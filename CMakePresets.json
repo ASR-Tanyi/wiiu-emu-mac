@@ -1,0 +1,83 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "WIIU_BUILD_TESTS": "ON",
+        "WIIU_WERROR": "ON"
+      }
+    },
+    {
+      "name": "macos-debug",
+      "inherits": "base",
+      "displayName": "macOS arm64 — Debug",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.0",
+        "WIIU_ENABLE_LTO": "OFF"
+      }
+    },
+    {
+      "name": "macos-release",
+      "inherits": "base",
+      "displayName": "macOS arm64 — Release",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.0",
+        "WIIU_ENABLE_LTO": "ON"
+      }
+    },
+    {
+      "name": "macos-asan",
+      "inherits": "macos-debug",
+      "displayName": "macOS arm64 — Debug + sanitizers",
+      "cacheVariables": { "WIIU_SANITIZE": "ON" }
+    },
+    {
+      "name": "core-debug",
+      "inherits": "base",
+      "displayName": "Platform-independent core — Debug (any host)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "WIIU_ENABLE_LTO": "OFF"
+      }
+    },
+    {
+      "name": "core-release",
+      "inherits": "base",
+      "displayName": "Platform-independent core — Release (any host)",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "macos-debug", "configurePreset": "macos-debug" },
+    { "name": "macos-release", "configurePreset": "macos-release" },
+    { "name": "macos-asan", "configurePreset": "macos-asan" },
+    { "name": "core-debug", "configurePreset": "core-debug" },
+    { "name": "core-release", "configurePreset": "core-release" }
+  ],
+  "testPresets": [
+    {
+      "name": "macos-debug",
+      "configurePreset": "macos-debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "core-debug",
+      "configurePreset": "core-debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+// Generated from version.hpp.in by CMake — do not edit.
+#pragma once
+
+#include <string_view>
+
+namespace wiiu::version {
+
+inline constexpr std::string_view project = "@PROJECT_NAME@";
+inline constexpr std::string_view string = "@PROJECT_VERSION@";
+inline constexpr int major = @PROJECT_VERSION_MAJOR@;
+inline constexpr int minor = @PROJECT_VERSION_MINOR@;
+inline constexpr int patch = @PROJECT_VERSION_PATCH@;
+
+inline constexpr std::string_view git_hash = "@WIIU_GIT_HASH@";
+inline constexpr std::string_view git_branch = "@WIIU_GIT_BRANCH@";
+inline constexpr bool git_dirty = @WIIU_GIT_DIRTY@;
+
+inline constexpr std::string_view build_type = "@CMAKE_BUILD_TYPE@";
+inline constexpr std::string_view compiler = "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@";
+
+/// e.g. "wiiu-emu 0.1.0 (a1b2c3d, Release)"
+[[nodiscard]] std::string_view full() noexcept;
+
+} // namespace wiiu::version

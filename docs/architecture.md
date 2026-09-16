@@ -1,0 +1,147 @@
+# Architecture
+
+How the pieces fit together. Filled in as phases land; sections marked
+*(not built)* describe intent, not code.
+
+## Shape
+
+```
+                 frontend  (window, UI, settings)
+                     |
+   +-----------+-----+------+-----------+
+   |           |            |           |
+  cpu        memory        gpu        audio/input
+   |           |            |
+   +----> hle (Cafe OS libraries) <----+
+                 |
+              loader  (RPX/RPL, disc, filesystem)
+                 |
+              common  (types, endian, logging)
+```
+
+`common` depends on nothing. Everything depends on `common`. `hle` is the hub:
+it is what guest code actually calls, and it drives the other subsystems.
+
+## Principles
+
+**Big-endian guest, little-endian host.** Every guest memory access goes
+through a byte-swapping accessor. This is not retrofittable, so it is in place
+from Phase 2 before anything reads guest memory.
+
+**HLE-first.** Cafe OS libraries are reimplemented at the function level.
+There is no LLE of the ARM security processor (Starbuck/IOSU); its IPC is
+intercepted and serviced natively.
+
+**Correctness, then speed.** The interpreter is the reference implementation
+and stays in the tree forever — Phase 12's JIT is validated by running in
+lockstep against it. Performance work is tracked separately in
+[`performance.md`](performance.md), and five of those items are design
+constraints rather than later optimisations.
+
+**Everything is observable.** Per-subsystem log channels, an in-memory ring
+buffer for the debug UI, cache hit-rate counters, and a loud warning on every
+unimplemented HLE import. A cache that silently misses and a stub that silently
+returns zero are the two failure modes that cost the most debugging time.
+
+**Deterministic by construction.** Two runs of the same title differ only
+where the emulator consults the host, and there are very few such places: the
+guest timebase advances by instructions rather than by wall-clock time, the
+scheduler interleaves guest threads in a fixed order, and the interpreter has
+no other source of variation. So the real-time clock is read once, at the
+first `OSGetTime`, and everything else is derived from it. Recording just
+those host values is enough to replay a whole run (`--record` / `--replay`,
+Phase 10.4), and the same property is what lets Phase 12's JIT be compared
+against the interpreter in lockstep. Anything that would introduce
+nondeterminism — real thread parallelism, a host-clock-driven timebase —
+goes behind an interface that can be turned off, not into the default path.
+
+## Subsystems
+
+### common
+
+Types (`u32`, `ppcaddr_t`, …), bit and alignment helpers, and logging.
+
+Logging is one channel per subsystem, each with an independent runtime level,
+behind a compile-time floor. The level check sits in the macro rather than the
+function, so a gated record evaluates none of its arguments — formatting a
+disassembled instruction costs far more than the call, and in the CPU and GPU
+hot paths that difference is the point.
+
+*Phase 2.1 adds `be<T>`, the byte-swapping storage type.*
+
+### memory *(not built — Phase 3)*
+
+A 4 GiB host reservation with the Cafe OS virtual map laid into it, so guest
+virtual → host pointer is one add. Fastmem (P3) is a design constraint here:
+translation must reduce to `base + zero_extend32(addr)` with no branch, and
+MMIO must be caught by a fault handler rather than a per-access check.
+
+The cache model is real, not decorative: the guest CPU is coherent with the
+other two cores but *not* with the GPU, so `DCFlushRange` and friends have to
+actually invalidate GPU-visible ranges.
+
+### cpu
+
+An Espresso interpreter: three PowerPC 750CL-derived cores, big-endian, with
+paired singles. The decoder, disassembler and interpreter come from one
+instruction table so they cannot drift apart, and the JIT (Phase 12) will
+dispatch off the same identifiers.
+
+Faults have two modes. `Report` surfaces them to the caller; `Deliver` does
+what the hardware does and jumps to the vector. Report is the default because
+until Cafe OS installs handlers, delivering an exception means jumping into
+zeroed memory, which turns a clear diagnostic into an illegal-instruction loop
+somewhere else.
+
+**The exception vectors are not in the Cafe OS memory map.** Nothing is mapped
+at low addresses, so the loader (Phase 6.2) has to place a vector page before
+Deliver mode is usable at all. This surfaced from a test rather than from
+reading the map, and it is easy to miss because Report mode works fine without
+it.
+
+### loader *(not built — Phase 5)*
+
+RPX/RPL is ELF32 with custom section types, PE-style import/export tables and
+per-section zlib compression. Above it sits a VFS that presents `/vol/content`
+and friends identically whether the source was a decrypted folder, a WUP
+install or a disc image.
+
+### hle
+
+A registry from `library.symbol` to a native handler, with PPC ABI argument
+marshalling generated by templates so a handler is an ordinary C++ function.
+Unimplemented imports log their library, name and caller, then return zero.
+
+Two ABI details are worth stating because getting either wrong produces
+plausible wrong values rather than a fault: a 64-bit argument occupies a
+register pair starting at an **odd** register (r3:r4, r5:r6, r7:r8, r9:r10),
+so `f(int, long long)` skips r4; and floating-point arguments take f1–f8
+without consuming a GPR slot. Both are checked against what
+`powerpc-linux-gnu-gcc -m32` actually emits.
+
+`recording.hpp` holds the determinism layer: every host-derived value passes
+through it, and it either appends it to a trace or substitutes the recorded
+one. It also hashes machine state at intervals, so a replay that stops
+matching is reported at the first point it could be known rather than wherever
+the consequences surface.
+
+### gpu *(not built — Phases 7–8)*
+
+GX2 calls append PM4 packets to a ring buffer; a separate GPU thread consumes
+it asynchronously, mirroring the hardware. R700 shader microcode is lowered to
+an internal IR and emitted as MSL. Geometry shaders become Metal object+mesh
+pipelines; stream-out becomes a rasterization-disabled vertex pass.
+
+See [ADR-001](decisions/ADR-001-metal-over-vulkan.md) for why the backend is
+Metal, and the Phase 7 table in `plan.md` for the Metal gaps that need
+shader-side emulation.
+
+## Conventions
+
+- `wiiu::` for everything; one namespace per subsystem below it.
+- `snake_case` functions and variables, `CamelCase` types, trailing `_` on
+  private members. Enforced by `.clang-tidy`.
+- Targets are `wiiu_<name>` with a `wiiu::<name>` alias, built by
+  `wiiu_add_library()` so the warning set and standard are applied uniformly.
+- Warnings are errors. A warning that is genuinely wrong gets a suppression
+  with a comment, not a relaxed global setting.

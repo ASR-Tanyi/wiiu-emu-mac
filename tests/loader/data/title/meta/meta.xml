@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<menu type="complex" access="777">
+  <title_id type="hexBinary" length="16">0005000010143500</title_id>
+  <title_version type="unsignedInt" length="4">0</title_version>
+  <product_code type="string" length="32">WUP-P-TEST</product_code>
+  <company_code type="string" length="8">0001</company_code>
+  <region type="hexBinary" length="8">00000002</region>
+  <longname_en type="string" length="512">Test Title</longname_en>
+  <longname_ja type="string" length="512">テストタイトル</longname_ja>
+  <shortname_en type="string" length="256">Test</shortname_en>
+  <publisher_en type="string" length="256">Alpha Star Research</publisher_en>
+</menu>

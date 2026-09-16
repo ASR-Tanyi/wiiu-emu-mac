@@ -1,0 +1,32 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++20
+ColumnLimit: 100
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+AccessModifierOffset: -4
+AlignAfterOpenBracket: Align
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakTemplateDeclarations: Yes
+BinPackArguments: false
+BinPackParameters: false
+BreakBeforeBraces: Attach
+IndentCaseLabels: true
+NamespaceIndentation: None
+PointerAlignment: Left
+SeparateDefinitionBlocks: Always
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<wiiu/'
+    Priority: 1
+  - Regex: '^"'
+    Priority: 2
+  - Regex: '^<(fmt|spdlog|catch2)/'
+    Priority: 3
+  - Regex: '^<'
+    Priority: 4
