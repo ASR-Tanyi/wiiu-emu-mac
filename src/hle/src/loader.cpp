@@ -235,6 +235,10 @@ RunReport run(cpu::Interpreter& interpreter,
 
     u64 since_switch = 0;
 
+    // See the idle-skip block below.
+    u64 idle_skips_without_progress = 0;
+    constexpr u64 max_idle_skips_without_progress = 1024;
+
     // The budget is checked here rather than in the loop condition so that a
     // fault or a halt on the very last budgeted instruction keeps its own
     // outcome: those are set after the instruction counter has been bumped,
@@ -250,6 +254,43 @@ RunReport run(cpu::Interpreter& interpreter,
             if (recording->stop_requested()) {
                 report.outcome = RunOutcome::Diverged;
                 break;
+            }
+        }
+
+        // Nothing can run, but something is waiting for the clock: a sleeping
+        // thread or an alarm. Skip straight to it (**P2**) rather than
+        // emulating the wait -- which, with every thread asleep, would mean
+        // running no instructions at all and calling it a deadlock.
+        //
+        // This is checked before the sentinels below on purpose. A thread that
+        // exits while every other thread is asleep leaves the core sitting on
+        // the exit sentinel with nothing to switch to; skipping the clock here
+        // is what gets a thread back, and doing it afterwards would spin on
+        // the sentinel instead.
+        if (scheduler != nullptr) {
+            if (const u64 skip = scheduler->idle_skip_ticks(state); skip > 0) {
+                interpreter.advance_time(skip);
+                scheduler->note_skipped(skip);
+                report.skipped_ticks += skip;
+                static_cast<void>(scheduler->service_timers(state.timebase));
+                static_cast<void>(scheduler->reschedule(state));
+
+                // A skip that leaves nothing runnable has achieved nothing.
+                // One or two of those is ordinary -- a periodic alarm with no
+                // callback, a timer whose thread is waiting on something else
+                // -- but a run of them means the deadline is the only thing
+                // still moving and no amount of clock will help. Without this
+                // the loop spins on the clock forever: it runs no
+                // instructions, so the budget never advances either.
+                if (scheduler->runnable_count() == 0) {
+                    if (++idle_skips_without_progress >= max_idle_skips_without_progress) {
+                        report.outcome = RunOutcome::Deadlocked;
+                        break;
+                    }
+                } else {
+                    idle_skips_without_progress = 0;
+                }
+                continue;
             }
         }
 
@@ -288,8 +329,17 @@ RunReport run(cpu::Interpreter& interpreter,
         report.last_result = result;
 
         if (result == cpu::StepResult::Ok) {
-            if (scheduler != nullptr && ++since_switch >= options.timeslice) {
+            // A thread spinning on a flag gives the core back now rather than
+            // at the end of its timeslice (**P2**). It cannot make progress by
+            // itself, and whatever it is waiting for is on another thread.
+            const bool spinning = scheduler != nullptr && interpreter.spinning();
+            if (spinning) {
+                ++report.spin_yields;
+            }
+
+            if (scheduler != nullptr && (spinning || ++since_switch >= options.timeslice)) {
                 since_switch = 0;
+                interpreter.clear_spin();
                 static_cast<void>(scheduler->reschedule(state));
             }
             continue;

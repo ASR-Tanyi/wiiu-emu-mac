@@ -71,6 +71,18 @@ struct RunReport {
     u64 instructions = 0;
     u64 hle_calls = 0;
     u64 context_switches = 0;
+
+    /// Timebase ticks jumped rather than emulated, because every thread was
+    /// waiting for one of them (**P2**). Worth reporting: a title spending
+    /// most of its time here is one where the emulator is keeping up easily,
+    /// and a title where it stays at zero is one where nothing ever waits.
+    u64 skipped_ticks = 0;
+
+    /// Times a thread was found spinning on a flag and gave the core back
+    /// early (**P2**). Against `context_switches` this says how much of the
+    /// scheduling was the emulator noticing a wait rather than a timeslice
+    /// running out.
+    u64 spin_yields = 0;
 };
 
 struct RunOptions {

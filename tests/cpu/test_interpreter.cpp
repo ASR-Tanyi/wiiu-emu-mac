@@ -502,3 +502,156 @@ TEST_CASE_METHOD(CpuFixture, "bitfield operations on a real value", "[cpu][inter
     CHECK(state.gpr[6] == 0xFFFFFFEFU); // extsb of 0xEF
     CHECK(state.gpr[7] == 0U);          // cntlzw: the top bit is set
 }
+
+// ---------------------------------------------------------------------------
+// Idle-loop detection (P2)
+// ---------------------------------------------------------------------------
+
+TEST_CASE_METHOD(CpuFixture, "a poll loop is recognised as a spin", "[cpu][interp][idle]") {
+    // The shape every "wait for another thread" compiles to: load the flag,
+    // compare, branch back. Nothing in it can change the flag, so running it
+    // for a whole timeslice produces nothing at all.
+    const std::array<u32, 3> program{
+        0x80640000, // lwz   r3,0(r4)
+        0x2C030000, // cmpwi r3,0
+        0x4182FFF8, // beq   -8
+    };
+    load(program);
+    state.gpr[4] = memory::data_heap_base;
+    REQUIRE(memory.try_write<u32>(memory::data_heap_base, 0));
+
+    CHECK_FALSE(interpreter.spinning());
+
+    const Interpreter::RunResult result = interpreter.run(3 * Interpreter::spin_threshold + 30);
+    CHECK(result.result == StepResult::Ok);
+    CHECK(interpreter.spinning());
+
+    // And it is forgettable: the run loop clears it after handing the core to
+    // someone else, and the next thread's loops are its own.
+    interpreter.clear_spin();
+    CHECK_FALSE(interpreter.spinning());
+    CHECK(interpreter.spin_iterations() == 0U);
+}
+
+TEST_CASE_METHOD(CpuFixture, "a loop that stores is not a spin", "[cpu][interp][idle]") {
+    // The same shape with a store in it is doing work -- a memcpy, a
+    // checksum, a clear. Treating that as a wait would hand the core away in
+    // the middle of something that was making progress.
+    const std::array<u32, 4> program{
+        0x80640000, // lwz   r3,0(r4)
+        0x90640004, // stw   r3,4(r4)
+        0x2C030000, // cmpwi r3,0
+        0x4182FFF4, // beq   -12
+    };
+    load(program);
+    state.gpr[4] = memory::data_heap_base;
+    REQUIRE(memory.try_write<u32>(memory::data_heap_base, 0));
+
+    const Interpreter::RunResult result = interpreter.run(4 * Interpreter::spin_threshold + 40);
+    CHECK_FALSE(interpreter.spinning());
+
+    // The loop really did run -- otherwise this would pass for the wrong
+    // reason, which is the failure mode a negative test has.
+    CHECK(result.result == StepResult::Ok);
+    CHECK(result.executed == 4 * Interpreter::spin_threshold + 40);
+}
+
+TEST_CASE_METHOD(CpuFixture, "a loop that calls out is not a spin", "[cpu][interp][idle]") {
+    // A loop calling a function might be polling through it -- but it might
+    // equally be doing all its work there, and the call is the part this
+    // cannot see into.
+    const std::array<u32, 3> program{
+        0x4800000C, // b     +12   (over the callee)
+        0x4E800020, // blr         (the callee)
+        0x60000000, // nop
+    };
+    load(program);
+    REQUIRE(memory.try_write<u32>(kLoadAddress + 12, 0x4BFFFFF5)); // bl -12 -> the callee
+    REQUIRE(memory.try_write<u32>(kLoadAddress + 16, 0x4BFFFFFC)); // b  -4  -> back to the call
+
+    const Interpreter::RunResult result = interpreter.run(4 * Interpreter::spin_threshold + 40);
+    CHECK_FALSE(interpreter.spinning());
+    CHECK(result.result == StepResult::Ok);
+    CHECK(result.executed == 4 * Interpreter::spin_threshold + 40);
+}
+
+TEST_CASE_METHOD(CpuFixture, "a long loop is not a spin", "[cpu][interp][idle]") {
+    // A backward branch reaching back past a hundred and some bytes is an
+    // ordinary loop over data, not a thread waiting on a word. Forty
+    // instructions of body, so the branch spans 160 bytes.
+    constexpr u32 body = 40;
+    for (u32 index = 0; index < body; ++index) {
+        REQUIRE(memory.try_write<u32>(kLoadAddress + index * 4, 0x60000000)); // nop
+    }
+    // b -160
+    const u32 back = 0x48000000U | ((0x4000000U - body * 4) & 0x03FFFFFCU);
+    REQUIRE(memory.try_write<u32>(kLoadAddress + body * 4, back));
+    state.pc = kLoadAddress;
+
+    // Long enough for several hundred iterations, so the threshold is not
+    // what is keeping this from being called a spin.
+    const u64 budget = (body + 1) * (Interpreter::spin_threshold + 50);
+    const Interpreter::RunResult result = interpreter.run(budget);
+    CHECK(result.result == StepResult::Ok);
+    CHECK(result.executed == budget);
+    CHECK_FALSE(interpreter.spinning());
+}
+
+TEST_CASE_METHOD(CpuFixture,
+                 "a loop that makes progress in registers is not a spin",
+                 "[cpu][interp][idle]") {
+    // Three shapes that store nothing and are unmistakably work: walking a
+    // string, accumulating a sum, and clearing memory a cache block at a
+    // time. Calling any of them a wait hands the core away in the middle of
+    // something that was getting somewhere.
+    const u64 budget = 4 * Interpreter::spin_threshold + 40;
+
+    SECTION("walking a string") {
+        const std::array<u32, 3> program{
+            0x8C640001, // lbzu  r3,1(r4)
+            0x2C030000, // cmpwi r3,0
+            0x4082FFF8, // bne   -8
+        };
+        load(program);
+        state.gpr[4] = memory::data_heap_base;
+
+        // A string long enough to outlast the budget; walking off the end of
+        // it would stop the loop for the wrong reason.
+        REQUIRE(memory.fill(memory::data_heap_base, 8192, 'a'));
+
+        const Interpreter::RunResult result = interpreter.run(budget);
+        CHECK(result.executed == budget);
+        CHECK_FALSE(interpreter.spinning());
+    }
+
+    SECTION("accumulating a sum") {
+        const std::array<u32, 4> program{
+            0x80640000, // lwz   r3,0(r4)
+            0x7CA51A14, // add   r5,r5,r3
+            0x38840004, // addi  r4,r4,4
+            0x4200FFF4, // bdnz  -12
+        };
+        load(program);
+        state.gpr[4] = memory::data_heap_base;
+        state.ctr = 100000;
+
+        const Interpreter::RunResult result = interpreter.run(budget);
+        CHECK(result.executed == budget);
+        CHECK_FALSE(interpreter.spinning());
+    }
+
+    SECTION("clearing memory") {
+        const std::array<u32, 3> program{
+            0x7C0027EC, // dcbz  0,r4
+            0x38840020, // addi  r4,r4,32
+            0x4200FFF8, // bdnz  -8
+        };
+        load(program);
+        state.gpr[4] = memory::data_heap_base;
+        state.ctr = 100000;
+
+        const Interpreter::RunResult result = interpreter.run(budget);
+        CHECK(result.executed == budget);
+        CHECK_FALSE(interpreter.spinning());
+    }
+}

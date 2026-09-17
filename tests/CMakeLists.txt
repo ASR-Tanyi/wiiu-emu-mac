@@ -104,6 +104,7 @@ wiiu_add_test(loader
 
 wiiu_add_test(hle
     SOURCES
+        hle/test_callbacks.cpp
         hle/test_coreinit.cpp
         hle/test_hle.cpp
         hle/test_recording.cpp

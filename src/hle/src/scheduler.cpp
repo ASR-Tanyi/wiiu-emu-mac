@@ -41,6 +41,10 @@ std::string_view block_reason_name(BlockReason reason) noexcept {
             return "event";
         case BlockReason::Semaphore:
             return "semaphore";
+        case BlockReason::Condition:
+            return "condition";
+        case BlockReason::Rendezvous:
+            return "rendezvous";
         case BlockReason::Join:
             return "join";
         case BlockReason::Sleep:
@@ -51,8 +55,11 @@ std::string_view block_reason_name(BlockReason reason) noexcept {
 
 void Scheduler::reset() {
     threads_.clear();
+    timers_.clear();
     current_ = 0;
     switches_ = 0;
+    skipped_ticks_ = 0;
+    servicing_timers_ = false;
 }
 
 u32 Scheduler::create(u32 handle,
@@ -70,13 +77,21 @@ u32 Scheduler::create(u32 handle,
     thread.priority = std::clamp(priority, highest_priority, lowest_priority);
     thread.affinity = affinity == 0 ? 0x7U : affinity;
 
-    // Lowest set bit of the affinity mask: the core this will actually run on.
-    for (u32 core = 0; core < cpu::core_count; ++core) {
-        if ((thread.affinity & (1U << core)) != 0) {
-            thread.core = core;
-            break;
+    // Which core this actually runs on. A thread pinned to one core has no
+    // choice; a thread that may run anywhere is spread round, because putting
+    // every "any core" thread on core 0 makes anything that coordinates
+    // *between* cores -- a rendezvous, most obviously -- wait for a core that
+    // is never going to arrive.
+    thread.core = next_core_ % cpu::core_count;
+    if ((thread.affinity & (1U << thread.core)) == 0) {
+        for (u32 core = 0; core < cpu::core_count; ++core) {
+            if ((thread.affinity & (1U << core)) != 0) {
+                thread.core = core;
+                break;
+            }
         }
     }
+    ++next_core_;
 
     thread.context.reset();
     thread.context.pc = entry;
@@ -101,8 +116,58 @@ u32 Scheduler::create(u32 handle,
     thread.state = ThreadState::Suspended;
     thread.suspend_count = 1;
 
+    // Re-creating the handle that was running means the old thread is gone,
+    // whatever the caller thought. Same reasoning as `remove`.
+    if (current_ == handle) {
+        current_ = 0;
+    }
+
     threads_[handle] = std::move(thread);
     return handle;
+}
+
+u32 Scheduler::create_callback(u32 handle,
+                               std::string name,
+                               ppcaddr_t entry,
+                               std::span<const u32> arguments,
+                               ppcaddr_t stack_top,
+                               s32 priority) {
+    static_cast<void>(create(handle, std::move(name), entry, 0, 0, stack_top, 0, priority, 0x7));
+
+    Thread* const thread = find(handle);
+    if (thread == nullptr) {
+        return 0;
+    }
+
+    // The ABI's first eight argument registers. More than eight would go on
+    // the stack, and no OS callback takes that many.
+    const std::size_t count = std::min<std::size_t>(arguments.size(), 8);
+    for (std::size_t index = 0; index < count; ++index) {
+        thread->context.gpr[3 + index] = arguments[index];
+    }
+
+    // A callback runs now; it is not something the title resumes.
+    thread->state = ThreadState::Ready;
+    thread->suspend_count = 0;
+    return handle;
+}
+
+bool Scheduler::remove(u32 handle) {
+    const auto it = threads_.find(handle);
+    if (it == threads_.end() || it->second.state != ThreadState::Exited) {
+        return false;
+    }
+    threads_.erase(it);
+
+    // The core is not running it any more -- it does not exist. Leaving
+    // `current_` pointing at the handle means the next thread created under
+    // it inherits "is already running", and `reschedule` then declines to
+    // restore its context: the new thread starts with the old one's registers
+    // and exits without executing an instruction.
+    if (current_ == handle) {
+        current_ = 0;
+    }
+    return true;
 }
 
 u32 Scheduler::adopt_main(const cpu::CoreState& state, u32 handle) {
@@ -214,7 +279,106 @@ void Scheduler::wake_sleepers(u64 now) {
     }
 }
 
+void Scheduler::set_timer(u32 id, u64 deadline, TimerCallback callback) {
+    timers_[id] = Timer{deadline, std::move(callback)};
+}
+
+void Scheduler::clear_timer(u32 id) noexcept {
+    timers_.erase(id);
+}
+
+bool Scheduler::has_timer(u32 id) const noexcept {
+    return timers_.contains(id);
+}
+
+u32 Scheduler::service_timers(u64 now) {
+    // A callback can arm timers, create threads, or cause a reschedule that
+    // would land back here. Re-entering would fire the same deadline twice.
+    if (servicing_timers_) {
+        return 0;
+    }
+
+    // A guard rather than a pair of assignments: a callback that throws --
+    // and they allocate, so they can -- would otherwise leave the flag set
+    // and no timer would ever fire again.
+    struct Guard {
+        bool& flag;
+
+        ~Guard() { flag = false; }
+    } const guard{servicing_timers_};
+
+    servicing_timers_ = true;
+
+    u32 fired = 0;
+    while (true) {
+        // Earliest deadline first, one at a time: the map is being modified by
+        // the callbacks, so nothing may be held across one.
+        u32 due_id = 0;
+        u64 due_deadline = 0;
+        bool found = false;
+        for (const auto& [id, timer] : timers_) {
+            if (timer.deadline <= now && (!found || timer.deadline < due_deadline)) {
+                due_id = id;
+                due_deadline = timer.deadline;
+                found = true;
+            }
+        }
+        if (!found) {
+            break;
+        }
+
+        const auto it = timers_.find(due_id);
+        TimerCallback callback = std::move(it->second.callback);
+        timers_.erase(it);
+        ++fired;
+
+        if (callback) {
+            callback(now);
+        }
+    }
+
+    return fired;
+}
+
+std::optional<u64> Scheduler::next_deadline() const noexcept {
+    std::optional<u64> earliest;
+    const auto consider = [&earliest](u64 deadline) {
+        if (!earliest.has_value() || deadline < *earliest) {
+            earliest = deadline;
+        }
+    };
+
+    for (const auto& [handle, thread] : threads_) {
+        if (thread.state == ThreadState::Sleeping) {
+            consider(thread.wake_time);
+        }
+    }
+    for (const auto& [id, timer] : timers_) {
+        consider(timer.deadline);
+    }
+    return earliest;
+}
+
+u64 Scheduler::idle_skip_ticks(const cpu::CoreState& state) const noexcept {
+    const bool anything_runnable =
+        std::ranges::any_of(threads_, [](const auto& entry) { return entry.second.runnable(); });
+    if (anything_runnable) {
+        return 0;
+    }
+    const Thread* const running = current();
+    if (running != nullptr && running->state == ThreadState::Running) {
+        return 0;
+    }
+
+    const std::optional<u64> deadline = next_deadline();
+    if (!deadline.has_value()) {
+        return 0; // nothing is waiting for time: this is a deadlock, not a wait
+    }
+    return *deadline > state.timebase ? *deadline - state.timebase : 0;
+}
+
 bool Scheduler::reschedule(cpu::CoreState& state) {
+    static_cast<void>(service_timers(state.timebase));
     wake_sleepers(state.timebase);
 
     Thread* const running = current();
@@ -298,7 +462,7 @@ u32 Scheduler::unblock_all(u32 object) {
     return woken;
 }
 
-bool Scheduler::unblock_one(u32 object) {
+u32 Scheduler::unblock_one(u32 object) {
     // Highest priority waiter wins, which is what a priority-scheduled OS
     // does and what stops a low-priority thread holding up the queue.
     Thread* best = nullptr;
@@ -311,17 +475,50 @@ bool Scheduler::unblock_one(u32 object) {
         }
     }
     if (best == nullptr) {
-        return false;
+        return 0;
     }
     best->state = ThreadState::Ready;
     best->block_reason = BlockReason::None;
     best->blocked_on = 0;
-    return true;
+    return best->handle;
+}
+
+std::vector<u32> Scheduler::waiters(u32 object) const {
+    std::vector<const Thread*> found;
+    for (const auto& [handle, thread] : threads_) {
+        if (thread.state == ThreadState::Blocked && thread.blocked_on == object) {
+            found.push_back(&thread);
+        }
+    }
+    std::ranges::stable_sort(
+        found, [](const Thread* lhs, const Thread* rhs) { return lhs->priority < rhs->priority; });
+
+    std::vector<u32> handles;
+    handles.reserve(found.size());
+    for (const Thread* thread : found) {
+        handles.push_back(thread->handle);
+    }
+    return handles;
+}
+
+void Scheduler::block_thread(u32 handle, BlockReason reason, u32 object) {
+    Thread* const thread = find(handle);
+    if (thread == nullptr || thread->state == ThreadState::Exited) {
+        return;
+    }
+    thread->state = ThreadState::Blocked;
+    thread->block_reason = reason;
+    thread->blocked_on = object;
 }
 
 void Scheduler::exit_current(cpu::CoreState& state, s32 value) {
     Thread* const thread = current();
     if (thread == nullptr) {
+        // Nothing is running: the core is sitting on a sentinel with no
+        // thread behind it. Something else may still be runnable, and
+        // returning without looking leaves the caller to meet the same
+        // sentinel again, and again.
+        static_cast<void>(reschedule(state));
         return;
     }
 
@@ -403,6 +600,14 @@ u64 Scheduler::hash(u64 seed) const noexcept {
     };
 
     fold(current_);
+
+    // Pending deadlines are part of the machine: two runs that disagree about
+    // when an alarm fires will diverge later, when it does.
+    for (const auto& [id, timer] : timers_) {
+        fold(id);
+        fold(timer.deadline);
+    }
+
     for (const auto& [handle, thread] : threads_) {
         fold(handle);
         fold(static_cast<u64>(thread.state));
@@ -414,6 +619,7 @@ u64 Scheduler::hash(u64 seed) const noexcept {
         fold(static_cast<u64>(static_cast<u32>(thread.exit_value)));
         fold(static_cast<u64>(static_cast<u32>(thread.suspend_count)));
         fold(thread.wake_time);
+        fold(thread.stack_base);
         fold(thread.joiners.size());
 
         // The current thread's saved context is stale -- the live one is in

@@ -583,6 +583,8 @@ StepResult Interpreter::execute_fp_load_store(Opcode id, Instruction inst) {
         case Opcode::Stfs:
         case Opcode::Stfsu:
         case Opcode::Stfsx:
+            // A loop that stores is doing work, not waiting (P2).
+            note_side_effect();
             if (!write_guest<u32>(address,
                                   std::bit_cast<u32>(static_cast<f32>(state_.fpr[inst.frs].ps0)))) {
                 return StepResult::MemoryFault;
@@ -592,6 +594,7 @@ StepResult Interpreter::execute_fp_load_store(Opcode id, Instruction inst) {
         case Opcode::Stfd:
         case Opcode::Stfdu:
         case Opcode::Stfdx:
+            note_side_effect();
             if (!write_guest<u64>(address, std::bit_cast<u64>(state_.fpr[inst.frs].ps0))) {
                 return StepResult::MemoryFault;
             }
@@ -608,6 +611,9 @@ StepResult Interpreter::execute_fp_load_store(Opcode id, Instruction inst) {
 }
 
 StepResult Interpreter::execute_paired_load_store(Opcode id, Instruction inst) {
+    // Any store means this is not an idle loop (P2); the paired forms are no
+    // different from the integer ones in that respect.
+
     const u32 base = inst.ra == 0 ? 0 : state_.gpr[inst.ra];
     const ppcaddr_t address = base + static_cast<u32>(inst.ps_d.value());
 
@@ -660,6 +666,7 @@ StepResult Interpreter::execute_paired_load_store(Opcode id, Instruction inst) {
     FpuRegister& reg = state_.fpr[inst.frd];
 
     if (store) {
+        note_side_effect();
         if (!write_element(address, quantize(reg.ps0, type, scale))) {
             return StepResult::MemoryFault;
         }

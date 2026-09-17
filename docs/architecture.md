@@ -89,6 +89,26 @@ address space is keyed by *virtual* address, since MEM1 is committed where Cafe
 OS shows it rather than at physical zero, so a real address produced by a
 translation is mapped back through the region table before it is used.
 
+### hle
+
+Cafe OS libraries reimplemented as native functions, reached through one-word
+`sc` trampolines that imports resolve to. Threads interleave deterministically
+on one host thread, which is what makes record/replay and the eventual JIT
+lockstep possible.
+
+Two things are worth knowing before reading it. A handler that blocks switches
+the context out from under itself, so anything that can block sets its return
+value first — and a thread woken from a blocking call resumes *after* the call,
+never inside it, which is why unlocking a mutex has to name the next owner
+rather than leaving it free. And the OS calls back into the title — alarms,
+asynchronous completion — by running a guest function on its own scheduler
+thread, with a stack from a recycled pool.
+
+Waiting is not emulated. Every deadline the machine is waiting for, whether a
+sleeping thread or an alarm, lives in one list, so when nothing can run the
+clock jumps to the next one; and a thread found spinning on a flag hands the
+core back immediately rather than at the end of its timeslice (**P2**).
+
 ### cpu
 
 An Espresso interpreter: three PowerPC 750CL-derived cores, big-endian, with

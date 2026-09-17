@@ -23,6 +23,8 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -47,6 +49,8 @@ enum class BlockReason : u8 {
     Mutex,
     Event,
     Semaphore,
+    Condition,
+    Rendezvous,
     Join,
     Sleep,
 };
@@ -67,6 +71,11 @@ inline constexpr ppcaddr_t thread_exit_sentinel = 0x01FE0000;
 /// one.
 inline constexpr u32 main_thread_handle = 0x01FD0000;
 
+/// Handles for the threads the OS makes on the title's behalf -- alarm
+/// callbacks, asynchronous FS completion. Same reasoning: outside every mapped
+/// region, so they cannot be mistaken for an OSThread the title allocated.
+inline constexpr u32 callback_handle_base = 0x01FC0000;
+
 struct Thread {
     u32 handle = 0; ///< the guest OSThread pointer
     std::string name;
@@ -83,6 +92,11 @@ struct Thread {
     s32 exit_value = 0;
     u32 suspend_count = 1; ///< created suspended, as OSCreateThread leaves it
     u64 wake_time = 0;
+
+    /// Where this thread's stack was allocated, for the threads the emulator
+    /// allocated one for. Zero for a thread whose stack the title owns, which
+    /// is every thread it created itself.
+    ppcaddr_t stack_base = 0;
 
     /// Threads waiting on this one, with where each wants the exit value
     /// written.
@@ -118,6 +132,26 @@ public:
     /// entry point is schedulable like anything else.
     [[nodiscard]] u32 adopt_main(const cpu::CoreState& state, u32 handle);
 
+    /// Create a thread that starts at `entry` with `arguments` in r3 onward
+    /// and is runnable immediately.
+    ///
+    /// A callback from the OS into the title -- an alarm handler, an
+    /// asynchronous read completing -- is an ordinary guest function that has
+    /// to run on a stack somewhere. Hardware runs them on a system thread per
+    /// core; here each one is a thread, which has the same observable shape
+    /// without a pool whose state could disagree with the scheduler's.
+    [[nodiscard]] u32 create_callback(u32 handle,
+                                      std::string name,
+                                      ppcaddr_t entry,
+                                      std::span<const u32> arguments,
+                                      ppcaddr_t stack_top,
+                                      s32 priority = default_priority);
+
+    /// Forget a thread that has exited, so a title firing an alarm every frame
+    /// does not accumulate one dead thread per frame. Refuses anything still
+    /// alive: a live thread that vanished would take its state with it.
+    bool remove(u32 handle);
+
     [[nodiscard]] bool resume(u32 handle);
     [[nodiscard]] bool suspend(u32 handle);
 
@@ -128,11 +162,28 @@ public:
     void sleep(cpu::CoreState& state, u64 ticks);
 
     void block(cpu::CoreState& state, BlockReason reason, u32 object);
+
+    /// Block a thread that is not the one running. Used when a wait is handed
+    /// from one object to another -- a condition variable's waiters queue up
+    /// on its mutex when it is signalled -- which cannot go through `block`,
+    /// since that one blocks the caller.
+    void block_thread(u32 handle, BlockReason reason, u32 object);
+
     void unblock(u32 handle);
     /// Wake every thread blocked on `object`. Returns how many.
     u32 unblock_all(u32 object);
-    /// Wake the highest-priority thread blocked on `object`.
-    [[nodiscard]] bool unblock_one(u32 object);
+
+    /// Wake the highest-priority thread blocked on `object`, and say which one
+    /// it was -- zero if nobody was waiting.
+    ///
+    /// The handle is the point: whoever hands out a mutex has to record who
+    /// now owns it. Returning only "somebody" left every woken waiter
+    /// resuming *after* its OSLockMutex with the mutex unowned, which is two
+    /// threads inside the same critical section.
+    u32 unblock_one(u32 object);
+
+    /// Everything blocked on `object`, highest priority first.
+    [[nodiscard]] std::vector<u32> waiters(u32 object) const;
 
     void exit_current(cpu::CoreState& state, s32 value);
 
@@ -148,8 +199,49 @@ public:
     void set_exit_callback(ExitCallback callback) { on_exit_ = std::move(callback); }
 
     /// Pick the next thread and switch to it if that is not the current one.
-    /// Also wakes any sleeper whose deadline has passed.
+    /// Also wakes any sleeper whose deadline has passed, and fires any timer
+    /// that has come due.
     bool reschedule(cpu::CoreState& state);
+
+    // --- deadlines --------------------------------------------------------
+    //
+    // Anything that has to happen at a particular point on the timebase --
+    // an alarm (6.7), and later a vsync or an audio frame -- registers here.
+    // Keeping them with the sleeping threads is what makes "nothing can run
+    // until time moves" answerable in one place, which is both the idle skip
+    // below and the difference between a deadlock and a wait.
+
+    using TimerCallback = std::function<void(u64 now)>;
+
+    /// Register or re-arm a deadline. An id that already exists is replaced,
+    /// which is what re-arming a periodic alarm does.
+    void set_timer(u32 id, u64 deadline, TimerCallback callback);
+
+    void clear_timer(u32 id) noexcept;
+
+    [[nodiscard]] bool has_timer(u32 id) const noexcept;
+
+    [[nodiscard]] std::size_t timer_count() const noexcept { return timers_.size(); }
+
+    /// Fire every timer due at `now`, oldest deadline first. Returns how many
+    /// fired. A timer is removed before its callback runs, so a callback that
+    /// re-arms the same id keeps the new deadline rather than losing it.
+    u32 service_timers(u64 now);
+
+    /// The next moment anything is waiting for: the earliest sleeping thread
+    /// or timer deadline.
+    [[nodiscard]] std::optional<u64> next_deadline() const noexcept;
+
+    /// How far the clock would have to move before anything could happen, or
+    /// zero if something can run now or nothing ever will (**P2**).
+    ///
+    /// Emulating a wait faithfully means running a spin loop or an idle core
+    /// for however many million instructions the wait lasts, producing
+    /// nothing. Skipping to the next deadline is both faster and *more*
+    /// accurate about when the guest resumes. The run loop does the moving,
+    /// not the scheduler: the decrementer counts down with the timebase, and
+    /// only the interpreter owns that.
+    [[nodiscard]] u64 idle_skip_ticks(const cpu::CoreState& state) const noexcept;
 
     [[nodiscard]] Thread* current() noexcept;
     [[nodiscard]] const Thread* current() const noexcept;
@@ -180,10 +272,27 @@ private:
     [[nodiscard]] Thread* pick_next();
     void wake_sleepers(u64 now);
 
+    struct Timer {
+        u64 deadline = 0;
+        TimerCallback callback;
+    };
+
     ExitCallback on_exit_;
     std::map<u32, Thread> threads_;
+    std::map<u32, Timer> timers_;
     u32 current_ = 0;
+    u32 next_core_ = 0;
     u64 switches_ = 0;
+    u64 skipped_ticks_ = 0;
+    bool servicing_timers_ = false;
+
+public:
+    /// Timebase ticks skipped rather than emulated (**P2**). A counter rather
+    /// than a log line because the interesting question is what fraction of a
+    /// run was spent waiting, which only shows up in aggregate.
+    [[nodiscard]] u64 skipped_ticks() const noexcept { return skipped_ticks_; }
+
+    void note_skipped(u64 ticks) noexcept { skipped_ticks_ += ticks; }
 };
 
 } // namespace wiiu::hle

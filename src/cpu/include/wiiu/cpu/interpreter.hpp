@@ -100,6 +100,38 @@ public:
     /// transition from non-negative to negative raises its interrupt.
     void advance_time(u64 ticks) noexcept;
 
+    // --- idle-loop detection (P2) -----------------------------------------
+    //
+    // A guest thread waiting for another one writes the wait as a loop: load
+    // the flag, compare, branch back. Emulating that faithfully means running
+    // it for the whole timeslice -- hundreds of thousands of instructions
+    // that cannot change anything, because the only thing that could is the
+    // thread this one is keeping off the core.
+    //
+    // The shape is recognisable: a short backward branch, taken over and over,
+    // whose body stores nothing and calls nothing. Storing or making a system
+    // call means the loop is doing work, and the count starts again.
+
+    /// Iterations of the same short backward branch, with nothing written in
+    /// between, before the loop is called a spin. Low enough to give the time
+    /// back quickly, high enough that an ordinary tight loop -- a memcpy, a
+    /// checksum -- is never mistaken for one. Those store, so they reset it
+    /// anyway; this is the belt to that pair of braces.
+    static constexpr u32 spin_threshold = 200;
+
+    [[nodiscard]] bool spinning() const noexcept { return spin_count_ >= spin_threshold; }
+
+    /// Forget what has been seen so far. The run loop calls this after giving
+    /// the time back, and on a context switch: the next thread's loops are
+    /// its own.
+    void clear_spin() noexcept {
+        spin_target_ = 0;
+        spin_count_ = 0;
+        spin_dirty_ = false;
+    }
+
+    [[nodiscard]] u32 spin_iterations() const noexcept { return spin_count_; }
+
     /// Execute one instruction. On anything but Ok, `pc` is left pointing at
     /// the offending instruction so it can be reported and retried.
     StepResult step();
@@ -330,10 +362,40 @@ private:
     Mmu mmu_;
     TranslationFaultInfo translation_fault_;
 
+    /// Note that the current loop body did something a poll loop would not.
+    void note_side_effect() noexcept { spin_dirty_ = true; }
+
+    /// Count a taken backward branch towards the spin threshold.
+    void note_backward_branch(ppcaddr_t target, ppcaddr_t from) noexcept {
+        // Only a short loop: a backward branch spanning a whole function is
+        // an ordinary loop over data, not a thread waiting for a flag.
+        constexpr u32 longest_spin = 128;
+        if (target >= from || from - target > longest_spin) {
+            clear_spin();
+            return;
+        }
+        if (target != spin_target_) {
+            spin_target_ = target;
+            spin_count_ = 0;
+            spin_dirty_ = false;
+            return;
+        }
+        if (spin_dirty_) {
+            spin_count_ = 0;
+            spin_dirty_ = false;
+            return;
+        }
+        ++spin_count_;
+    }
+
     ExceptionMode exception_mode_ = ExceptionMode::Report;
     bool external_pending_ = false;
     bool decrementer_pending_ = false;
     u64 ticks_per_instruction_ = 1;
+
+    ppcaddr_t spin_target_ = 0;
+    u32 spin_count_ = 0;
+    bool spin_dirty_ = false;
 
     // Stored as the raw word rather than as an Instruction: BitField deletes
     // copy assignment on purpose, and that propagates to any union holding

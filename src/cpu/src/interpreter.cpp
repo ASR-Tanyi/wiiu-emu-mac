@@ -885,7 +885,11 @@ StepResult Interpreter::execute_branch(Opcode id, Instruction inst) {
         const auto displacement = static_cast<u32>(inst.li.value() * 4);
         state_.next_pc = inst.aa ? displacement : state_.pc + displacement;
         if (inst.lk) {
+            // A call is not a spin, whatever it branches to.
+            note_side_effect();
             state_.lr = link_target;
+        } else {
+            note_backward_branch(state_.next_pc, state_.pc);
         }
         return StepResult::Ok;
     }
@@ -899,6 +903,11 @@ StepResult Interpreter::execute_branch(Opcode id, Instruction inst) {
 
     if (!bo2) {
         --state_.ctr;
+
+        // A branch that counts is a loop with an end in sight -- a copy, a
+        // checksum, a clear -- not a thread waiting on a word it cannot
+        // change (P2).
+        note_side_effect();
     }
 
     const bool ctr_ok = bo2 || ((state_.ctr != 0) != bo3);
@@ -921,6 +930,12 @@ StepResult Interpreter::execute_branch(Opcode id, Instruction inst) {
                 break;
             default:
                 return StepResult::Unimplemented;
+        }
+
+        if (inst.lk) {
+            note_side_effect();
+        } else {
+            note_backward_branch(state_.next_pc, state_.pc);
         }
     }
 
@@ -1194,8 +1209,15 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
 
     if (is_load) {
         state_.gpr[inst.rd] = value;
+    } else {
+        // A loop that writes something is doing work, whatever it looks like
+        // (P2). Only a loop that reads and compares is waiting.
+        note_side_effect();
     }
     if (update && inst.ra != 0) {
+        // Walking a pointer is progress as well: this is what a string loop
+        // does, and it never stores anything.
+        note_side_effect();
         state_.gpr[inst.ra] = address;
     }
     return StepResult::Ok;
@@ -1492,6 +1514,7 @@ StepResult Interpreter::execute_system(Opcode id, Instruction inst) {
             return StepResult::Ok;
 
         case Opcode::Sc:
+            note_side_effect();
             // Cafe OS reaches the kernel through sc, and the HLE layer wants
             // to intercept it rather than run a guest handler, so this always
             // surfaces. In Deliver mode it also vectors, so that a guest that
@@ -1527,6 +1550,10 @@ StepResult Interpreter::execute_system(Opcode id, Instruction inst) {
         case Opcode::Dcbi:
         case Opcode::Dcbz:
         case Opcode::Icbi: {
+            // Clearing or flushing a cache block is work; dcbz in particular
+            // is how a loop zeroes memory without storing a word at a time
+            // (P2).
+            note_side_effect();
             const bool writes = id == Opcode::Dcbz;
             const ppcaddr_t effective = effective_address_indexed(inst);
             const Translation translation =

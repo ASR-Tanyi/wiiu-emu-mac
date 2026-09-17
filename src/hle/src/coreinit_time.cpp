@@ -14,6 +14,8 @@
 #include <wiiu/common/log.hpp>
 #include <wiiu/hle/coreinit.hpp>
 
+#include <fmt/format.h>
+
 #include <array>
 #include <chrono>
 #include <limits>
@@ -258,6 +260,193 @@ u64 rtc_epoch_ticks(Context& context) {
     return ticks;
 }
 
+// --------------------------------------------------------------------------
+// Alarms (6.7)
+// --------------------------------------------------------------------------
+//
+// An alarm is a guest callback attached to a point on the timebase. The
+// scheduler keeps the deadline, because it is the thing that knows whether
+// anything can run before then; when it comes due, the callback runs on its
+// own thread, the way hardware runs it on a system thread.
+//
+// Timebase rather than wall clock is what makes this reproducible: an alarm
+// set for a millisecond from now fires after the same number of instructions
+// every run, so a replay sees it in the same place (10.4).
+
+/// Alarms register with the scheduler under their guest address. Nothing else
+/// uses that number space, and the address is already the alarm's identity.
+void arm_alarm(Context& context, u32 handle, u64 deadline);
+
+void fire_alarm(Context& context, u32 handle, u64 now) {
+    const auto it = context.alarms.find(handle);
+    if (it == context.alarms.end() || !it->second.armed) {
+        return;
+    }
+    Alarm& alarm = it->second;
+    ++alarm.fire_count;
+
+    // Periodic alarms re-arm from the deadline, not from now: drifting by the
+    // time it took to notice would make a 60 Hz alarm slowly lose frames.
+    if (alarm.period != 0) {
+        alarm.deadline += alarm.period;
+        if (alarm.deadline <= now) {
+            // The guest was away long enough to miss one. Hardware does not
+            // deliver the backlog either; it carries on from the next slot.
+            const u64 missed = ((now - alarm.deadline) / alarm.period) + 1;
+            alarm.deadline += missed * alarm.period;
+        }
+        arm_alarm(context, handle, alarm.deadline);
+    } else {
+        alarm.armed = false;
+    }
+
+    // Anything waiting in OSWaitAlarm wakes whether or not there is a
+    // callback: waiting on an alarm with no callback is a legitimate way to
+    // use one.
+    static_cast<void>(context.scheduler.unblock_all(handle));
+
+    if (alarm.callback == 0) {
+        return;
+    }
+
+    memory::Memory* const memory = context.memory;
+    if (memory == nullptr) {
+        WIIU_LOG_ERROR(Coreinit, "alarm {:#010x} fired with no memory to run its callback", handle);
+        return;
+    }
+
+    // OSAlarmCallback takes the alarm and the interrupted context; nothing
+    // here has an OSContext to hand, and a title that dereferences it would
+    // fault visibly rather than read something invented.
+    const std::array<u32, 2> arguments{handle, 0};
+    static_cast<void>(invoke_guest_callback(
+        context, *memory, fmt::format("alarm_{:#x}", handle), alarm.callback, arguments));
+}
+
+void arm_alarm(Context& context, u32 handle, u64 deadline) {
+    context.scheduler.set_timer(
+        handle, deadline, [&context, handle](u64 now) { fire_alarm(context, handle, now); });
+}
+
+void os_create_alarm(Call& call) {
+    const u32 handle = call.next_word();
+    Context& context = *detail::active_context();
+    context.scheduler.clear_timer(handle);
+    context.alarms[handle] = Alarm{};
+}
+
+void os_set_alarm(Call& call) {
+    const u32 handle = call.next_word();
+    const u64 ticks = call.next_long();
+    const u32 callback = call.next_word();
+
+    Context& context = *detail::active_context();
+    context.memory = &call.memory;
+
+    Alarm& alarm = context.alarms[handle];
+    alarm.deadline = call.state.timebase + ticks;
+    alarm.period = 0;
+    alarm.callback = callback;
+    alarm.armed = true;
+    arm_alarm(context, handle, alarm.deadline);
+    call.state.gpr[3] = 1;
+}
+
+void os_set_periodic_alarm(Call& call) {
+    const u32 handle = call.next_word();
+    const u64 start = call.next_long();
+    const u64 interval = call.next_long();
+    const u32 callback = call.next_word();
+
+    Context& context = *detail::active_context();
+    context.memory = &call.memory;
+
+    Alarm& alarm = context.alarms[handle];
+
+    // OSSetPeriodicAlarm takes an absolute start time, as OSGetTime returns
+    // it, and an interval. A start in the past means "begin one interval from
+    // now" rather than firing repeatedly to catch up.
+    const u64 now = call.state.timebase;
+    const u64 epoch = rtc_epoch_ticks(context);
+    const u64 start_ticks = start > epoch ? start - epoch : now;
+
+    alarm.deadline = start_ticks > now ? start_ticks : now + interval;
+    alarm.period = interval == 0 ? 1 : interval;
+    alarm.callback = callback;
+    alarm.armed = true;
+    arm_alarm(context, handle, alarm.deadline);
+    call.state.gpr[3] = 1;
+}
+
+void os_cancel_alarm(Call& call) {
+    const u32 handle = call.next_word();
+    Context& context = *detail::active_context();
+
+    const auto it = context.alarms.find(handle);
+    const bool was_armed = it != context.alarms.end() && it->second.armed;
+    if (it != context.alarms.end()) {
+        it->second.armed = false;
+    }
+    context.scheduler.clear_timer(handle);
+
+    // A cancelled alarm releases its waiters: they are waiting for something
+    // that is now never going to happen.
+    static_cast<void>(context.scheduler.unblock_all(handle));
+    call.state.gpr[3] = was_armed ? 1U : 0U;
+}
+
+void os_cancel_alarms(Call& call) {
+    const u32 tag = call.next_word();
+    Context& context = *detail::active_context();
+
+    u32 cancelled = 0;
+    for (auto& [handle, alarm] : context.alarms) {
+        if (!alarm.armed || alarm.tag != tag) {
+            continue;
+        }
+        alarm.armed = false;
+        context.scheduler.clear_timer(handle);
+        static_cast<void>(context.scheduler.unblock_all(handle));
+        ++cancelled;
+    }
+    call.state.gpr[3] = cancelled;
+}
+
+void os_wait_alarm(Call& call) {
+    const u32 handle = call.next_word();
+    Context& context = *detail::active_context();
+
+    const auto it = context.alarms.find(handle);
+    if (it == context.alarms.end() || !it->second.armed) {
+        // Nothing to wait for. Returning rather than blocking forever is the
+        // difference between a title that carries on and one that hangs.
+        call.state.gpr[3] = 0;
+        return;
+    }
+
+    call.state.gpr[3] = 1;
+    context.scheduler.block(call.state, BlockReason::Event, handle);
+}
+
+void os_set_alarm_user_data(Call& call) {
+    const u32 handle = call.next_word();
+    const u32 value = call.next_word();
+    detail::active_context()->alarms[handle].user_data = value;
+}
+
+void os_get_alarm_user_data(Call& call) {
+    const u32 handle = call.next_word();
+    Context& context = *detail::active_context();
+    const auto it = context.alarms.find(handle);
+    call.state.gpr[3] = it == context.alarms.end() ? 0U : it->second.user_data;
+}
+
+void os_set_alarm_tag(Call& call) {
+    const u32 handle = call.next_word();
+    const u32 tag = call.next_word();
+    detail::active_context()->alarms[handle].tag = tag;
+}
+
 void register_time(Registry& registry, Context& context) {
     detail::set_active_context(&context);
 
@@ -268,22 +457,16 @@ void register_time(Registry& registry, Context& context) {
     registry.add("coreinit", "OSTicksToCalendarTime", os_ticks_to_calendar_time);
     registry.add("coreinit", "OSCalendarTimeToTicks", os_calendar_time_to_ticks);
 
-    // Alarms need a callback the scheduler can run on a guest stack, which is
-    // the same mechanism the asynchronous FS calls are waiting on (6.9). Named
-    // here so a title that uses them says so instead of failing to link.
-    for (const char* name : {
-             "OSCreateAlarm",
-             "OSCreateAlarmEx",
-             "OSSetAlarm",
-             "OSSetPeriodicAlarm",
-             "OSSetAlarmUserData",
-             "OSGetAlarmUserData",
-             "OSCancelAlarm",
-             "OSCancelAlarms",
-             "OSWaitAlarm",
-         }) {
-        registry.add_stub("coreinit", name);
-    }
+    registry.add("coreinit", "OSCreateAlarm", os_create_alarm);
+    registry.add("coreinit", "OSCreateAlarmEx", os_create_alarm);
+    registry.add("coreinit", "OSSetAlarm", os_set_alarm);
+    registry.add("coreinit", "OSSetPeriodicAlarm", os_set_periodic_alarm);
+    registry.add("coreinit", "OSSetAlarmUserData", os_set_alarm_user_data);
+    registry.add("coreinit", "OSGetAlarmUserData", os_get_alarm_user_data);
+    registry.add("coreinit", "OSSetAlarmTag", os_set_alarm_tag);
+    registry.add("coreinit", "OSCancelAlarm", os_cancel_alarm);
+    registry.add("coreinit", "OSCancelAlarms", os_cancel_alarms);
+    registry.add("coreinit", "OSWaitAlarm", os_wait_alarm);
 }
 
 } // namespace wiiu::hle::coreinit

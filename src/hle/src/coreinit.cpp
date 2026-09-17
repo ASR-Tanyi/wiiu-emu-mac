@@ -3,6 +3,7 @@
 
 #include <fmt/format.h>
 
+#include <array>
 #include <cmath>
 #include <vector>
 
@@ -413,6 +414,198 @@ s32 fs_get_pos_file(
                : static_cast<s32>(FsStatus::FatalError);
 }
 
+// --------------------------------------------------------------------------
+// Asynchronous FS (6.9)
+// --------------------------------------------------------------------------
+//
+// The asynchronous calls do the same work as the synchronous ones and then
+// deliver the result later. "Later" is the part that matters: a title that
+// starts a read, sets a flag, and expects its callback to run after the call
+// returns would break if the callback ran inside it.
+//
+// The Phase 5 filesystem is synchronous, so the work happens immediately and
+// only the completion is scheduled -- on the timebase, through the same timer
+// list alarms use, so a replay delivers it at the same instruction (10.4).
+
+/// FSAsyncData as the guest lays it out: the callback, its context word, and
+/// the message queue to post to instead. Three big-endian words.
+struct AsyncData {
+    ppcaddr_t callback = 0;
+    u32 context = 0;
+    ppcaddr_t queue = 0;
+};
+
+[[nodiscard]] AsyncData read_async_data(Call& call, ppcaddr_t address) {
+    AsyncData data;
+    if (address == 0) {
+        return data;
+    }
+    static_cast<void>(call.memory.try_read<u32>(address, data.callback));
+    static_cast<void>(call.memory.try_read<u32>(address + 4, data.context));
+    static_cast<void>(call.memory.try_read<u32>(address + 8, data.queue));
+    return data;
+}
+
+/// Ids for the pending completions, from the range coreinit.hpp reserves for
+/// them. Held on the context rather than in a static: two runs of the same
+/// title in one process should not inherit each other's numbering.
+u32 next_async_id(Context& context) {
+    if (context.next_async_id < async_id_base) {
+        context.next_async_id = async_id_base;
+    }
+    return context.next_async_id++;
+}
+
+/// Claim a command block for a request. False means it already has one in
+/// flight: one block carries one request, and hardware refuses a second
+/// rather than queueing it.
+[[nodiscard]] bool claim_fs_block(ppcaddr_t block) {
+    Context* const context = active();
+    if (context == nullptr) {
+        return false;
+    }
+    if (block != 0 && !context->busy_fs_blocks.insert(block).second) {
+        WIIU_LOG_WARN(Coreinit, "FS command block {:#010x} already has a request in flight", block);
+        return false;
+    }
+    return true;
+}
+
+void complete_async(Call& call, ppcaddr_t client, ppcaddr_t block, s32 status, AsyncData data) {
+    Context& context = *active();
+    context.memory = &call.memory;
+
+    if (data.callback == 0) {
+        context.busy_fs_blocks.erase(block);
+        // A queue-based wait (FSGetAsyncResult on an OSMessageQueue) is the
+        // other half of this API and is not implemented. Saying so is the
+        // point: a title waiting on the queue would otherwise wait forever
+        // with nothing to show why.
+        WIIU_LOG_WARN(Coreinit,
+                      "asynchronous FS request completed with nothing to deliver it to "
+                      "(callback none, queue {:#010x}); a title waiting on the queue will wait "
+                      "for good",
+                      data.queue);
+        return;
+    }
+
+    const u32 id = next_async_id(context);
+    const ppcaddr_t callback = data.callback;
+    const u32 user_context = data.context;
+
+    context.scheduler.set_timer(id,
+                                call.state.timebase + fs_async_latency_ticks,
+                                [&context, client, block, status, callback, user_context](u64) {
+                                    context.busy_fs_blocks.erase(block);
+                                    if (context.memory == nullptr) {
+                                        return;
+                                    }
+                                    // FSAsyncCallback(FSClient*, FSCmdBlock*, FSStatus, void*).
+                                    const std::array<u32, 4> arguments{
+                                        client, block, static_cast<u32>(status), user_context};
+                                    static_cast<void>(invoke_guest_callback(
+                                        context, *context.memory, "fs_async", callback, arguments));
+                                });
+}
+
+void fs_open_file_async(Call& call) {
+    const u32 client = call.next_word();
+    const u32 block = call.next_word();
+    const u32 path_address = call.next_word();
+    const u32 mode_address = call.next_word();
+    const u32 handle_address = call.next_word();
+    static_cast<void>(call.next_word()); // error mask
+    const u32 async_address = call.next_word();
+
+    if (!claim_fs_block(block)) {
+        // The block is carrying another request. Refusing here is what
+        // hardware does, and it keeps two completions from arriving through
+        // the same structure.
+        call.state.gpr[3] = static_cast<u32>(FsStatus::FatalError);
+        return;
+    }
+
+    s32 status = static_cast<s32>(FsStatus::FatalError);
+    if (active() != nullptr) {
+        const std::string path = call.read_string(path_address);
+        const std::string mode = call.read_string(mode_address, 8);
+
+        u32 handle = 0;
+        const FsStatus result = active()->filesystem.open(path, mode, handle);
+        status = static_cast<s32>(result);
+        if (result == FsStatus::Ok && !call.memory.try_write<u32>(handle_address, handle)) {
+            static_cast<void>(active()->filesystem.close(handle));
+            status = static_cast<s32>(FsStatus::FatalError);
+        }
+    }
+
+    complete_async(call, client, block, status, read_async_data(call, async_address));
+
+    // The call itself reports whether the request was *accepted*, not what it
+    // found; the status goes to the callback.
+    call.state.gpr[3] = 0;
+}
+
+void fs_read_file_async(Call& call) {
+    const u32 client = call.next_word();
+    const u32 block = call.next_word();
+    const u32 buffer = call.next_word();
+    const u32 size = call.next_word();
+    const u32 count = call.next_word();
+    const u32 handle = call.next_word();
+    static_cast<void>(call.next_word()); // flags
+    const u32 async_address = call.next_word();
+
+    if (!claim_fs_block(block)) {
+        // The block is carrying another request. Refusing here is what
+        // hardware does, and it keeps two completions from arriving through
+        // the same structure.
+        call.state.gpr[3] = static_cast<u32>(FsStatus::FatalError);
+        return;
+    }
+
+    s32 status = static_cast<s32>(FsStatus::FatalError);
+    if (active() != nullptr) {
+        std::vector<u8> data;
+        const FsStatus result = active()->filesystem.read(
+            handle, static_cast<u32>(static_cast<u64>(size) * count), data);
+        if (result == FsStatus::End) {
+            status = 0;
+        } else if (result != FsStatus::Ok) {
+            status = static_cast<s32>(result);
+        } else if (!call.memory.write_bytes(buffer, data)) {
+            status = static_cast<s32>(FsStatus::FatalError);
+        } else {
+            status = size == 0 ? 0 : static_cast<s32>(data.size() / size);
+        }
+    }
+
+    complete_async(call, client, block, status, read_async_data(call, async_address));
+    call.state.gpr[3] = 0;
+}
+
+void fs_close_file_async(Call& call) {
+    const u32 client = call.next_word();
+    const u32 block = call.next_word();
+    const u32 handle = call.next_word();
+    static_cast<void>(call.next_word()); // error mask
+    const u32 async_address = call.next_word();
+
+    if (!claim_fs_block(block)) {
+        // The block is carrying another request. Refusing here is what
+        // hardware does, and it keeps two completions from arriving through
+        // the same structure.
+        call.state.gpr[3] = static_cast<u32>(FsStatus::FatalError);
+        return;
+    }
+
+    const s32 status = active() == nullptr ? static_cast<s32>(FsStatus::FatalError)
+                                           : static_cast<s32>(active()->filesystem.close(handle));
+
+    complete_async(call, client, block, status, read_async_data(call, async_address));
+    call.state.gpr[3] = 0;
+}
+
 } // namespace
 
 void register_all(Registry& registry, Context& context) {
@@ -453,6 +646,10 @@ void register_all(Registry& registry, Context& context) {
     registry.add("coreinit", "FSCloseFile", fs_close_file);
     registry.add("coreinit", "FSSetPosFile", fs_set_pos_file);
     registry.add("coreinit", "FSGetPosFile", fs_get_pos_file);
+
+    registry.add("coreinit", "FSOpenFileAsync", fs_open_file_async);
+    registry.add("coreinit", "FSReadFileAsync", fs_read_file_async);
+    registry.add("coreinit", "FSCloseFileAsync", fs_close_file_async);
 
     registry.add("coreinit", "DCFlushRange", dc_flush_range);
     registry.add("coreinit", "DCStoreRange", dc_flush_range);
