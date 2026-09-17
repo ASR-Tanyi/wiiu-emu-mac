@@ -169,6 +169,21 @@ struct alignas(64) CoreState {
     u32 dar = 0;
     u32 dsisr = 0;
 
+    // Address translation (Phase 3.4). Cold: only the MMU reads these, and
+    // only when MSR[IR] or MSR[DR] is set.
+    //
+    // The 750 architecture has four IBAT and four DBAT pairs; the 750CL (and
+    // so Espresso) adds a second set of four, enabled by HID4. Both sets live
+    // here and the MMU decides which are live, so a title that programs the
+    // upper BATs is a configuration question rather than a missing register.
+    std::array<u32, 16> sr{};    ///< segment registers, one per 256 MiB
+    std::array<u32, 8> ibat_u{}; ///< IBAT0U..IBAT7U
+    std::array<u32, 8> ibat_l{}; ///< IBAT0L..IBAT7L
+    std::array<u32, 8> dbat_u{}; ///< DBAT0U..DBAT7U
+    std::array<u32, 8> dbat_l{}; ///< DBAT0L..DBAT7L
+    u32 sdr1 = 0;                ///< page table origin and size
+    u32 hid4 = 0;                ///< 750CL: gates the upper four BAT pairs
+
     // Espresso / Gekko specifics.
     std::array<GqrRegister, 8> gqr{};
     u32 hid0 = 0;

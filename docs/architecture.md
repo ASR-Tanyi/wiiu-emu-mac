@@ -69,7 +69,7 @@ hot paths that difference is the point.
 
 *Phase 2.1 adds `be<T>`, the byte-swapping storage type.*
 
-### memory *(not built — Phase 3)*
+### memory
 
 A 4 GiB host reservation with the Cafe OS virtual map laid into it, so guest
 virtual → host pointer is one add. Fastmem (P3) is a design constraint here:
@@ -79,6 +79,15 @@ MMIO must be caught by a fault handler rather than a per-access check.
 The cache model is real, not decorative: the guest CPU is coherent with the
 other two cores but *not* with the GPU, so `DCFlushRange` and friends have to
 actually invalidate GPU-visible ranges.
+
+Address translation (Phase 3.4) sits in the CPU rather than here, because BATs,
+segment registers and SDR1 are CPU registers. With MSR[IR]/[DR] clear — where
+the HLE loader leaves the core — the effective address is used unchanged and
+translation costs one test. With them set, the BATs and the hashed page table
+are walked for real and cached in a TLB. One convention is worth knowing: this
+address space is keyed by *virtual* address, since MEM1 is committed where Cafe
+OS shows it rather than at physical zero, so a real address produced by a
+translation is mapped back through the region table before it is used.
 
 ### cpu
 

@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 
 using namespace wiiu;
@@ -16,8 +17,13 @@ namespace {
 class TempFile {
 public:
     explicit TempFile(std::string_view contents = {}) {
+        // The counter alone is not enough: ctest runs each test case in its
+        // own process and several at once, so two of them would start at zero
+        // and fight over the same file. That failed about one run in three,
+        // and only under -j.
         path_ = std::filesystem::temp_directory_path() /
-                std::filesystem::path{"wiiu-emu-test-" + std::to_string(counter()++) + ".toml"};
+                std::filesystem::path{"wiiu-emu-test-" + std::to_string(salt()) + "-" +
+                                      std::to_string(counter()++) + ".toml"};
         if (!contents.empty()) {
             write(contents);
         }
@@ -41,6 +47,13 @@ public:
 private:
     static int& counter() {
         static int value = 0;
+        return value;
+    }
+
+    /// One random value per process, so concurrent test processes cannot
+    /// collide however their counters line up.
+    static unsigned salt() {
+        static const unsigned value = std::random_device{}();
         return value;
     }
 

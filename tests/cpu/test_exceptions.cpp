@@ -236,3 +236,39 @@ TEST_CASE_METHOD(ExceptionFixture, "mftb reads the running timebase", "[cpu][tim
     // The instruction itself ticks the clock, so allow for that.
     CHECK(state.gpr[3] == 0x23456789U);
 }
+
+TEST_CASE_METHOD(ExceptionFixture,
+                 "MSR[IP] moves the vectors, and survives the exception",
+                 "[cpu][exception]") {
+    // IP selects the vector base, so clearing it on entry -- before the vector
+    // is computed -- would send every exception to the low addresses however
+    // the guest had configured it.
+    state.msr |= MsrBits::ip;
+    interpreter.raise(Exception::Dsi);
+
+    CHECK(state.pc == 0xFFF00300U);
+    CHECK((state.msr & MsrBits::ip) != 0);
+    CHECK((state.srr1 & MsrBits::ip) != 0);
+}
+
+TEST_CASE_METHOD(ExceptionFixture,
+                 "rfi restores the machine state, not the cause bits",
+                 "[cpu][exception]") {
+    // SRR1 carries both. Copying it into MSR wholesale would, for a privileged
+    // instruction exception, leave the core in power-saving mode on return.
+    constexpr u32 kEnc_rfi = 0x4C000064;
+
+    state.msr = MsrBits::ee | MsrBits::pr;
+    interpreter.raise(Exception::Program, ProgramCause::privileged);
+    REQUIRE((state.srr1 & ProgramCause::privileged) != 0);
+
+    state.pc = kLoadAddress;
+    REQUIRE(memory.try_write<u32>(kLoadAddress, kEnc_rfi));
+    state.srr0 = kLoadAddress + 8;
+    REQUIRE(interpreter.step() == StepResult::Ok);
+
+    CHECK(state.pc == kLoadAddress + 8);
+    CHECK((state.msr & MsrBits::ee) != 0);
+    CHECK((state.msr & MsrBits::pr) != 0);
+    CHECK((state.msr & MsrBits::pow) == 0); // the cause bit did not become state
+}

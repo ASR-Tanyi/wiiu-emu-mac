@@ -140,6 +140,22 @@ u64 Recording::hash_state(const cpu::CoreState& state) noexcept {
         hash = fold(hash, sprg);
     }
 
+    // Translation state (Phase 3.4). A run that disagrees about a segment
+    // register or a BAT reads different memory through the same address, which
+    // is a divergence that would otherwise only surface as wrong data much
+    // later.
+    for (const u32 segment : state.sr) {
+        hash = fold(hash, segment);
+    }
+    for (u32 index = 0; index < state.ibat_u.size(); ++index) {
+        hash = fold(hash, state.ibat_u[index]);
+        hash = fold(hash, state.ibat_l[index]);
+        hash = fold(hash, state.dbat_u[index]);
+        hash = fold(hash, state.dbat_l[index]);
+    }
+    hash = fold(hash, state.sdr1);
+    hash = fold(hash, state.hid4);
+
     hash = fold(hash, state.pc);
     hash = fold(hash, state.next_pc);
     hash = fold(hash, state.lr);

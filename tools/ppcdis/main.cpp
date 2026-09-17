@@ -107,6 +107,19 @@ using namespace wiiu::cpu;
         case Form::XfxMfcr:
             inst.rd = 3;
             break;
+        case Form::XSegFrom:
+        case Form::XSegTo:
+            inst.rd = 3;
+            inst.sr_field = 6;
+            break;
+        case Form::XSegFromReg:
+        case Form::XSegToReg:
+            inst.rd = 3;
+            inst.rb = 5;
+            break;
+        case Form::XTlb:
+            inst.rb = 5;
+            break;
         case Form::XlBranch:
             inst.bo = 12;
             inst.bi = 2;
@@ -189,6 +202,13 @@ using namespace wiiu::cpu;
         case Form::XMtfsf:
             inst.fm = 0xFF;
             inst.frb = 3;
+            break;
+        case Form::XMtfsb:
+            inst.crbd = 5;
+            break;
+        case Form::XMtfsfi:
+            inst.crfd = 3;
+            inst.imm4 = 5;
             break;
         case Form::PsQuantized:
             inst.frd = 1;

@@ -2,9 +2,10 @@
 
 A Wii U (Cafe) emulator for macOS, written in C++20 with a native Metal renderer.
 
-**Status: early scaffolding.** Phase 1 of [`plan.md`](plan.md). There is no
-emulation yet — the first milestone that runs anything is M2 (homebrew
-`OSReport` output), several phases away.
+**Status: M2 reached.** A homebrew RPX loads, runs on the Espresso
+interpreter and prints through `OSReport`. There is no renderer yet: M3
+(`OSScreen` output through Metal) is the next milestone. See
+[`plan.md`](plan.md).
 
 ## Requirements
 
@@ -14,6 +15,16 @@ emulation yet — the first milestone that runs anything is M2 (homebrew
 - CMake 3.24+, Ninja, and the Xcode command line tools.
 
 ## Build
+
+```sh
+scripts/build-macos.sh              # configure, build and test (debug)
+scripts/build-macos.sh release      # or: asan, core
+scripts/build-macos.sh debug --clean
+```
+
+The script prints only what went wrong when something does, and keeps the full
+output in `build/<preset>/build.log`. The underlying commands, if you would
+rather run them yourself:
 
 ```sh
 cmake --preset macos-debug
@@ -38,8 +49,8 @@ JIT once Phase 12 lands), `core-release`.
 | Path | Contents |
 |---|---|
 | `src/common` | Types, bit helpers, logging, version |
-| `src/memory` | Guest address space, MMU, cache model (Phase 3) |
-| `src/cpu` | Espresso interpreter, then JIT (Phases 4, 12) |
+| `src/memory` | Guest address space, regions, cache model (Phase 3) |
+| `src/cpu` | Espresso interpreter and MMU, then JIT (Phases 3.4, 4, 12) |
 | `src/loader` | RPX/RPL, discs, filesystem (Phase 5) |
 | `src/hle` | Cafe OS libraries (Phase 6) |
 | `src/gpu` | PM4, shader translation, Metal backend (Phases 7–8) |

@@ -94,13 +94,13 @@ MMIO: PI `0x0C000000`, GPU `0x0C200000`, audio `0x0C280000`, AHB trusted `0x0D00
 - [x] 3.1 Reserve a 4 GB `mmap` region as the guest address space; map MEM1/MEM2/MEM0 as sub-mappings so guest virtual → host pointer is a single add.
 - [x] 3.2 Implement the Cafe OS virtual map from the table above; represent it as a table of `MemoryRegion { virtual, size, physical, flags, name }`.
 - [x] 3.3 Typed accessors: `read<T>(addr)`, `write<T>(addr, value)` performing byte-swap; `translate(addr)` → host pointer. **⚠ Design for fastmem (P3) now.** Translation must reduce to `host_base + zero_extend32(guest_addr)` with no branch, with MMIO and unmapped access caught by a `SIGSEGV`/`SIGBUS` handler that decodes the faulting arm64 instruction. This removes a check from every guest load and store (10–40% of CPU time) and **cannot be retrofitted** onto an accessor API that assumed explicit checks.
-- [ ] 3.4 MMU model: BAT registers, segment registers, page table search. Start with a flat/identity fast path plus a fallback slow path that honours the real translation, so translation bugs surface but don't cost performance in the common case.
+- [x] 3.4 MMU model: BAT registers, segment registers, page table search. Start with a flat/identity fast path plus a fallback slow path that honours the real translation, so translation bugs surface but don't cost performance in the common case. *(`src/cpu/mmu.hpp`: eight IBAT/DBAT pairs with the upper four gated by HID4, sixteen segment registers, the hashed page table with both hashes, protection by PP and segment key, SR[N], reference and change bits, and a 256-entry direct-mapped TLB per side. Translation off is one test and the effective address passes through, so nothing is charged to the HLE path. Real addresses are mapped back through the region table, because Phase 3.1 keys the address space by virtual address — documented at the top of `mmu.hpp`, and the one place this deviates from hardware.)*
 - [x] 3.5 MMIO dispatch: address ranges routed to device handler objects (GPU, audio, IPC, PI) rather than backing memory — left unmapped so the P3 fault handler routes them. Shares its handler with SMC detection (**P15**), so design the two together.
 - [x] 3.6 Cache model: `DCFlushRange` / `DCInvalidateRange` / `DCZeroRange` / `ICInvalidateRange` must invalidate JIT blocks and mark GPU-visible ranges dirty. **Model the CPU↔GPU incoherency explicitly** — games depend on the flushes being real.
 - [x] 3.7 Memory watchpoints for the debugger.
 - [x] 3.8 Tests: region overlap assertions, read/write round-trips across region boundaries, MMIO routing.
 
-**Done when:** a synthetic test writes through every mapped region and reads back correct big-endian values, and MMIO writes reach a fake device. ✅ *Done except 3.4 (MMU), which waits until the CPU needs it.*
+**Done when:** a synthetic test writes through every mapped region and reads back correct big-endian values, and MMIO writes reach a fake device. ✅ *Phase 3 complete.*
 
 ---
 
@@ -113,15 +113,17 @@ MMIO: PI `0x0C000000`, GPU `0x0C200000`, audio `0x0C280000`, AHB trusted `0x0D00
 - [x] 4.3 Disassembler first — it makes every later bug tractable. Validated by **round-trip**: every instruction in the table is disassembled and fed back through binutils' PowerPC assembler, which must produce the identical word (`scripts/ppc_roundtrip.py`, wired into ctest). Stronger than diffing objdump text, since it checks meaning rather than spelling. 187/187 pass. Also ships `ppcdis`.
 - [x] 4.4 Integer instructions: arithmetic, logical, compare, rotate/shift, load/store (incl. byte-reversed `lwbrx`/`stwbrx`, multiple `lmw`/`stmw`, string). Condition register ops.
 - [x] 4.5 Branch unit: `b/bl/bc/bclr/bcctr`, link stack, `sc` system call trap.
-- [~] 4.6 FPU: IEEE-754 double + single ops, `frsp` rounding, FPSCR flags, `fmadd` family with the correct non-fused/fused behaviour, `fres`/`frsqrte` estimate tables matching 750CL precision. *(Arithmetic, compares, conversions and fused multiply-add done. Two gaps: `fres`/`frsqrte` are exact rather than table-based, so they differ from hardware in the low bits; and FPSCR exception bookkeeping beyond CR1 is not modelled.)*
+- [x] 4.6 FPU: IEEE-754 double + single ops, `frsp` rounding, FPSCR flags, `fmadd` family with the correct non-fused/fused behaviour, `fres`/`frsqrte` estimate tables matching 750CL precision. *(Estimates are now the 32-entry base/decrement tables, and FPSCR is modelled properly: sticky exception bits with FX meaning "first one", VX and FEX recomputed as summaries rather than stored, FPRF, FI and FR, the enable bits, `mtfsf`/`mtfsb0`/`mtfsb1`/`mtfsfi`/`mcrfs`, and a program exception when an enabled exception fires with MSR[FE0]/[FE1] set. Overflow, underflow and inexact are read back from the host FPU running in the guest's rounding mode, so they come from the arithmetic rather than from a guess about it; FR for a double-precision result is recovered by re-evaluating toward zero. Two gaps remain, both dormant while Cafe OS leaves the enables clear: an enabled exception does not suppress the result write, and MSR[FP] is not consulted, so there is no floating-point-unavailable exception. The estimate tables are transcribed hardware data and worth checking against the 750CL manual — the accuracy tests bound them at 1/256 and 1/32, and measure 1/943 and 1/5461.)*
 - [x] 4.7 **Paired singles**: `ps_add/sub/mul/div/madd/msub/sel/merge/neg/abs/res/rsqrte/cmp`, and `psq_l/psq_lu/psq_st/psq_stu` with all GQR quantization types (float, u8, u16, s8, s16) and scale exponents.
-- [~] 4.8 Supervisor: `mtmsr/mfmsr`, `mtspr/mfspr`, `rfi`, `tlbie`, cache instructions (`dcbz`, `dcbf`, `dcbst`, `icbi`, `dcbt`). *(Done except `tlbie`, which waits on 3.4.)*
+- [x] 4.8 Supervisor: `mtmsr/mfmsr`, `mtspr/mfspr`, `rfi`, `tlbie`, cache instructions (`dcbz`, `dcbf`, `dcbst`, `icbi`, `dcbt`). *(Complete with 3.4: `mtsr`/`mfsr`/`mtsrin`/`mfsrin`, `tlbie`, `tlbsync`, the BAT and SDR1 SPRs, and a privilege check — supervisor instructions and SPRs now take a program exception in problem state, without which the MMU would be decorative. No `tlbia`: the 750 does not implement it. Cache instructions translate their effective address like any other access.)*
 - [x] 4.9 Reservations: `lwarx`/`stwcx.` per-core reservation granule. Note the real hardware bug — model the *documented* behaviour, and add a compatibility switch if a title turns out to depend on the flaw.
 - [x] 4.10 Exception model: decrementer, external interrupt, DSI/ISI, program, floating-point unavailable, system call. Vector table at `0x00000100`-relative offsets honouring `MSR[IP]`. **Note: the Cafe OS map has nothing at low addresses, so 6.2's loader must place a vector page before exception delivery works.**
 - [x] 4.11 Timebase and decrementer driven from a host monotonic clock scaled to the timebase rate. *(Currently one tick per instruction — monotonic and proportional, not cycle-accurate, and deterministic, which 10.4 depends on. Hook to a host clock when frame pacing needs it. The rate is 62.15625 MHz: like every PowerPC 750 derivative the timebase counts the **bus** clock / 4, not the core clock / 4 — a factor of five that would have made every emulated second last a fifth as long.)*
 - [~] 4.12 **Test suite**: port/adapt an existing PPC instruction test corpus; write a self-checking guest test harness; differential-test the FPU against a software reference. Target: every implemented instruction has at least one test, edge cases (overflow, NaN, denormal, carry) have their own. *(Integer/branch done: 520 golden vectors from an independent Python reference in `scripts/gen_cpu_fixtures.py`, plus six binutils-assembled programs. Extend with the FP work.)*
 
 **Done when:** a hand-assembled PPC program computing a known result runs to completion, and the instruction test suite passes 100%.
+
+**Note on `rfi` and the vector base**, found while testing 3.4 and worth remembering: `MSR[IP]` selects the vector base, so it must survive exception entry — clearing it with the rest of the mask sends every exception to the low addresses whatever the guest configured. And `rfi` restores only the architected MSR bits: SRR1 also carries the exception's cause, and copying it wholesale puts the core into power-saving mode on the way back from a privileged-instruction exception.
 
 ---
 
@@ -347,10 +349,10 @@ This phase has no end, only milestones.
 
 ## Immediate next actions
 
-1. Phase 1.1–1.2 — repo layout and CMake skeleton (arm64, macOS 13 deployment target).
-2. Phase 1.4 — platform layer: `CAMetalLayer` window plus the `metal-cpp` RAII wrapper. Get a cleared frame on screen.
-3. Phase 1.8 — run the codesign + notarize round-trip once, with the JIT entitlement, on the empty app.
-4. Phase 2.1 — `be<T>`, with tests. Everything downstream depends on it.
-5. Decide the fastmem design (**P3**) before writing Phase 3.3 — it is the one performance item that constrains an API rather than following one.
-6. Phase 5.1 + 5.10 — `rpl-dump`, so real Wii U binaries are inspectable from week one.
-7. Install devkitPro + `wut` to build the homebrew test programs this plan is validated against.
+1. Phase 1.4 — platform layer: `CAMetalLayer` window plus the `metal-cpp` RAII wrapper. Get a cleared frame on screen. (Needs a Mac; everything below the renderer builds anywhere.)
+2. Phase 1.8 — run the codesign + notarize round-trip once, with the JIT entitlement, on the empty app, so Phase 12 does not meet it for the first time at the end.
+3. Phase 7.1 and 7.5 — the `GPUBackend` interface and the resource-binding decision (argument buffers tier 2 versus reserved slots), recorded as an ADR before Phase 8 starts depending on it.
+4. Close the Phase 6 gaps that a real title will hit first: 6.3 (three host threads plus idle-loop detection, **P2**), 6.5 (`OSCond`, `OSFastMutex`, atomics), 6.7 (alarms), 6.9 (asynchronous FS).
+5. Run an RPX built with devkitPro + `wut` through the loader. The current fixtures validate the parser against this project's reading of the format, not the format itself.
+6. Verify the `fres`/`frsqrte` estimate tables against the 750CL manual. They are transcribed hardware data; the accuracy tests bound them but cannot confirm the exact values.
+7. Decide what to do about MSR[FP]: nothing consults it, so there is no floating-point-unavailable exception, and a guest doing lazy FPU context switching would silently read stale registers.

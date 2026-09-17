@@ -9,13 +9,16 @@ wiiu_add_library(cpu
         src/exceptions.cpp
         src/interpreter.cpp
         src/interpreter_fpu.cpp
+        src/mmu.cpp
         src/opcodes.cpp
     HEADERS
         include/wiiu/cpu/backtrace.hpp
         include/wiiu/cpu/disassembler.hpp
         include/wiiu/cpu/exceptions.hpp
+        include/wiiu/cpu/fpscr.hpp
         include/wiiu/cpu/instruction.hpp
         include/wiiu/cpu/interpreter.hpp
+        include/wiiu/cpu/mmu.hpp
         include/wiiu/cpu/opcodes.hpp
         include/wiiu/cpu/state.hpp
     DEPS

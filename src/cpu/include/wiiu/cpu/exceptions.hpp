@@ -42,9 +42,29 @@ struct DsisrBits {
     static constexpr u32 is_store = 1U << 25;       ///< cleared for a load
 };
 
+/// An instruction storage exception reports the same conditions, but in SRR1
+/// rather than DSISR, and at different bit positions. Keeping the two sets
+/// apart is the point: a fetch fault and a data fault do not share a register.
+struct IsiCause {
+    static constexpr u32 not_translated = 1U << 30; ///< bit 1: no PTE
+    static constexpr u32 no_execute = 1U << 28;     ///< bit 3: SR[N] or guarded
+    static constexpr u32 protection = 1U << 27;     ///< bit 4: protection violation
+};
+
 /// MSR bits an exception clears on entry. ME and IP survive; everything to do
 /// with translation, interrupts and user mode does not.
-inline constexpr u32 msr_exception_clear_mask = 0x0004EF73;
+///
+/// IP is the one that has to be excluded by hand: it selects the vector base,
+/// so clearing it before the vector is computed sends every exception to
+/// 0x00000100 regardless of where the guest asked for them.
+inline constexpr u32 msr_exception_clear_mask = 0x0004EF33;
+
+/// The MSR bits an exception saves into SRR1 and `rfi` restores from it.
+/// Everything outside this mask keeps its current value on return: SRR1 also
+/// carries the exception's cause bits, and copying those into MSR wholesale
+/// would, among other things, put the core into power-saving mode on the way
+/// back from a privileged-instruction exception.
+inline constexpr u32 msr_restore_mask = 0x87C0FF73;
 
 /// Vector base, selected by MSR[IP].
 [[nodiscard]] constexpr ppcaddr_t exception_base(u32 msr) noexcept {

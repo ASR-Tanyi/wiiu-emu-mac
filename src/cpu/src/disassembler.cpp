@@ -32,14 +32,71 @@ struct SprName {
 };
 
 constexpr std::array kSprNames{
-    SprName{1, "xer"},     SprName{8, "lr"},      SprName{9, "ctr"},     SprName{18, "dsisr"},
-    SprName{19, "dar"},    SprName{22, "dec"},    SprName{25, "sdr1"},   SprName{26, "srr0"},
-    SprName{27, "srr1"},   SprName{272, "sprg0"}, SprName{273, "sprg1"}, SprName{274, "sprg2"},
-    SprName{275, "sprg3"}, SprName{284, "tbl"},   SprName{285, "tbu"},   SprName{287, "pvr"},
-    SprName{912, "gqr0"},  SprName{913, "gqr1"},  SprName{914, "gqr2"},  SprName{915, "gqr3"},
-    SprName{916, "gqr4"},  SprName{917, "gqr5"},  SprName{918, "gqr6"},  SprName{919, "gqr7"},
-    SprName{920, "hid2"},  SprName{921, "wpar"},  SprName{922, "dmau"},  SprName{923, "dmal"},
-    SprName{947, "scr"},   SprName{1008, "hid0"}, SprName{1009, "hid1"},
+    SprName{1, "xer"},
+    SprName{8, "lr"},
+    SprName{9, "ctr"},
+    SprName{18, "dsisr"},
+    SprName{19, "dar"},
+    SprName{22, "dec"},
+    SprName{25, "sdr1"},
+    SprName{26, "srr0"},
+    SprName{27, "srr1"},
+    SprName{272, "sprg0"},
+    SprName{273, "sprg1"},
+    SprName{274, "sprg2"},
+    SprName{275, "sprg3"},
+    SprName{284, "tbl"},
+    SprName{285, "tbu"},
+    SprName{287, "pvr"},
+    SprName{912, "gqr0"},
+    SprName{913, "gqr1"},
+    SprName{914, "gqr2"},
+    SprName{915, "gqr3"},
+    SprName{916, "gqr4"},
+    SprName{917, "gqr5"},
+    SprName{918, "gqr6"},
+    SprName{919, "gqr7"},
+    SprName{920, "hid2"},
+    SprName{921, "wpar"},
+    SprName{922, "dmau"},
+    SprName{923, "dmal"},
+    SprName{947, "scr"},
+    SprName{1008, "hid0"},
+    SprName{1009, "hid1"},
+    SprName{1011, "hid4"},
+    // Block address translation, in upper/lower pairs (Phase 3.4).
+    SprName{528, "ibat0u"},
+    SprName{529, "ibat0l"},
+    SprName{530, "ibat1u"},
+    SprName{531, "ibat1l"},
+    SprName{532, "ibat2u"},
+    SprName{533, "ibat2l"},
+    SprName{534, "ibat3u"},
+    SprName{535, "ibat3l"},
+    SprName{536, "dbat0u"},
+    SprName{537, "dbat0l"},
+    SprName{538, "dbat1u"},
+    SprName{539, "dbat1l"},
+    SprName{540, "dbat2u"},
+    SprName{541, "dbat2l"},
+    SprName{542, "dbat3u"},
+    SprName{543, "dbat3l"},
+    SprName{560, "ibat4u"},
+    SprName{561, "ibat4l"},
+    SprName{562, "ibat5u"},
+    SprName{563, "ibat5l"},
+    SprName{564, "ibat6u"},
+    SprName{565, "ibat6l"},
+    SprName{566, "ibat7u"},
+    SprName{567, "ibat7l"},
+    SprName{568, "dbat4u"},
+    SprName{569, "dbat4l"},
+    SprName{570, "dbat5u"},
+    SprName{571, "dbat5l"},
+    SprName{572, "dbat6u"},
+    SprName{573, "dbat6l"},
+    SprName{574, "dbat7u"},
+    SprName{575, "dbat7l"},
 };
 
 [[nodiscard]] std::string branch_target(ppcaddr_t address,
@@ -377,6 +434,17 @@ std::string disassemble(Instruction inst, ppcaddr_t address, const DisassemblyOp
         case Form::XMsrTo:
             return fmt::format("{} {}", name, formatter.gpr(inst.rs));
 
+        case Form::XSegFrom:
+            return fmt::format("{} {},{}", name, formatter.gpr(inst.rd), inst.sr_field.value());
+        case Form::XSegTo:
+            return fmt::format("{} {},{}", name, inst.sr_field.value(), formatter.gpr(inst.rs));
+        case Form::XSegFromReg:
+            return fmt::format("{} {},{}", name, formatter.gpr(inst.rd), formatter.gpr(inst.rb));
+        case Form::XSegToReg:
+            return fmt::format("{} {},{}", name, formatter.gpr(inst.rs), formatter.gpr(inst.rb));
+        case Form::XTlb:
+            return fmt::format("{} {}", name, formatter.gpr(inst.rb));
+
         case Form::XlBranch:
             return fmt::format("{} {},{}", name, inst.bo.value(), inst.bi.value());
         case Form::XlCr:
@@ -474,6 +542,10 @@ std::string disassemble(Instruction inst, ppcaddr_t address, const DisassemblyOp
             return fmt::format("{} {},{}", name, inst.fm.value(), formatter.fpr(inst.frb));
         case Form::XMcrfs:
             return fmt::format("{} {},{}", name, inst.crfd.value(), inst.crfs.value());
+        case Form::XMtfsb:
+            return fmt::format("{} {}", name, inst.crbd.value());
+        case Form::XMtfsfi:
+            return fmt::format("{} {},{}", name, inst.crfd.value(), inst.imm4.value());
 
         case Form::PsQuantized:
             return fmt::format("{} {},{}({}),{},{}",

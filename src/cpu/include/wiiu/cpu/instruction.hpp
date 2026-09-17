@@ -79,6 +79,10 @@ union Instruction {
     /// bits 11-20. The two halves are stored swapped; use `spr_number()`.
     BitField<11, 10, u32> spr_field;
 
+    /// bits 12-15. Which segment register mtsr/mfsr name. One bit narrower
+    /// than rA, which overlaps it: there are only sixteen of them.
+    BitField<16, 4, u32> sr_field;
+
     // --- paired singles (psq_l / psq_st) -----------------------------------
     BitField<15, 1, bool> ps_w; ///< bit 16     0 = load both slots, 1 = one
     BitField<12, 3, u32> ps_i;  ///< bits 17-19 which GQR to quantise through
@@ -88,7 +92,7 @@ union Instruction {
     BitField<11, 5, u32> nb;   ///< bits 16-20 byte count for lswi/stswi
     BitField<21, 5, u32> to;   ///< bits 6-10  trap conditions
     BitField<17, 8, u32> fm;   ///< bits 7-14  FPSCR field mask
-    BitField<11, 5, u32> imm4; ///< bits 16-19 immediate for mtfsfi
+    BitField<12, 4, u32> imm4; ///< bits 16-19 immediate for mtfsfi
 
     /// The SPR number, with the two 5-bit halves put back the right way round.
     ///
@@ -120,13 +124,24 @@ enum class Spr : u32 {
     Sprg2 = 274,
     Sprg3 = 275,
     Ear = 282,
+    /// Block address translation registers, in upper/lower pairs.
+    ///
+    ///   528-535  IBAT0U, IBAT0L, IBAT1U, ... IBAT3L
+    ///   536-543  DBAT0U ... DBAT3L
+    ///   560-567  IBAT4U ... IBAT7L   (750CL's second set, gated by HID4)
+    ///   568-575  DBAT4U ... DBAT7L
+    Ibat0U = 528,
+    Dbat0U = 536,
+    Ibat4U = 560,
+    Dbat4U = 568,
     Tbl = 284,
     Tbu = 285,
     Pvr = 287,
     Hid0 = 1008,
     Hid1 = 1009,
-    Hid2 = 920, ///< Gekko/Espresso: locked cache and paired-singles control
-    Gqr0 = 912, ///< paired-singles quantisation registers
+    Hid4 = 1011, ///< 750CL: among other things, enables BAT pairs 4-7
+    Hid2 = 920,  ///< Gekko/Espresso: locked cache and paired-singles control
+    Gqr0 = 912,  ///< paired-singles quantisation registers
     Gqr1 = 913,
     Gqr2 = 914,
     Gqr3 = 915,

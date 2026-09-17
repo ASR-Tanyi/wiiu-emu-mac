@@ -46,7 +46,9 @@ wiiu_add_test(cpu
         cpu/test_disassembler.cpp
         cpu/test_exceptions.cpp
         cpu/test_fpu.cpp
+        cpu/test_fpscr.cpp
         cpu/test_interpreter.cpp
+        cpu/test_mmu.cpp
         cpu/test_opcodes.cpp
     DEPS
         wiiu::cpu

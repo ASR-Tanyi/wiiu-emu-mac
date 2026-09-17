@@ -143,6 +143,16 @@ TEST_CASE("the state hash covers every architectural register", "[hle][recording
     CHECK(changes([](cpu::CoreState& s) { s.scr = 1; }));
     CHECK(changes([](cpu::CoreState& s) { s.wpar = 1; }));
 
+    // Translation state. Two runs that disagree about a segment register or a
+    // BAT are reading different memory through the same addresses.
+    CHECK(changes([](cpu::CoreState& s) { s.sr[9] = 1; }));
+    CHECK(changes([](cpu::CoreState& s) { s.ibat_u[2] = 1; }));
+    CHECK(changes([](cpu::CoreState& s) { s.ibat_l[2] = 1; }));
+    CHECK(changes([](cpu::CoreState& s) { s.dbat_u[7] = 1; }));
+    CHECK(changes([](cpu::CoreState& s) { s.dbat_l[7] = 1; }));
+    CHECK(changes([](cpu::CoreState& s) { s.sdr1 = 1; }));
+    CHECK(changes([](cpu::CoreState& s) { s.hid4 = 1; }));
+
     // A held lwarx reservation decides what the next stwcx. does, so two runs
     // that disagree about it have already diverged.
     CHECK(changes([](cpu::CoreState& s) { s.reserved = true; }));

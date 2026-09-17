@@ -33,6 +33,10 @@ std::string_view step_result_name(StepResult result) noexcept {
             return "memory fault";
         case StepResult::IllegalInstruction:
             return "illegal instruction";
+        case StepResult::Privileged:
+            return "privileged instruction";
+        case StepResult::FpException:
+            return "floating-point exception";
         case StepResult::Unimplemented:
             return "unimplemented";
     }
@@ -110,9 +114,11 @@ void Interpreter::raise(Exception exception, u32 srr1_extra) {
     state_.srr0 = state_.pc;
 
     // SRR1 carries the old MSR plus, for a program exception, the reason.
-    state_.srr1 = (state_.msr & 0x87C0FF73U) | srr1_extra;
+    state_.srr1 = (state_.msr & msr_restore_mask) | srr1_extra;
 
+    const u32 previous_msr = state_.msr;
     state_.msr &= ~msr_exception_clear_mask;
+    msr_changed(previous_msr);
 
     state_.pc = exception_base(state_.msr) + static_cast<u32>(exception);
     state_.next_pc = state_.pc;
@@ -146,10 +152,24 @@ StepResult Interpreter::handle_fault(StepResult result, Instruction inst) {
 
     switch (result) {
         case StepResult::MemoryFault: {
-            const memory::Fault& fault = memory_.last_fault();
-            state_.dar = fault.address;
-            state_.dsisr = (fault.unmapped ? DsisrBits::not_translated : DsisrBits::protection) |
-                           (fault.is_write ? DsisrBits::is_store : 0U);
+            // Two different failures arrive here. The MMU refusing to
+            // translate is the architectural one and reports its own reason;
+            // the memory layer refusing an access to an address that *was*
+            // translated is the emulator's own map saying no. Both are a DSI,
+            // and DSISR has to say which.
+            if (translation_fault_.active()) {
+                state_.dar = translation_fault_.address;
+                state_.dsisr = (translation_fault_.reason == TranslationFault::NotTranslated
+                                    ? DsisrBits::not_translated
+                                    : DsisrBits::protection) |
+                               (translation_fault_.is_write ? DsisrBits::is_store : 0U);
+            } else {
+                const memory::Fault& fault = memory_.last_fault();
+                state_.dar = fault.address;
+                state_.dsisr =
+                    (fault.unmapped ? DsisrBits::not_translated : DsisrBits::protection) |
+                    (fault.is_write ? DsisrBits::is_store : 0U);
+            }
             raise(Exception::Dsi);
             return StepResult::Ok;
         }
@@ -158,8 +178,16 @@ StepResult Interpreter::handle_fault(StepResult result, Instruction inst) {
             raise(Exception::Program, ProgramCause::illegal_instruction);
             return StepResult::Ok;
 
+        case StepResult::Privileged:
+            raise(Exception::Program, ProgramCause::privileged);
+            return StepResult::Ok;
+
         case StepResult::Trap:
             raise(Exception::Program, ProgramCause::trap);
+            return StepResult::Ok;
+
+        case StepResult::FpException:
+            raise(Exception::Program, ProgramCause::floating_point);
             return StepResult::Ok;
 
         case StepResult::Unimplemented:
@@ -200,11 +228,30 @@ StepResult Interpreter::step() {
         }
     }
 
+    // A fault from the previous instruction has been dealt with by now.
+    translation_fault_ = {};
+
+    const Translation fetch = mmu_.translate(state_.pc, AccessKind::Execute);
+
     u32 word = 0;
-    if (!memory_.try_read<u32>(state_.pc, word)) {
-        // A failed fetch is an instruction storage exception, not a data one.
+    if (!fetch.ok() || !memory_.try_read<u32>(fetch.address, word)) {
+        // A failed fetch is an instruction storage exception, not a data one,
+        // and its reason goes in SRR1 rather than DSISR.
         if (exception_mode_ == ExceptionMode::Deliver) {
-            raise(Exception::Isi);
+            u32 cause = IsiCause::not_translated;
+            switch (fetch.fault) {
+                case TranslationFault::Protection:
+                    cause = IsiCause::protection;
+                    break;
+                case TranslationFault::NoExecute:
+                case TranslationFault::DirectStore:
+                    cause = IsiCause::no_execute;
+                    break;
+                case TranslationFault::NotTranslated:
+                case TranslationFault::None:
+                    break;
+            }
+            raise(Exception::Isi, cause);
             return StepResult::Ok;
         }
         return StepResult::MemoryFault;
@@ -329,6 +376,12 @@ StepResult Interpreter::execute(Opcode id, Instruction inst) {
         case Opcode::Mtcrf:
         case Opcode::Mfmsr:
         case Opcode::Mtmsr:
+        case Opcode::Mfsr:
+        case Opcode::Mtsr:
+        case Opcode::Mfsrin:
+        case Opcode::Mtsrin:
+        case Opcode::Tlbie:
+        case Opcode::Tlbsync:
         case Opcode::Sc:
         case Opcode::Rfi:
         case Opcode::Tw:
@@ -393,10 +446,15 @@ StepResult Interpreter::execute(Opcode id, Instruction inst) {
         case Opcode::Fctiwz:
         case Opcode::Fcmpu:
         case Opcode::Fcmpo:
+            return execute_fp(id, inst);
+
         case Opcode::Mffs:
         case Opcode::Mtfsf:
+        case Opcode::Mtfsb0:
+        case Opcode::Mtfsb1:
+        case Opcode::Mtfsfi:
         case Opcode::Mcrfs:
-            return execute_fp(id, inst);
+            return execute_fpscr(id, inst);
 
         case Opcode::PsAdd:
         case Opcode::PsSub:
@@ -980,7 +1038,7 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
         case Opcode::Lbzx:
         case Opcode::Lbzux: {
             u8 byte = 0;
-            if (!memory_.try_read<u8>(address, byte)) {
+            if (!read_guest<u8>(address, byte)) {
                 return StepResult::MemoryFault;
             }
             value = byte;
@@ -992,7 +1050,7 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
         case Opcode::Lhzx:
         case Opcode::Lhzux: {
             u16 half = 0;
-            if (!memory_.try_read<u16>(address, half)) {
+            if (!read_guest<u16>(address, half)) {
                 return StepResult::MemoryFault;
             }
             value = half;
@@ -1003,7 +1061,7 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
         case Opcode::Lhau:
         case Opcode::Lhax: {
             u16 half = 0;
-            if (!memory_.try_read<u16>(address, half)) {
+            if (!read_guest<u16>(address, half)) {
                 return StepResult::MemoryFault;
             }
             value = extend16(half);
@@ -1014,13 +1072,13 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
         case Opcode::Lwzu:
         case Opcode::Lwzx:
         case Opcode::Lwzux:
-            if (!memory_.try_read<u32>(address, value)) {
+            if (!read_guest<u32>(address, value)) {
                 return StepResult::MemoryFault;
             }
             break;
 
         case Opcode::Lwarx:
-            if (!memory_.try_read<u32>(address, value)) {
+            if (!read_guest<u32>(address, value)) {
                 return StepResult::MemoryFault;
             }
             state_.reserved = true;
@@ -1031,7 +1089,7 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
         // little-endian value out of guest memory.
         case Opcode::Lhbrx: {
             u16 half = 0;
-            if (!memory_.try_read<u16>(address, half)) {
+            if (!read_guest<u16>(address, half)) {
                 return StepResult::MemoryFault;
             }
             value = swap_bytes(half);
@@ -1039,7 +1097,7 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
         }
         case Opcode::Lwbrx: {
             u32 word = 0;
-            if (!memory_.try_read<u32>(address, word)) {
+            if (!read_guest<u32>(address, word)) {
                 return StepResult::MemoryFault;
             }
             value = swap_bytes(word);
@@ -1051,7 +1109,7 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
             ppcaddr_t cursor = address;
             for (u32 reg = inst.rd; reg < 32; ++reg, cursor += 4) {
                 u32 word = 0;
-                if (!memory_.try_read<u32>(cursor, word)) {
+                if (!read_guest<u32>(cursor, word)) {
                     return StepResult::MemoryFault;
                 }
                 state_.gpr[reg] = word;
@@ -1062,7 +1120,7 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
         case Opcode::Stmw: {
             ppcaddr_t cursor = address;
             for (u32 reg = inst.rs; reg < 32; ++reg, cursor += 4) {
-                if (!memory_.try_write<u32>(cursor, state_.gpr[reg])) {
+                if (!write_guest<u32>(cursor, state_.gpr[reg])) {
                     return StepResult::MemoryFault;
                 }
             }
@@ -1073,7 +1131,7 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
         case Opcode::Stbu:
         case Opcode::Stbx:
             is_load = false;
-            if (!memory_.try_write<u8>(address, static_cast<u8>(state_.gpr[inst.rs]))) {
+            if (!write_guest<u8>(address, static_cast<u8>(state_.gpr[inst.rs]))) {
                 return StepResult::MemoryFault;
             }
             break;
@@ -1082,7 +1140,7 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
         case Opcode::Sthu:
         case Opcode::Sthx:
             is_load = false;
-            if (!memory_.try_write<u16>(address, static_cast<u16>(state_.gpr[inst.rs]))) {
+            if (!write_guest<u16>(address, static_cast<u16>(state_.gpr[inst.rs]))) {
                 return StepResult::MemoryFault;
             }
             break;
@@ -1092,22 +1150,21 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
         case Opcode::Stwx:
         case Opcode::Stwux:
             is_load = false;
-            if (!memory_.try_write<u32>(address, state_.gpr[inst.rs])) {
+            if (!write_guest<u32>(address, state_.gpr[inst.rs])) {
                 return StepResult::MemoryFault;
             }
             break;
 
         case Opcode::Sthbrx:
             is_load = false;
-            if (!memory_.try_write<u16>(address,
-                                        swap_bytes(static_cast<u16>(state_.gpr[inst.rs])))) {
+            if (!write_guest<u16>(address, swap_bytes(static_cast<u16>(state_.gpr[inst.rs])))) {
                 return StepResult::MemoryFault;
             }
             break;
 
         case Opcode::Stwbrx:
             is_load = false;
-            if (!memory_.try_write<u32>(address, swap_bytes(state_.gpr[inst.rs]))) {
+            if (!write_guest<u32>(address, swap_bytes(state_.gpr[inst.rs]))) {
                 return StepResult::MemoryFault;
             }
             break;
@@ -1118,7 +1175,7 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
             // reservation. Espresso's real implementation is buggy and Cafe OS
             // works around it; this is the documented behaviour.
             const bool held = state_.reserved && state_.reservation_address == address;
-            if (held && !memory_.try_write<u32>(address, state_.gpr[inst.rs])) {
+            if (held && !write_guest<u32>(address, state_.gpr[inst.rs])) {
                 return StepResult::MemoryFault;
             }
             state_.reserved = false;
@@ -1148,7 +1205,71 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
 // System, cache and special registers
 // --------------------------------------------------------------------------
 
+u32* Interpreter::bat_register(u32 number) noexcept {
+    const auto pick = [](std::array<u32, 8>& upper,
+                         std::array<u32, 8>& lower,
+                         u32 offset,
+                         u32 first_pair) -> u32* {
+        const u32 pair = first_pair + offset / 2;
+        return (offset % 2 == 0) ? &upper[pair] : &lower[pair];
+    };
+
+    if (number >= 528 && number <= 535) {
+        return pick(state_.ibat_u, state_.ibat_l, number - 528, 0);
+    }
+    if (number >= 536 && number <= 543) {
+        return pick(state_.dbat_u, state_.dbat_l, number - 536, 0);
+    }
+    if (number >= 560 && number <= 567) {
+        return pick(state_.ibat_u, state_.ibat_l, number - 560, 4);
+    }
+    if (number >= 568 && number <= 575) {
+        return pick(state_.dbat_u, state_.dbat_l, number - 568, 4);
+    }
+    return nullptr;
+}
+
 StepResult Interpreter::execute_system(Opcode id, Instruction inst) {
+    // Supervisor instructions are not merely discouraged in user mode: the
+    // hardware refuses them. Without this a guest running in problem state
+    // could reprogram its own translation, which makes the MMU decorative.
+    if ((state_.msr & MsrBits::pr) != 0) {
+        switch (id) {
+            case Opcode::Mfmsr:
+            case Opcode::Mtmsr:
+            case Opcode::Rfi:
+            case Opcode::Mfsr:
+            case Opcode::Mtsr:
+            case Opcode::Mfsrin:
+            case Opcode::Mtsrin:
+            case Opcode::Tlbie:
+            case Opcode::Tlbsync:
+            case Opcode::Dcbi:
+                return StepResult::Privileged;
+
+            // An SPR is privileged when bit 5 of its number is set, which is
+            // why LR (8) and CTR (9) are free and SRR0 (26) is not. The
+            // encoding stores the halves swapped, so this reads the assembled
+            // number rather than the field.
+            //
+            // Note what this makes privileged: the GQRs (912-919) are
+            // supervisor SPRs by that rule, so a title that programs its own
+            // quantisation registers from user mode takes an exception here.
+            // Nothing does today, because nothing runs in problem state yet.
+            // If one turns out to, it belongs behind a per-title compatibility
+            // switch (Phase 14.3) rather than a hole in this check.
+            case Opcode::Mfspr:
+            case Opcode::Mtspr:
+                if ((inst.spr_number() & 0x10) != 0) {
+                    return StepResult::Privileged;
+                }
+                break;
+
+            default:
+                break;
+        }
+    }
+
     switch (id) {
         case Opcode::Mfspr: {
             const u32 number = inst.spr_number();
@@ -1192,8 +1313,22 @@ StepResult Interpreter::execute_system(Opcode id, Instruction inst) {
                 case Spr::Wpar:
                     state_.gpr[inst.rd] = state_.wpar;
                     break;
+                case Spr::Sdr1:
+                    state_.gpr[inst.rd] = state_.sdr1;
+                    break;
+                case Spr::Dar:
+                    state_.gpr[inst.rd] = state_.dar;
+                    break;
+                case Spr::Dsisr:
+                    state_.gpr[inst.rd] = state_.dsisr;
+                    break;
+                case Spr::Hid4:
+                    state_.gpr[inst.rd] = state_.hid4;
+                    break;
                 default:
-                    if (number >= 272 && number <= 275) {
+                    if (const u32* bat = bat_register(number); bat != nullptr) {
+                        state_.gpr[inst.rd] = *bat;
+                    } else if (number >= 272 && number <= 275) {
                         state_.gpr[inst.rd] = state_.sprg[number - 272];
                     } else if (number >= 912 && number <= 919) {
                         state_.gpr[inst.rd] = state_.gqr[number - 912].value;
@@ -1244,8 +1379,29 @@ StepResult Interpreter::execute_system(Opcode id, Instruction inst) {
                 case Spr::Wpar:
                     state_.wpar = value;
                     break;
+                // Anything that changes a translation retires the TLB. The
+                // guest is required to follow these with a context
+                // synchronising instruction, but it is not required to
+                // invalidate entries it has just made meaningless.
+                case Spr::Sdr1:
+                    state_.sdr1 = value;
+                    mmu_.invalidate_all();
+                    break;
+                case Spr::Dar:
+                    state_.dar = value;
+                    break;
+                case Spr::Dsisr:
+                    state_.dsisr = value;
+                    break;
+                case Spr::Hid4:
+                    state_.hid4 = value;
+                    mmu_.invalidate_all();
+                    break;
                 default:
-                    if (number >= 272 && number <= 275) {
+                    if (u32* bat = bat_register(number); bat != nullptr) {
+                        *bat = value;
+                        mmu_.invalidate_all();
+                    } else if (number >= 272 && number <= 275) {
                         state_.sprg[number - 272] = value;
                     } else if (number >= 912 && number <= 919) {
                         state_.gqr[number - 912].value = value;
@@ -1285,13 +1441,54 @@ StepResult Interpreter::execute_system(Opcode id, Instruction inst) {
             state_.gpr[inst.rd] = state_.msr;
             return StepResult::Ok;
 
-        case Opcode::Mtmsr:
+        case Opcode::Mtmsr: {
+            const u32 previous = state_.msr;
             state_.msr = state_.gpr[inst.rs];
+            msr_changed(previous);
+            return StepResult::Ok;
+        }
+
+        case Opcode::Rfi: {
+            const u32 previous = state_.msr;
+            state_.next_pc = state_.srr0 & ~3U;
+
+            // Only the architected bits come back. SRR1's remaining bits are
+            // the exception's cause, and they are not machine state.
+            state_.msr = (state_.msr & ~msr_restore_mask) | (state_.srr1 & msr_restore_mask);
+            msr_changed(previous);
+            return StepResult::Ok;
+        }
+
+            // --- address translation (Phase 3.4) ------------------------------
+
+        case Opcode::Mfsr:
+            state_.gpr[inst.rd] = state_.sr[inst.sr_field];
             return StepResult::Ok;
 
-        case Opcode::Rfi:
-            state_.next_pc = state_.srr0 & ~3U;
-            state_.msr = state_.srr1;
+        case Opcode::Mtsr:
+            state_.sr[inst.sr_field] = state_.gpr[inst.rs];
+            mmu_.invalidate_all();
+            return StepResult::Ok;
+
+        // The indirect forms take the segment from the top four bits of rB,
+        // which is how software walks segments in a loop.
+        case Opcode::Mfsrin:
+            state_.gpr[inst.rd] = state_.sr[state_.gpr[inst.rb] >> 28];
+            return StepResult::Ok;
+
+        case Opcode::Mtsrin:
+            state_.sr[state_.gpr[inst.rb] >> 28] = state_.gpr[inst.rs];
+            mmu_.invalidate_all();
+            return StepResult::Ok;
+
+        case Opcode::Tlbie:
+            mmu_.invalidate(state_.gpr[inst.rb]);
+            return StepResult::Ok;
+
+        // tlbsync waits for other cores' invalidations to complete. Nothing
+        // here runs the TLBs concurrently, so there is nothing to wait for --
+        // but it is a real instruction and must not be an illegal one.
+        case Opcode::Tlbsync:
             return StepResult::Ok;
 
         case Opcode::Sc:
@@ -1321,21 +1518,41 @@ StepResult Interpreter::execute_system(Opcode id, Instruction inst) {
 
         // Cache maintenance drives the Phase 3.6 model, which is what makes a
         // CPU write visible to the GPU. These are not no-ops.
+        //
+        // They name a cache block by effective address, so they translate like
+        // any other access: a flush of an address the guest cannot reach is a
+        // data storage exception, not a silent no-op somewhere else.
         case Opcode::Dcbf:
-            memory_.dc_flush_range(effective_address_indexed(inst), 1);
-            return StepResult::Ok;
         case Opcode::Dcbst:
-            memory_.dc_flush_range(effective_address_indexed(inst), 1);
-            return StepResult::Ok;
         case Opcode::Dcbi:
-            memory_.dc_invalidate_range(effective_address_indexed(inst), 1);
-            return StepResult::Ok;
         case Opcode::Dcbz:
-            memory_.dc_zero_range(effective_address_indexed(inst), 1);
+        case Opcode::Icbi: {
+            const bool writes = id == Opcode::Dcbz;
+            const ppcaddr_t effective = effective_address_indexed(inst);
+            const Translation translation =
+                mmu_.translate(effective, writes ? AccessKind::Write : AccessKind::Read);
+            if (!translation.ok()) {
+                note_translation_fault(effective, writes, translation.fault);
+                return StepResult::MemoryFault;
+            }
+
+            switch (id) {
+                case Opcode::Dcbf:
+                case Opcode::Dcbst:
+                    memory_.dc_flush_range(translation.address, 1);
+                    break;
+                case Opcode::Dcbi:
+                    memory_.dc_invalidate_range(translation.address, 1);
+                    break;
+                case Opcode::Dcbz:
+                    memory_.dc_zero_range(translation.address, 1);
+                    break;
+                default:
+                    memory_.ic_invalidate_range(translation.address, 1);
+                    break;
+            }
             return StepResult::Ok;
-        case Opcode::Icbi:
-            memory_.ic_invalidate_range(effective_address_indexed(inst), 1);
-            return StepResult::Ok;
+        }
 
         // Prefetch hints and barriers have no architectural effect here: the
         // interpreter is sequential and the memory model is already stronger

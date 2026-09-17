@@ -43,6 +43,11 @@ enum class Form : u8 {
     XNone,        ///< (none)              sync, isync, rfi
     XMsrFrom,     ///< rD                  mfmsr
     XMsrTo,       ///< rS                  mtmsr
+    XSegFrom,     ///< rD, SR              mfsr
+    XSegTo,       ///< SR, rS              mtsr
+    XSegFromReg,  ///< rD, rB              mfsrin
+    XSegToReg,    ///< rS, rB              mtsrin
+    XTlb,         ///< rB                  tlbie
     XlBranch,     ///< BO, BI              bclr, bcctr
     XlCr,         ///< crbD, crbA, crbB    cror
     XlMcrf,       ///< crfD, crfS          mcrf
@@ -64,6 +69,8 @@ enum class Form : u8 {
     XMffs,        ///< frD                 mffs
     XMtfsf,       ///< FM, frB             mtfsf
     XMcrfs,       ///< crfD, crfS          mcrfs
+    XMtfsb,       ///< crbD                mtfsb0, mtfsb1
+    XMtfsfi,      ///< crfD, IMM           mtfsfi
     PsQuantized,  ///< frD, d(rA), W, I    psq_l
     PsQuantizedX, ///< frD, rA, rB, W, I   psq_lx
     Sc,           ///< (none)              sc
@@ -178,6 +185,14 @@ enum Flags : u8 {
     X(Mtcrf, "mtcrf", WIIU_PPC_XR(31, 144), Form::XfxMtcrf, FlagNone)                              \
     X(Mfmsr, "mfmsr", WIIU_PPC_XR(31, 83), Form::XMsrFrom, FlagNone)                               \
     X(Mtmsr, "mtmsr", WIIU_PPC_XR(31, 146), Form::XMsrTo, FlagNone)                                \
+    /* address translation (Phase 3.4). No tlbia: the 750 does not implement   */                  \
+    /* it -- the architecture makes it optional and the core traps it.         */                  \
+    X(Mfsr, "mfsr", WIIU_PPC_XR(31, 595), Form::XSegFrom, FlagNone)                                \
+    X(Mtsr, "mtsr", WIIU_PPC_XR(31, 210), Form::XSegTo, FlagNone)                                  \
+    X(Mfsrin, "mfsrin", WIIU_PPC_XR(31, 659), Form::XSegFromReg, FlagNone)                         \
+    X(Mtsrin, "mtsrin", WIIU_PPC_XR(31, 242), Form::XSegToReg, FlagNone)                           \
+    X(Tlbie, "tlbie", WIIU_PPC_XR(31, 306), Form::XTlb, FlagNone)                                  \
+    X(Tlbsync, "tlbsync", WIIU_PPC_XR(31, 566), Form::XNone, FlagNone)                             \
     /* loads, D-form */                                                                            \
     X(Lbz, "lbz", WIIU_PPC_D(34), Form::DLoad, FlagNone)                                           \
     X(Lbzu, "lbzu", WIIU_PPC_D(35), Form::DLoad, FlagNone)                                         \
@@ -278,6 +293,9 @@ enum Flags : u8 {
     X(Mffs, "mffs", WIIU_PPC_X(63, 583), Form::XMffs, FlagRc)                                      \
     X(Mtfsf, "mtfsf", WIIU_PPC_X(63, 711), Form::XMtfsf, FlagRc)                                   \
     X(Mcrfs, "mcrfs", WIIU_PPC_XR(63, 64), Form::XMcrfs, FlagNone)                                 \
+    X(Mtfsb0, "mtfsb0", WIIU_PPC_X(63, 70), Form::XMtfsb, FlagRc)                                  \
+    X(Mtfsb1, "mtfsb1", WIIU_PPC_X(63, 38), Form::XMtfsb, FlagRc)                                  \
+    X(Mtfsfi, "mtfsfi", WIIU_PPC_X(63, 134), Form::XMtfsfi, FlagRc)                                \
     /* paired singles -- the Gekko/Espresso extension */                                           \
     X(PsAdd, "ps_add", WIIU_PPC_A(4, 21), Form::Aab, FlagRc)                                       \
     X(PsSub, "ps_sub", WIIU_PPC_A(4, 20), Form::Aab, FlagRc)                                       \
