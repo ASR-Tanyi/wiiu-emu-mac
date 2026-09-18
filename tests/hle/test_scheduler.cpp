@@ -372,6 +372,11 @@ struct SyncFixture {
     static constexpr u32 kFast = 0x10001200;
     static constexpr u32 kBarrier = 0x10001300;
     static constexpr u32 kWord = 0x10001400;
+    static constexpr u32 kQueue = 0x10001500;
+    static constexpr u32 kRing = 0x10001600;   ///< the array the title supplies
+    static constexpr u32 kOutbox = 0x10001800; ///< where a receiver wants its message
+    static constexpr u32 kOutboxB = 0x10001820;
+    static constexpr u32 kMessage = 0x10001900; ///< the message a sender is sending
 
     SyncFixture() {
         std::string error;
@@ -411,6 +416,17 @@ struct SyncFixture {
         REQUIRE(thread != nullptr);
         return thread->state;
     }
+
+    /// Put an OSMessage at `address` and send it, returning what the call did.
+    u32 send(u32 queue, u32 value, u32 flags, std::string_view function = "OSSendMessage") {
+        REQUIRE(memory.try_write<u32>(kMessage, value));
+        REQUIRE(memory.try_write<u32>(kMessage + 4, value ^ 0xA5A5A5A5));
+        REQUIRE(memory.try_write<u32>(kMessage + 8, 0));
+        REQUIRE(memory.try_write<u32>(kMessage + 12, 0));
+        return call(function, {queue, kMessage, flags});
+    }
+
+    [[nodiscard]] u32 received(u32 address = kOutbox) { return memory.read<u32>(address); }
 };
 
 } // namespace
@@ -680,6 +696,54 @@ TEST_CASE_METHOD(SchedulerFixture, "only an exited thread can be forgotten", "[h
     CHECK(scheduler.current_handle() != kMain);
 }
 
+TEST_CASE_METHOD(SchedulerFixture,
+                 "the clock does not go backwards across a switch",
+                 "[hle][scheduler]") {
+    // The timebase lives in CoreState because that is where the interpreter
+    // counts it, but it belongs to the machine: it only ever goes forward, and
+    // every deadline in the scheduler is measured against it. Restoring it
+    // wholesale with the rest of a thread's context handed the core whatever
+    // that thread last saw -- zero, for one that had not run yet -- so an
+    // alarm or an asynchronous completion armed before the switch came due the
+    // moment the clock was put back.
+    static_cast<void>(spawn(kWorkerA));
+    REQUIRE(scheduler.resume(kWorkerA));
+
+    state.timebase = 5'000'000;
+    REQUIRE(scheduler.reschedule(state));
+    REQUIRE(scheduler.current_handle() == kWorkerA);
+    CHECK(state.timebase == 5'000'000U);
+
+    state.timebase = 6'000'000;
+    REQUIRE(scheduler.reschedule(state));
+    REQUIRE(scheduler.current_handle() == kMain);
+    CHECK(state.timebase == 6'000'000U);
+}
+
+TEST_CASE_METHOD(SchedulerFixture,
+                 "equal-priority waiters are woken in the order they waited",
+                 "[hle][scheduler]") {
+    // Cafe OS thread queues are FIFO within a priority level. Without a
+    // tiebreaker the order fell out of std::map's, which is by handle -- and a
+    // handle is wherever the title happened to allocate its OSThread. Which of
+    // two threads was served first then depended on the title's allocator.
+    constexpr u32 object = 0x10009000;
+
+    // kWorkerB has the higher handle, and waits first.
+    static_cast<void>(spawn(kWorkerB));
+    static_cast<void>(spawn(kWorkerA));
+    scheduler.block_thread(kWorkerB, BlockReason::Mutex, object);
+    scheduler.block_thread(kWorkerA, BlockReason::Mutex, object);
+
+    CHECK(scheduler.waiters(object) == std::vector<u32>{kWorkerB, kWorkerA});
+    CHECK(scheduler.unblock_one(object) == kWorkerB);
+
+    // Priority still comes first, though.
+    scheduler.block_thread(kWorkerB, BlockReason::Mutex, object);
+    scheduler.find(kWorkerA)->priority = 5;
+    CHECK(scheduler.waiters(object) == std::vector<u32>{kWorkerA, kWorkerB});
+}
+
 TEST_CASE_METHOD(SchedulerFixture, "a reset scheduler keeps no deadlines", "[hle][scheduler]") {
     scheduler.set_timer(0x1234, 500, [](u64) {});
     REQUIRE(scheduler.has_timer(0x1234));
@@ -687,4 +751,426 @@ TEST_CASE_METHOD(SchedulerFixture, "a reset scheduler keeps no deadlines", "[hle
     scheduler.reset();
     CHECK(scheduler.timer_count() == 0);
     CHECK_FALSE(scheduler.next_deadline().has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Message queues (6.5)
+// ---------------------------------------------------------------------------
+//
+// The queue a title waits on for anything the system hands it. The rule these
+// are mostly about: a woken thread resumes *after* the call it blocked in, so
+// whoever wakes a receiver has to have delivered the message already.
+
+TEST_CASE_METHOD(SyncFixture, "a message queue is first in, first out", "[hle][scheduler][queue]") {
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+
+    CHECK(send(kQueue, 0x1111, 0) == 1U);
+    CHECK(send(kQueue, 0x2222, 0) == 1U);
+    CHECK(send(kQueue, 0x3333, 0) == 1U);
+
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x1111U);
+    // The other three words come with it; a title that packs a command into
+    // args[0] and gets only `message` back is the bug this is watching for.
+    CHECK(memory.read<u32>(kOutbox + 4) == (0x1111U ^ 0xA5A5A5A5U));
+
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x2222U);
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x3333U);
+
+    // Empty, and the caller did not ask to wait.
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 0U);
+    CHECK(state_of(kMain) == ThreadState::Running);
+}
+
+TEST_CASE_METHOD(SyncFixture, "OSPeekMessage leaves the message alone", "[hle][scheduler][queue]") {
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+    CHECK(call("OSPeekMessage", {kQueue, kOutbox}) == 0U); // empty
+
+    CHECK(send(kQueue, 0x4444, 0) == 1U);
+    CHECK(call("OSPeekMessage", {kQueue, kOutbox}) == 1U);
+    CHECK(received() == 0x4444U);
+
+    // Still there.
+    CHECK(os.sync.message_queues[kQueue].entries.size() == 1U);
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x4444U);
+}
+
+TEST_CASE_METHOD(SyncFixture, "a jammed message goes to the head", "[hle][scheduler][queue]") {
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+
+    CHECK(send(kQueue, 0x1111, 0) == 1U);
+    CHECK(send(kQueue, 0x2222, 0, "OSJamMessage") == 1U);
+    // OS_MESSAGE_QUEUE_FLAG_HIGH_PRIORITY on an ordinary send does the same
+    // thing, which is how most titles jam one.
+    CHECK(send(kQueue, 0x3333, coreinit::message_flag_high_priority) == 1U);
+
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x3333U);
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x2222U);
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x1111U);
+}
+
+TEST_CASE_METHOD(SyncFixture, "a full queue refuses a message", "[hle][scheduler][queue]") {
+    // The capacity is the title's: it sized the array, and a send that ignored
+    // the size would overrun what it thinks it allocated.
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 2}));
+
+    CHECK(send(kQueue, 0x1111, 0) == 1U);
+    CHECK(send(kQueue, 0x2222, 0) == 1U);
+    CHECK(send(kQueue, 0x3333, 0) == 0U);
+    CHECK(state_of(kMain) == ThreadState::Running); // and it did not wait
+    CHECK(os.sync.message_queues[kQueue].entries.size() == 2U);
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "a blocking send waits for room and keeps its place",
+                 "[hle][scheduler][queue]") {
+    spawn_ready(kWorkerA);
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 1}));
+
+    CHECK(send(kQueue, 0x1111, 0) == 1U);
+    static_cast<void>(send(kQueue, 0x2222, coreinit::message_flag_block));
+
+    // Full, so the sender parks -- with its message, because by the time there
+    // is room this handler is long gone and nothing else knows what it wanted
+    // to send.
+    CHECK(state_of(kMain) == ThreadState::Blocked);
+    CHECK(os.scheduler.current_handle() == kWorkerA);
+    CHECK(os.sync.message_queues[kQueue].pending_sends.size() == 1U);
+
+    // The worker takes one out, which lets the parked sender in.
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x1111U);
+    CHECK(state_of(kMain) == ThreadState::Ready);
+    CHECK(os.sync.message_queues[kQueue].pending_sends.empty());
+
+    // And it went in behind what was already queued, not in front of it.
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x2222U);
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "a waiting receiver is handed the message directly",
+                 "[hle][scheduler][queue]") {
+    spawn_ready(kWorkerA);
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+
+    static_cast<void>(call("OSReceiveMessage", {kQueue, kOutbox, coreinit::message_flag_block}));
+    CHECK(state_of(kMain) == ThreadState::Blocked);
+    CHECK(os.scheduler.current_handle() == kWorkerA);
+
+    CHECK(send(kQueue, 0x5555, 0) == 1U);
+
+    // The message is already where the receiver asked for it. It resumes after
+    // its OSReceiveMessage and never looks at the queue again, so delivering it
+    // at wake time is the only moment there is.
+    CHECK(state_of(kMain) == ThreadState::Ready);
+    CHECK(received() == 0x5555U);
+    CHECK(memory.read<u32>(kOutbox + 4) == (0x5555U ^ 0xA5A5A5A5U));
+
+    // And it did not also land in the ring.
+    CHECK(os.sync.message_queues[kQueue].entries.empty());
+    CHECK(os.sync.message_queues[kQueue].pending_receives.empty());
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "the highest-priority receiver is served first",
+                 "[hle][scheduler][queue]") {
+    spawn_ready(kWorkerA);
+    spawn_ready(kWorkerB);
+    os.scheduler.find(kWorkerA)->priority = 5; // higher than the main thread's 16
+
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+
+    // Main parks first, then the worker that runs next parks too; the last
+    // runnable thread does the sending.
+    static_cast<void>(call("OSReceiveMessage", {kQueue, kOutbox, coreinit::message_flag_block}));
+    REQUIRE(os.scheduler.current_handle() == kWorkerA);
+    static_cast<void>(call("OSReceiveMessage", {kQueue, kOutboxB, coreinit::message_flag_block}));
+    REQUIRE(os.scheduler.current_handle() == kWorkerB);
+
+    CHECK(send(kQueue, 0x6666, 0) == 1U);
+
+    // Priority order, not arrival order: the worker waited second and is
+    // served first.
+    CHECK(state_of(kWorkerA) == ThreadState::Ready);
+    CHECK(state_of(kMain) == ThreadState::Blocked);
+    CHECK(received(kOutboxB) == 0x6666U);
+    CHECK(received(kOutbox) == 0U);
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "a queue that was never initialised is refused",
+                 "[hle][scheduler][queue]") {
+    // Zero capacity is not an empty queue, it is a queue nothing can ever go
+    // through. Treating it as empty would leave a title blocked on a send that
+    // can never be satisfied, with nothing to say why.
+    CHECK(send(kQueue, 0x1111, coreinit::message_flag_block) == 0U);
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, coreinit::message_flag_block}) == 0U);
+    CHECK(call("OSPeekMessage", {kQueue, kOutbox}) == 0U);
+    CHECK(state_of(kMain) == ThreadState::Running);
+
+    // Nor does a queue sized zero or negative pretend to work.
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 0}));
+    CHECK(send(kQueue, 0x1111, 0) == 0U);
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "the system can post to a queue from outside a call",
+                 "[hle][scheduler][queue]") {
+    // This is the path an asynchronous FS completion takes (6.9): it fires
+    // from a timer, where there is no guest call to hang the delivery off.
+    spawn_ready(kWorkerA);
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 1}));
+
+    static_cast<void>(call("OSReceiveMessage", {kQueue, kOutbox, coreinit::message_flag_block}));
+    REQUIRE(state_of(kMain) == ThreadState::Blocked);
+
+    coreinit::Message message;
+    message.value = 0x7777;
+    message.args[0] = 0x8888;
+    CHECK(coreinit::post_message(os, memory, kQueue, message));
+
+    CHECK(state_of(kMain) == ThreadState::Ready);
+    CHECK(received() == 0x7777U);
+    CHECK(memory.read<u32>(kOutbox + 4) == 0x8888U);
+
+    // With nobody waiting it queues; with no room it has nowhere to wait, so it
+    // says no rather than losing the message silently.
+    CHECK(coreinit::post_message(os, memory, kQueue, message));
+    CHECK_FALSE(coreinit::post_message(os, memory, kQueue, message));
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "a thread that exits while parked is not delivered to",
+                 "[hle][scheduler][queue]") {
+    spawn_ready(kWorkerA);
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+
+    static_cast<void>(call("OSReceiveMessage", {kQueue, kOutbox, coreinit::message_flag_block}));
+    REQUIRE(os.scheduler.current_handle() == kWorkerA);
+
+    // The main thread goes away while parked. Handles are guest OSThread
+    // pointers and do get reused, so a record left behind could be handed a
+    // message meant for a thread that no longer exists.
+    Thread* const parked = os.scheduler.find(kMain);
+    REQUIRE(parked != nullptr);
+    parked->state = ThreadState::Exited;
+
+    CHECK(send(kQueue, 0x9999, 0) == 1U);
+    CHECK(received() == 0U); // nothing was written into the dead thread's outbox
+    CHECK(os.sync.message_queues[kQueue].entries.size() == 1U);
+    CHECK(os.sync.message_queues[kQueue].pending_receives.empty());
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "equal-priority receivers are served in the order they waited",
+                 "[hle][scheduler][queue]") {
+    // kWorkerB has the higher handle and parks first, so a queue that served
+    // by handle would serve kWorkerA. The order two messages come back in
+    // would then depend on where the title allocated its OSThreads.
+    spawn_ready(kWorkerA);
+    spawn_ready(kWorkerB);
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+
+    // Park kWorkerB first, then kWorkerA, leaving the main thread free to send.
+    REQUIRE(os.scheduler.suspend(kWorkerA));
+    REQUIRE(os.scheduler.reschedule(state));
+    REQUIRE(os.scheduler.current_handle() == kWorkerB);
+    static_cast<void>(call("OSReceiveMessage", {kQueue, kOutboxB, coreinit::message_flag_block}));
+
+    REQUIRE(os.scheduler.suspend(kMain));
+    REQUIRE(os.scheduler.resume(kWorkerA));
+    REQUIRE(os.scheduler.reschedule(state));
+    REQUIRE(os.scheduler.current_handle() == kWorkerA);
+    static_cast<void>(call("OSReceiveMessage", {kQueue, kOutbox, coreinit::message_flag_block}));
+
+    coreinit::Message message;
+    message.value = 0xAAAA;
+    CHECK(coreinit::post_message(os, memory, kQueue, message));
+
+    CHECK(received(kOutboxB) == 0xAAAAU); // waited first
+    CHECK(received(kOutbox) == 0U);
+    CHECK(state_of(kWorkerB) == ThreadState::Ready);
+    CHECK(state_of(kWorkerA) == ThreadState::Blocked);
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "equal-priority senders are admitted in the order they waited",
+                 "[hle][scheduler][queue]") {
+    spawn_ready(kWorkerA);
+    spawn_ready(kWorkerB);
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 1}));
+    CHECK(send(kQueue, 0x1111, 0) == 1U); // fills it
+
+    // Same shape as the receiver case: the higher handle parks first.
+    REQUIRE(os.scheduler.suspend(kWorkerA));
+    REQUIRE(os.scheduler.reschedule(state));
+    REQUIRE(os.scheduler.current_handle() == kWorkerB);
+    static_cast<void>(send(kQueue, 0x2222, coreinit::message_flag_block));
+
+    REQUIRE(os.scheduler.suspend(kMain));
+    REQUIRE(os.scheduler.resume(kWorkerA));
+    REQUIRE(os.scheduler.reschedule(state));
+    REQUIRE(os.scheduler.current_handle() == kWorkerA);
+    static_cast<void>(send(kQueue, 0x3333, coreinit::message_flag_block));
+
+    REQUIRE(os.scheduler.resume(kMain));
+    REQUIRE(os.scheduler.reschedule(state));
+    REQUIRE(os.scheduler.current_handle() == kMain);
+
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x1111U);
+
+    // Exactly one sender gets in per message taken out, and it is the one that
+    // has been waiting longest.
+    CHECK(state_of(kWorkerB) == ThreadState::Ready);
+    CHECK(state_of(kWorkerA) == ThreadState::Blocked);
+    CHECK(os.sync.message_queues[kQueue].pending_sends.size() == 1U);
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x2222U);
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "the highest-priority sender is admitted first",
+                 "[hle][scheduler][queue]") {
+    spawn_ready(kWorkerA);
+    spawn_ready(kWorkerB);
+    os.scheduler.find(kWorkerB)->priority = 5; // higher than the others' 16
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 1}));
+    CHECK(send(kQueue, 0x1111, 0) == 1U);
+
+    // kWorkerA parks first, but kWorkerB outranks it.
+    REQUIRE(os.scheduler.suspend(kWorkerB));
+    REQUIRE(os.scheduler.reschedule(state));
+    REQUIRE(os.scheduler.current_handle() == kWorkerA);
+    static_cast<void>(send(kQueue, 0x2222, coreinit::message_flag_block));
+
+    REQUIRE(os.scheduler.suspend(kMain));
+    REQUIRE(os.scheduler.resume(kWorkerB));
+    REQUIRE(os.scheduler.reschedule(state));
+    REQUIRE(os.scheduler.current_handle() == kWorkerB);
+    static_cast<void>(send(kQueue, 0x3333, coreinit::message_flag_block));
+
+    REQUIRE(os.scheduler.resume(kMain));
+    REQUIRE(os.scheduler.reschedule(state));
+    static_cast<void>(call("OSReceiveMessage", {kQueue, kOutbox, 0}));
+
+    CHECK(state_of(kWorkerB) == ThreadState::Ready);
+    CHECK(state_of(kWorkerA) == ThreadState::Blocked);
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x3333U);
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "a parked send comes back true, with everything it was sending",
+                 "[hle][scheduler][queue]") {
+    spawn_ready(kWorkerA);
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 1}));
+    CHECK(send(kQueue, 0x1111, 0) == 1U);
+
+    // The sender sets its return value before it parks -- it cannot set one
+    // afterwards, because by then it is not the thread running. A blocking
+    // send only ever comes back having sent, so that value is TRUE.
+    static_cast<void>(send(kQueue, 0x2222, coreinit::message_flag_block));
+    REQUIRE(state_of(kMain) == ThreadState::Blocked);
+    CHECK(os.scheduler.find(kMain)->context.gpr[3] == 1U);
+
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+
+    // All four words were parked with it, not just the payload.
+    CHECK(received() == 0x2222U);
+    CHECK(memory.read<u32>(kOutbox + 4) == (0x2222U ^ 0xA5A5A5A5U));
+}
+
+TEST_CASE_METHOD(SyncFixture, "a parked jam is still a jam", "[hle][scheduler][queue]") {
+    spawn_ready(kWorkerA);
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 2}));
+    CHECK(send(kQueue, 0x1111, 0) == 1U);
+    CHECK(send(kQueue, 0x2222, 0) == 1U); // full
+
+    // Waiting for room does not cost a message its place at the head.
+    static_cast<void>(send(kQueue, 0x3333, coreinit::message_flag_block, "OSJamMessage"));
+    REQUIRE(state_of(kMain) == ThreadState::Blocked);
+
+    // The receiver takes what was already at the head, and the jam goes in
+    // front of what is left -- not behind it.
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x1111U);
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x3333U);
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x2222U);
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "a sender that exits while parked is not admitted",
+                 "[hle][scheduler][queue]") {
+    spawn_ready(kWorkerA);
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 1}));
+    CHECK(send(kQueue, 0x1111, 0) == 1U);
+    static_cast<void>(send(kQueue, 0x2222, coreinit::message_flag_block));
+    REQUIRE(os.scheduler.current_handle() == kWorkerA);
+
+    Thread* const parked = os.scheduler.find(kMain);
+    REQUIRE(parked != nullptr);
+    parked->state = ThreadState::Exited;
+
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x1111U);
+
+    // The dead thread's message is not admitted, and its record is gone: a
+    // handle is a guest OSThread pointer and gets reused.
+    CHECK(os.sync.message_queues[kQueue].entries.empty());
+    CHECK(os.sync.message_queues[kQueue].pending_sends.empty());
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "a failed receive leaves the caller's message alone",
+                 "[hle][scheduler][queue]") {
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+    REQUIRE(memory.try_write<u32>(kOutbox, 0xFEEDFACE));
+
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 0U);
+    CHECK(received() == 0xFEEDFACEU); // untouched, as a failed call leaves it
+
+    CHECK(call("OSPeekMessage", {kQueue, kOutbox}) == 0U);
+    CHECK(received() == 0xFEEDFACEU);
+}
+
+TEST_CASE_METHOD(SyncFixture, "re-initialising a queue empties it", "[hle][scheduler][queue]") {
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+    CHECK(send(kQueue, 0x1111, 0) == 1U);
+
+    // OSInitMessageQueue is what a title calls to (re)claim a queue; whatever
+    // was in it belongs to the queue it used to be.
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 1}));
+    CHECK(os.sync.message_queues[kQueue].entries.empty());
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 0U);
+
+    // ... and the new capacity is the one in force.
+    CHECK(send(kQueue, 0x2222, 0) == 1U);
+    CHECK(send(kQueue, 0x3333, 0) == 0U);
+
+    // A negative count is refused the same way zero is.
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 0xFFFFFFFF}));
+    CHECK(send(kQueue, 0x4444, 0) == 0U);
+}
+
+TEST_CASE_METHOD(SyncFixture, "the system can jam a message too", "[hle][scheduler][queue]") {
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+    CHECK(send(kQueue, 0x1111, 0) == 1U);
+
+    coreinit::Message urgent;
+    urgent.value = 0x2222;
+    CHECK(coreinit::post_message(os, memory, kQueue, urgent, true));
+
+    CHECK(call("OSReceiveMessage", {kQueue, kOutbox, 0}) == 1U);
+    CHECK(received() == 0x2222U);
 }

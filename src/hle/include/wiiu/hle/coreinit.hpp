@@ -11,6 +11,8 @@
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/hle/scheduler.hpp>
 
+#include <array>
+#include <deque>
 #include <functional>
 #include <map>
 #include <set>
@@ -66,6 +68,60 @@ struct Rendezvous {
     u32 arrived = 0;
 };
 
+/// One `OSMessage`: four big-endian words, of which the first is the payload
+/// and the other three are the caller's to use. Named `value` rather than
+/// `message` because `message.message` reads like a mistake.
+struct Message {
+    u32 value = 0;
+    std::array<u32, 3> args{};
+};
+
+inline constexpr u32 message_size = 4 * sizeof(u32);
+
+/// `OSMessageFlags`. Bit 0 asks to block rather than fail; bit 1 puts the
+/// message at the head of the queue, which is what OSJamMessage does.
+inline constexpr u32 message_flag_block = 0x1;
+inline constexpr u32 message_flag_high_priority = 0x2;
+
+/// The two thread queues inside `OSMessageQueue`, used here as the addresses
+/// senders and receivers block on. Blocking both on the queue's own address
+/// would make "wake a receiver" indistinguishable from "wake a sender"; these
+/// are the offsets hardware keeps its two `OSThreadQueue`s at, and being
+/// inside the structure they cannot collide with another object's address.
+inline constexpr u32 message_queue_send_wait_offset = 0x0C;
+inline constexpr u32 message_queue_recv_wait_offset = 0x1C;
+
+/// A thread parked in `OSSendMessage` on a full queue: what it is trying to
+/// post, and whether it asked for the head.
+struct PendingSend {
+    Message message;
+    bool jam = false;
+};
+
+/// A message queue. The ring itself is kept here rather than in the guest
+/// array the title supplied, for the same reason every other object's state
+/// is (the pointer is the identity) -- but the capacity the title declared is
+/// honoured, because a title that sizes a queue for four messages and sends a
+/// fifth without OS_MESSAGE_QUEUE_FLAG_BLOCK expects to be told no.
+///
+/// A queue that was never initialised has capacity zero, which is not a usable
+/// state: sends and receives on it are refused and logged rather than quietly
+/// treated as an empty queue that can never fill.
+struct MessageQueue {
+    ppcaddr_t messages = 0; ///< the guest array, remembered for diagnostics
+    u32 capacity = 0;
+    std::deque<Message> entries;
+
+    /// Threads parked in `OSReceiveMessage`, and where each wants its message
+    /// written. The message has to be delivered by whoever wakes the thread:
+    /// a woken thread resumes *after* its HLE call, so it never gets to look
+    /// at the queue again.
+    std::map<u32, ppcaddr_t> pending_receives;
+
+    /// Threads parked in `OSSendMessage`, with what each is trying to post.
+    std::map<u32, PendingSend> pending_sends;
+};
+
 struct SyncObjects {
     std::map<u32, Mutex> mutexes;
     std::map<u32, Event> events;
@@ -73,6 +129,7 @@ struct SyncObjects {
     std::map<u32, Condition> conditions;
     std::map<u32, FastMutex> fast_mutexes;
     std::map<u32, Rendezvous> rendezvous;
+    std::map<u32, MessageQueue> message_queues;
 
     void reset() {
         mutexes.clear();
@@ -81,6 +138,7 @@ struct SyncObjects {
         conditions.clear();
         fast_mutexes.clear();
         rendezvous.clear();
+        message_queues.clear();
     }
 };
 
@@ -109,6 +167,36 @@ struct AsyncFsRequest {
     ppcaddr_t callback = 0;
     u32 context = 0;
 };
+
+/// Where the `FSAsyncResult` for a queue-delivered completion is written, as
+/// an offset into the caller's `FSCmdBlock`.
+///
+/// Hardware keeps it inside the command block too, and the block is opaque to
+/// the title -- it hands one to FSInitCmdBlock and never reads it directly --
+/// so the start of it is as good a place as any, and it is where the message
+/// posted to the queue points. Ten words:
+///
+///     +0x00 FSAsyncData: callback, context, queue
+///     +0x0c OSMessage:   the message this was delivered as
+///     +0x1c FSClient*
+///     +0x20 FSCmdBlock*
+///     +0x24 FSStatus
+inline constexpr u32 fs_async_result_offset = 0;
+inline constexpr u32 fs_async_result_size = 0x28;
+
+/// Where each field sits inside it. Named rather than written out at the one
+/// place that fills them in, because the tests check the same layout and two
+/// copies of a structure offset is how they drift apart.
+inline constexpr u32 fs_async_result_callback = 0x00;
+inline constexpr u32 fs_async_result_context = 0x04;
+inline constexpr u32 fs_async_result_queue = 0x08;
+inline constexpr u32 fs_async_result_message = 0x0C;
+inline constexpr u32 fs_async_result_client = 0x1C;
+inline constexpr u32 fs_async_result_block = 0x20;
+inline constexpr u32 fs_async_result_status = 0x24;
+
+static_assert(fs_async_result_message + message_size == fs_async_result_client);
+static_assert(fs_async_result_status + sizeof(u32) == fs_async_result_size);
 
 /// A recycled callback thread: its stack and the handle that goes with it.
 struct CallbackSlot {
@@ -175,6 +263,16 @@ struct Context {
     /// the same title — which is why it goes through the recording.
     u64 rtc_epoch = 0;
     bool rtc_valid = false;
+
+    /// Put everything that belongs to a running title back to how it started.
+    ///
+    /// The pieces reset each other's assumptions, which is why this is one
+    /// call rather than a scheduler reset here and a sync reset there:
+    /// dropping the scheduler's timers without clearing `busy_fs_blocks`
+    /// leaves every command block marked as carrying a request that can no
+    /// longer complete, and clearing the sync objects without waking what was
+    /// parked on them leaves threads blocked on queues that no longer exist.
+    void reset();
 };
 
 /// Wii U calendar time. Laid out exactly as `OSCalendarTime` is in guest
@@ -227,6 +325,23 @@ void register_all(Registry& registry, Context& context);
 /// Threads, mutexes, events and semaphores (6.4 / 6.5). Called by
 /// register_all; separate because the blocking rules differ.
 void register_threads(Registry& registry, Context& context);
+
+/// An `OSMessage` in guest memory, read and written. Shared because the
+/// asynchronous filesystem builds one too.
+[[nodiscard]] Message read_message(memory::Memory& memory, ppcaddr_t address);
+bool write_message(memory::Memory& memory, ppcaddr_t address, const Message& message);
+
+/// Post a message to a queue from outside any guest call.
+///
+/// The asynchronous filesystem (6.9) delivers completions this way, and a
+/// completion fires from a timer, where there is no `Call` to take memory
+/// from. Returns false if the queue was never initialised or is full -- there
+/// is nobody to block here, so a full queue drops the message and says so.
+bool post_message(Context& context,
+                  memory::Memory& memory,
+                  ppcaddr_t queue,
+                  const Message& message,
+                  bool jam = false);
 
 /// How big a stack an OS callback thread gets. Callbacks are meant to be
 /// short; a title doing real work in one gets the same 16 KiB hardware would

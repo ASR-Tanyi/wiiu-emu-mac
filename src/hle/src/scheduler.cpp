@@ -45,6 +45,8 @@ std::string_view block_reason_name(BlockReason reason) noexcept {
             return "condition";
         case BlockReason::Rendezvous:
             return "rendezvous";
+        case BlockReason::MessageQueue:
+            return "message queue";
         case BlockReason::Join:
             return "join";
         case BlockReason::Sleep:
@@ -59,6 +61,7 @@ void Scheduler::reset() {
     current_ = 0;
     switches_ = 0;
     skipped_ticks_ = 0;
+    next_block_sequence_ = 1;
     servicing_timers_ = false;
 }
 
@@ -233,7 +236,17 @@ void Scheduler::save_current(const cpu::CoreState& state) {
 }
 
 void Scheduler::restore(Thread& thread, cpu::CoreState& state) {
+    // The timebase belongs to the machine, not to a thread. It is in
+    // `CoreState` because the interpreter counts it there, but it is a clock
+    // that only ever goes forward, and a whole-struct copy would hand the core
+    // whatever the incoming thread last saw -- zero, for one that has not run
+    // yet. Every deadline in this file is measured against it, so a switch
+    // that rewound it fired alarms and asynchronous completions immediately,
+    // or never.
+    const u64 now = state.timebase;
     state = thread.context;
+    state.timebase = now;
+
     thread.state = ThreadState::Running;
     current_ = thread.handle;
 }
@@ -437,7 +450,19 @@ void Scheduler::block(cpu::CoreState& state, BlockReason reason, u32 object) {
     thread->state = ThreadState::Blocked;
     thread->block_reason = reason;
     thread->blocked_on = object;
+    thread->block_sequence = next_block_sequence_++;
     static_cast<void>(reschedule(state));
+}
+
+bool Scheduler::waits_before(const Thread& left, const Thread& right) noexcept {
+    // Priority first, and within a priority whoever has been waiting longest.
+    // Cafe OS thread queues are FIFO within a level, and a title that sends two
+    // messages through two equal-priority threads gets them back in the order
+    // it sent them -- not in the order its allocator handed out OSThreads.
+    if (left.priority != right.priority) {
+        return left.priority < right.priority;
+    }
+    return left.block_sequence < right.block_sequence;
 }
 
 void Scheduler::unblock(u32 handle) {
@@ -470,7 +495,7 @@ u32 Scheduler::unblock_one(u32 object) {
         if (thread.state != ThreadState::Blocked || thread.blocked_on != object) {
             continue;
         }
-        if (best == nullptr || thread.priority < best->priority) {
+        if (best == nullptr || waits_before(thread, *best)) {
             best = &thread;
         }
     }
@@ -490,8 +515,8 @@ std::vector<u32> Scheduler::waiters(u32 object) const {
             found.push_back(&thread);
         }
     }
-    std::ranges::stable_sort(
-        found, [](const Thread* lhs, const Thread* rhs) { return lhs->priority < rhs->priority; });
+    std::ranges::sort(
+        found, [](const Thread* lhs, const Thread* rhs) { return waits_before(*lhs, *rhs); });
 
     std::vector<u32> handles;
     handles.reserve(found.size());
@@ -509,6 +534,7 @@ void Scheduler::block_thread(u32 handle, BlockReason reason, u32 object) {
     thread->state = ThreadState::Blocked;
     thread->block_reason = reason;
     thread->blocked_on = object;
+    thread->block_sequence = next_block_sequence_++;
 }
 
 void Scheduler::exit_current(cpu::CoreState& state, s32 value) {

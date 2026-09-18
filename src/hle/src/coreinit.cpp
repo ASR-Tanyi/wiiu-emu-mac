@@ -471,41 +471,102 @@ u32 next_async_id(Context& context) {
     return true;
 }
 
+/// Fill in the `FSAsyncResult` a queue-delivered completion points at. It
+/// lives in the caller's command block, which is opaque to the title and
+/// already claimed by this request.
+[[nodiscard]] bool write_async_result(memory::Memory& memory,
+                                      ppcaddr_t result,
+                                      ppcaddr_t client,
+                                      ppcaddr_t block,
+                                      s32 status,
+                                      const AsyncData& data,
+                                      const Message& message) {
+    bool ok = memory.try_write<u32>(result + fs_async_result_callback, data.callback);
+    ok = memory.try_write<u32>(result + fs_async_result_context, data.context) && ok;
+    ok = memory.try_write<u32>(result + fs_async_result_queue, data.queue) && ok;
+    ok = write_message(memory, result + fs_async_result_message, message) && ok;
+    ok = memory.try_write<u32>(result + fs_async_result_client, client) && ok;
+    ok = memory.try_write<u32>(result + fs_async_result_block, block) && ok;
+    ok = memory.try_write<u32>(result + fs_async_result_status, static_cast<u32>(status)) && ok;
+
+    if (!ok) {
+        WIIU_LOG_WARN(
+            Coreinit, "could not write the FSAsyncResult into command block {:#010x}", block);
+    }
+    return ok;
+}
+
 void complete_async(Call& call, ppcaddr_t client, ppcaddr_t block, s32 status, AsyncData data) {
     Context& context = *active();
     context.memory = &call.memory;
 
-    if (data.callback == 0) {
+    if (data.callback == 0 && data.queue == 0) {
         context.busy_fs_blocks.erase(block);
-        // A queue-based wait (FSGetAsyncResult on an OSMessageQueue) is the
-        // other half of this API and is not implemented. Saying so is the
-        // point: a title waiting on the queue would otherwise wait forever
-        // with nothing to show why.
+        // Neither half of the API was asked for. Hardware would leave the
+        // caller waiting on something that never arrives; saying so here is
+        // what makes that legible rather than a title that simply stops.
         WIIU_LOG_WARN(Coreinit,
-                      "asynchronous FS request completed with nothing to deliver it to "
-                      "(callback none, queue {:#010x}); a title waiting on the queue will wait "
-                      "for good",
-                      data.queue);
+                      "asynchronous FS request on command block {:#010x} completed with neither a "
+                      "callback nor a queue to deliver it to",
+                      block);
+        return;
+    }
+
+    if (data.callback == 0 && block == 0) {
+        // The queue half needs somewhere to put the FSAsyncResult, and the
+        // command block is that somewhere.
+        context.busy_fs_blocks.erase(block);
+        WIIU_LOG_WARN(Coreinit,
+                      "asynchronous FS request with a queue but no command block to put the "
+                      "result in; dropping the completion");
         return;
     }
 
     const u32 id = next_async_id(context);
-    const ppcaddr_t callback = data.callback;
-    const u32 user_context = data.context;
 
-    context.scheduler.set_timer(id,
-                                call.state.timebase + fs_async_latency_ticks,
-                                [&context, client, block, status, callback, user_context](u64) {
-                                    context.busy_fs_blocks.erase(block);
-                                    if (context.memory == nullptr) {
-                                        return;
-                                    }
-                                    // FSAsyncCallback(FSClient*, FSCmdBlock*, FSStatus, void*).
-                                    const std::array<u32, 4> arguments{
-                                        client, block, static_cast<u32>(status), user_context};
-                                    static_cast<void>(invoke_guest_callback(
-                                        context, *context.memory, "fs_async", callback, arguments));
-                                });
+    context.scheduler.set_timer(
+        id,
+        call.state.timebase + fs_async_latency_ticks,
+        [&context, client, block, status, data](u64) {
+            context.busy_fs_blocks.erase(block);
+            if (context.memory == nullptr) {
+                return;
+            }
+            if (data.callback != 0) {
+                // A request carrying both is delivered to the callback, which
+                // is what hardware does: the queue coreinit posts to on the
+                // way there is its own, not the title's.
+                // FSAsyncCallback(FSClient*, FSCmdBlock*, FSStatus, void*).
+                const std::array<u32, 4> arguments{
+                    client, block, static_cast<u32>(status), data.context};
+                static_cast<void>(invoke_guest_callback(
+                    context, *context.memory, "fs_async", data.callback, arguments));
+                return;
+            }
+
+            // The queue half: the message carries a pointer to an
+            // FSAsyncResult, which is what FSGetAsyncResult hands back. The
+            // result also records the message it arrived as, so a title that
+            // reads `result->ioMsg` sees what it received.
+            Message message;
+            message.value = block + fs_async_result_offset;
+            if (!write_async_result(
+                    *context.memory, message.value, client, block, status, data, message)) {
+                return;
+            }
+            if (!post_message(context, *context.memory, data.queue, message)) {
+                // The request is over as far as the driver is concerned, so the
+                // command block is free -- but the title is still waiting for a
+                // message that is never coming. Naming the block is what turns
+                // that into something findable rather than a title that stops.
+                WIIU_LOG_WARN(Coreinit,
+                              "the completion for FS command block {:#010x} could not be "
+                              "delivered to queue {:#010x}; whoever was waiting for it will "
+                              "keep waiting",
+                              block,
+                              data.queue);
+            }
+        });
 }
 
 void fs_open_file_async(Call& call) {
@@ -606,6 +667,15 @@ void fs_close_file_async(Call& call) {
     call.state.gpr[3] = 0;
 }
 
+/// `FSAsyncResult *FSGetAsyncResult(OSMessage *message)` -- the first word of
+/// the message the completion was posted as. A one-line function on hardware
+/// too; it exists so the title does not have to know that much about the
+/// message layout.
+void fs_get_async_result(Call& call) {
+    const u32 message_address = call.next_word();
+    call.state.gpr[3] = read_message(call.memory, message_address).value;
+}
+
 } // namespace
 
 void register_all(Registry& registry, Context& context) {
@@ -650,6 +720,7 @@ void register_all(Registry& registry, Context& context) {
     registry.add("coreinit", "FSOpenFileAsync", fs_open_file_async);
     registry.add("coreinit", "FSReadFileAsync", fs_read_file_async);
     registry.add("coreinit", "FSCloseFileAsync", fs_close_file_async);
+    registry.add("coreinit", "FSGetAsyncResult", fs_get_async_result);
 
     registry.add("coreinit", "DCFlushRange", dc_flush_range);
     registry.add("coreinit", "DCStoreRange", dc_flush_range);
@@ -660,6 +731,8 @@ void register_all(Registry& registry, Context& context) {
     // reports the function by name instead of as an unresolved import, and
     // the list doubles as the to-do for Phase 6.4 onwards.
     for (const char* name : {
+             "OSGetSystemMessageQueue",
+             "FSInitCmdBlock",
              "OSDynLoad_Acquire",
              "OSDynLoad_FindExport",
              "OSDynLoad_Release",

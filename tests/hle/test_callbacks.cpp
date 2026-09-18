@@ -52,6 +52,21 @@ constexpr u32 kEnc_blr = 0x4E800020;
     return 0x38000000U | (reg << 21) | (value & 0xFFFF);
 }
 
+/// `lis reg,hi` then `ori reg,reg,lo`: a full 32-bit constant, which the
+/// addresses these tests pass around all are.
+[[nodiscard]] constexpr u32 lis(u32 reg, u32 value) {
+    return 0x3C000000U | (reg << 21) | (value >> 16);
+}
+
+[[nodiscard]] constexpr u32 ori(u32 reg, u32 value) {
+    return 0x60000000U | (reg << 21) | (reg << 16) | (value & 0xFFFF);
+}
+
+/// `stw src,offset(base)`.
+[[nodiscard]] constexpr u32 stw(u32 src, u32 offset, u32 base) {
+    return 0x90000000U | (src << 21) | (base << 16) | (offset & 0xFFFF);
+}
+
 /// A machine with coreinit registered, a scheduler, and room to write small
 /// programs by hand.
 struct CallbackFixture {
@@ -406,6 +421,149 @@ TEST_CASE_METHOD(CallbackFixture,
     CHECK(memory.read<u8>(kBuffer) != 0U);
 }
 
+TEST_CASE_METHOD(CallbackFixture,
+                 "an asynchronous read can report through a message queue",
+                 "[hle][fs][async][queue]") {
+    // The other half of the API: instead of a callback, the completion is
+    // posted to a queue the title waits on, and FSGetAsyncResult turns the
+    // message back into the result.
+    constexpr ppcaddr_t kAsyncData = 0x10004000;
+    constexpr ppcaddr_t kPath = 0x10004100;
+    constexpr ppcaddr_t kMode = 0x10004200;
+    constexpr ppcaddr_t kHandleOut = 0x10004300;
+    constexpr ppcaddr_t kBuffer = 0x10004400;
+    constexpr ppcaddr_t kQueue = 0x10004500;
+    constexpr ppcaddr_t kRing = 0x10004600;
+    constexpr ppcaddr_t kInbox = 0x10004800;
+    constexpr u32 kClient = 0x10005000;
+    constexpr u32 kBlock = 0x10006000;
+
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+
+    // FSAsyncData: no callback this time, and a queue instead.
+    REQUIRE(memory.try_write<u32>(kAsyncData, 0));
+    REQUIRE(memory.try_write<u32>(kAsyncData + 4, 0xC0DE));
+    REQUIRE(memory.try_write<u32>(kAsyncData + 8, kQueue));
+
+    const std::string path = "/vol/content/data.bin";
+    REQUIRE(memory.write_bytes(kPath, std::vector<u8>(path.begin(), path.end())));
+    REQUIRE(memory.try_write<u8>(kPath + static_cast<u32>(path.size()), 0));
+    REQUIRE(memory.try_write<u8>(kMode, 'r'));
+    REQUIRE(memory.try_write<u8>(kMode + 1, 0));
+
+    static_cast<void>(call("FSOpenFile", {kClient, kBlock, kPath, kMode, kHandleOut, 0xFFFFFFFF}));
+    const u32 handle = memory.read<u32>(kHandleOut);
+    REQUIRE(handle != 0U);
+
+    static_cast<void>(
+        call("FSReadFileAsync", {kClient, kBlock, kBuffer, 1, 16, handle, 0, kAsyncData}));
+
+    // Nothing has been posted yet -- the completion is a deadline away.
+    CHECK(call("OSPeekMessage", {kQueue, kInbox}) == 0U);
+    CHECK(os.scheduler.timer_count() == 1U);
+
+    write_main_calling("OSSleepTicks", 8000);
+    static_cast<void>(run_it());
+
+    // No callback ran; the message arrived instead.
+    CHECK(callback_count() == 0U);
+    REQUIRE(call("OSReceiveMessage", {kQueue, kInbox, 0}) == 1U);
+
+    const u32 result = call("FSGetAsyncResult", {kInbox});
+    REQUIRE(result == kBlock + coreinit::fs_async_result_offset);
+
+    // FSAsyncResult: the asyncData it was given, the message it arrived as,
+    // and what the request actually did.
+    CHECK(memory.read<u32>(result + 0x04) == 0xC0DEU); // userContext
+    CHECK(memory.read<u32>(result + 0x08) == kQueue);  // ioMsgQueue
+    CHECK(memory.read<u32>(result + 0x0C) == result);  // ioMsg.message
+    CHECK(memory.read<u32>(result + 0x1C) == kClient);
+    CHECK(memory.read<u32>(result + 0x20) == kBlock);
+    CHECK(memory.read<u32>(result + 0x24) == 16U); // bytes read, as FSStatus
+
+    CHECK(memory.read<u8>(kBuffer) != 0U);
+    CHECK(os.busy_fs_blocks.empty());
+}
+
+TEST_CASE_METHOD(CallbackFixture,
+                 "a guest thread parked on a queue is woken by the completion",
+                 "[hle][fs][async][queue][idle]") {
+    // The whole path, as a title would meet it: start a read, block on the
+    // queue, and have the run loop skip the wait, fire the completion, post
+    // the message and resume the thread with it. Every piece of this works on
+    // its own above; what this is guarding is the seam between them, where a
+    // thread that is woken but never handed its message simply stops.
+    constexpr ppcaddr_t kAsyncData = 0x10004000;
+    constexpr ppcaddr_t kPath = 0x10004100;
+    constexpr ppcaddr_t kMode = 0x10004200;
+    constexpr ppcaddr_t kHandleOut = 0x10004300;
+    constexpr ppcaddr_t kBuffer = 0x10004400;
+    constexpr ppcaddr_t kQueue = 0x10004500;
+    constexpr ppcaddr_t kRing = 0x10004600;
+    constexpr ppcaddr_t kInbox = 0x10004800;
+    constexpr u32 kClient = 0x10005000;
+    constexpr u32 kBlock = 0x10006000;
+
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+
+    REQUIRE(memory.try_write<u32>(kAsyncData, 0));
+    REQUIRE(memory.try_write<u32>(kAsyncData + 4, 0xC0DE));
+    REQUIRE(memory.try_write<u32>(kAsyncData + 8, kQueue));
+
+    const std::string path = "/vol/content/data.bin";
+    REQUIRE(memory.write_bytes(kPath, std::vector<u8>(path.begin(), path.end())));
+    REQUIRE(memory.try_write<u8>(kPath + static_cast<u32>(path.size()), 0));
+    REQUIRE(memory.try_write<u8>(kMode, 'r'));
+    REQUIRE(memory.try_write<u8>(kMode + 1, 0));
+
+    static_cast<void>(call("FSOpenFile", {kClient, kBlock, kPath, kMode, kHandleOut, 0xFFFFFFFF}));
+    const u32 handle = memory.read<u32>(kHandleOut);
+    REQUIRE(handle != 0U);
+
+    static_cast<void>(
+        call("FSReadFileAsync", {kClient, kBlock, kBuffer, 1, 16, handle, 0, kAsyncData}));
+
+    // OSReceiveMessage(&queue, &inbox, OS_MESSAGE_QUEUE_FLAG_BLOCK), then
+    // record what it returned and what arrived.
+    const ppcaddr_t trampoline = registry.resolve("coreinit", "OSReceiveMessage");
+    const std::array<u32, 16> program{
+        kEnc_mflr_r31,
+        lis_r12(trampoline),
+        ori_r12(trampoline),
+        kEnc_mtctr_r12,
+        lis(3, kQueue),
+        ori(3, kQueue),
+        lis(4, kInbox),
+        ori(4, kInbox),
+        li(5, coreinit::message_flag_block),
+        kEnc_bctrl,
+        lis(6, kScratch),
+        ori(6, kScratch),
+        stw(3, 12, 6), // what OSReceiveMessage returned
+        kEnc_mtlr_r31,
+        li(3, 0),
+        kEnc_blr,
+    };
+    write_program(kMainProgram, program);
+
+    std::string error;
+    REQUIRE(registry.install(memory, error));
+
+    const RunReport report = run_it();
+    INFO("outcome: " << run_outcome_name(report.outcome));
+    CHECK(report.outcome == RunOutcome::Returned);
+
+    // It came back true, with the message -- and the wait itself was skipped
+    // rather than emulated, since nothing else was runnable.
+    CHECK(memory.read<u32>(kScratch + 12) == 1U);
+    CHECK(memory.read<u32>(kInbox) == kBlock + coreinit::fs_async_result_offset);
+    // Nearly all of the latency was skipped -- all of it bar the handful of
+    // instructions that ran before the thread parked.
+    CHECK(report.skipped_ticks > coreinit::fs_async_latency_ticks - 100);
+    CHECK(report.instructions < 100U);
+    CHECK(memory.read<u32>(kBlock + coreinit::fs_async_result_offset + 0x24) == 16U);
+}
+
 // ---------------------------------------------------------------------------
 // Spin detection (P2)
 // ---------------------------------------------------------------------------
@@ -542,4 +700,95 @@ TEST_CASE_METHOD(CallbackFixture,
     static_cast<void>(run_it());
     CHECK(os.busy_fs_blocks.empty());
     CHECK(call("FSReadFileAsync", {kClient, kBlock, kBuffer, 1, 16, 0, 0, kAsyncData}) == 0U);
+}
+
+TEST_CASE_METHOD(CallbackFixture,
+                 "a request with both a callback and a queue uses the callback",
+                 "[hle][fs][async][queue]") {
+    // FSAsyncData carries both fields and a title fills in one of them. If it
+    // fills in both, hardware calls back: the queue coreinit posts to on the
+    // way there is its own, not the title's. Delivering to both would run the
+    // callback *and* leave a message the title never asked for sitting in its
+    // queue, which it would eventually receive as something else entirely.
+    constexpr ppcaddr_t kAsyncData = 0x10004000;
+    constexpr ppcaddr_t kPath = 0x10004100;
+    constexpr ppcaddr_t kMode = 0x10004200;
+    constexpr ppcaddr_t kHandleOut = 0x10004300;
+    constexpr ppcaddr_t kBuffer = 0x10004400;
+    constexpr ppcaddr_t kQueue = 0x10004500;
+    constexpr ppcaddr_t kRing = 0x10004600;
+    constexpr ppcaddr_t kInbox = 0x10004800;
+    constexpr u32 kClient = 0x10005000;
+    constexpr u32 kBlock = 0x10006000;
+
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+
+    REQUIRE(memory.try_write<u32>(kAsyncData, kCallbackProgram));
+    REQUIRE(memory.try_write<u32>(kAsyncData + 4, 0xC0DE));
+    REQUIRE(memory.try_write<u32>(kAsyncData + 8, kQueue));
+
+    const std::string path = "/vol/content/data.bin";
+    REQUIRE(memory.write_bytes(kPath, std::vector<u8>(path.begin(), path.end())));
+    REQUIRE(memory.try_write<u8>(kPath + static_cast<u32>(path.size()), 0));
+    REQUIRE(memory.try_write<u8>(kMode, 'r'));
+    REQUIRE(memory.try_write<u8>(kMode + 1, 0));
+
+    static_cast<void>(call("FSOpenFile", {kClient, kBlock, kPath, kMode, kHandleOut, 0xFFFFFFFF}));
+    const u32 handle = memory.read<u32>(kHandleOut);
+    REQUIRE(handle != 0U);
+
+    static_cast<void>(
+        call("FSReadFileAsync", {kClient, kBlock, kBuffer, 1, 16, handle, 0, kAsyncData}));
+
+    write_main_calling("OSSleepTicks", 8000);
+    static_cast<void>(run_it());
+
+    CHECK(callback_count() == 1U);
+    CHECK(call("OSReceiveMessage", {kQueue, kInbox, 0}) == 0U); // and nothing was posted
+}
+
+TEST_CASE_METHOD(CallbackFixture,
+                 "a request with nowhere to report is not left in flight",
+                 "[hle][fs][async][queue]") {
+    constexpr ppcaddr_t kAsyncData = 0x10004000;
+    constexpr ppcaddr_t kPath = 0x10004100;
+    constexpr ppcaddr_t kMode = 0x10004200;
+    constexpr ppcaddr_t kHandleOut = 0x10004300;
+    constexpr ppcaddr_t kBuffer = 0x10004400;
+    constexpr ppcaddr_t kQueue = 0x10004500;
+    constexpr ppcaddr_t kRing = 0x10004600;
+    constexpr u32 kClient = 0x10005000;
+    constexpr u32 kBlock = 0x10006000;
+
+    static_cast<void>(call("OSInitMessageQueue", {kQueue, kRing, 4}));
+
+    const std::string path = "/vol/content/data.bin";
+    REQUIRE(memory.write_bytes(kPath, std::vector<u8>(path.begin(), path.end())));
+    REQUIRE(memory.try_write<u8>(kPath + static_cast<u32>(path.size()), 0));
+    REQUIRE(memory.try_write<u8>(kMode, 'r'));
+    REQUIRE(memory.try_write<u8>(kMode + 1, 0));
+
+    static_cast<void>(call("FSOpenFile", {kClient, kBlock, kPath, kMode, kHandleOut, 0xFFFFFFFF}));
+    const u32 handle = memory.read<u32>(kHandleOut);
+    REQUIRE(handle != 0U);
+
+    SECTION("neither a callback nor a queue") {
+        REQUIRE(memory.fill(kAsyncData, 12, 0));
+        static_cast<void>(
+            call("FSReadFileAsync", {kClient, kBlock, kBuffer, 1, 16, handle, 0, kAsyncData}));
+    }
+
+    SECTION("a queue, but no command block to put the result in") {
+        REQUIRE(memory.try_write<u32>(kAsyncData, 0));
+        REQUIRE(memory.try_write<u32>(kAsyncData + 4, 0));
+        REQUIRE(memory.try_write<u32>(kAsyncData + 8, kQueue));
+        static_cast<void>(
+            call("FSReadFileAsync", {kClient, 0, kBuffer, 1, 16, handle, 0, kAsyncData}));
+    }
+
+    // Nothing to deliver to means nothing to wait for: no deadline is armed,
+    // and the command block is free again straight away rather than a
+    // completion later that is never going to arrive.
+    CHECK(os.scheduler.timer_count() == 0U);
+    CHECK(os.busy_fs_blocks.empty());
 }

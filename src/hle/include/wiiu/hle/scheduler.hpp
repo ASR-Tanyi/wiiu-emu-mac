@@ -51,6 +51,7 @@ enum class BlockReason : u8 {
     Semaphore,
     Condition,
     Rendezvous,
+    MessageQueue,
     Join,
     Sleep,
 };
@@ -84,6 +85,15 @@ struct Thread {
     ThreadState state = ThreadState::Suspended;
     BlockReason block_reason = BlockReason::None;
     u32 blocked_on = 0; ///< the object's guest address, for diagnostics
+
+    /// When this thread joined the queue it is waiting on. Cafe OS thread
+    /// queues are FIFO within a priority level, and without a tiebreaker the
+    /// order would fall out of `std::map`'s -- which is by handle, and a
+    /// handle is wherever the title happened to allocate its `OSThread`. Two
+    /// equal-priority threads would then be served by address, and which of
+    /// two messages a queue delivers first would depend on the title's
+    /// allocator.
+    u64 block_sequence = 0;
 
     s32 priority = default_priority;
     u32 affinity = 0x7; ///< bitmask of cores this may run on
@@ -277,11 +287,16 @@ private:
         TimerCallback callback;
     };
 
+    /// True when `left` should be served before `right`: higher priority
+    /// first, and among equals whoever has been waiting longest.
+    [[nodiscard]] static bool waits_before(const Thread& left, const Thread& right) noexcept;
+
     ExitCallback on_exit_;
     std::map<u32, Thread> threads_;
     std::map<u32, Timer> timers_;
     u32 current_ = 0;
     u32 next_core_ = 0;
+    u64 next_block_sequence_ = 1;
     u64 switches_ = 0;
     u64 skipped_ticks_ = 0;
     bool servicing_timers_ = false;

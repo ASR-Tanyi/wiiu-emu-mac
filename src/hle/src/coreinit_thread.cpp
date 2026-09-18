@@ -432,6 +432,220 @@ void os_wait_rendezvous(Call& call) {
     scheduler().block(call.state, BlockReason::Rendezvous, handle);
 }
 
+// --- message queues --------------------------------------------------------
+//
+// The queue a title waits on for anything the system hands it: an asynchronous
+// read finishing (6.9), and later a ProcUI transition (6.11).
+//
+// The delivery rule is the one that shapes all of this. A woken thread resumes
+// *after* the call it blocked in, so a receiver parked in OSReceiveMessage
+// never gets to look at the queue again -- whoever wakes it has to have put
+// the message where it asked for it already. So a blocked receiver records
+// where it wants its message, a blocked sender records what it is trying to
+// post, and a send with a receiver waiting hands the message straight over
+// rather than going through the ring at all.
+
+/// The queue at `handle`, or null if it was never initialised.
+///
+/// Unlike every other object here this does not create one on demand: a queue
+/// with no capacity is not an empty queue, it is a queue nothing can ever be
+/// sent through, and a title that hits that has a bug worth naming.
+[[nodiscard]] MessageQueue* find_queue(SyncObjects& objects, u32 handle) {
+    const auto entry = objects.message_queues.find(handle);
+    if (entry == objects.message_queues.end() || entry->second.capacity == 0) {
+        WIIU_LOG_WARN(Coreinit, "message queue {:#010x} used before OSInitMessageQueue", handle);
+        return nullptr;
+    }
+    return &entry->second;
+}
+
+/// Forget records for threads that are no longer parked here. The scheduler's
+/// waiter list is what actually decides who is waiting; these records only say
+/// what each waiter wanted. Handles are guest OSThread pointers and do get
+/// reused, so a record left behind by a thread that exited while parked could
+/// otherwise be handed a message meant for nobody.
+template <typename Record>
+void prune_pending(std::map<u32, Record>& records, const std::vector<u32>& waiting) {
+    for (auto entry = records.begin(); entry != records.end();) {
+        entry = std::ranges::find(waiting, entry->first) == waiting.end() ? records.erase(entry)
+                                                                          : std::next(entry);
+    }
+}
+
+/// Hand `message` to the highest-priority thread parked in OSReceiveMessage,
+/// and say whether there was one. The message goes into the address that
+/// thread asked for before it blocked.
+[[nodiscard]] bool hand_to_receiver(Scheduler& threads,
+                                    memory::Memory& memory,
+                                    u32 handle,
+                                    MessageQueue& queue,
+                                    const Message& message) {
+    const std::vector<u32> waiting = threads.waiters(handle + message_queue_recv_wait_offset);
+    prune_pending(queue.pending_receives, waiting);
+
+    for (const u32 thread : waiting) {
+        const auto record = queue.pending_receives.find(thread);
+        if (record == queue.pending_receives.end()) {
+            continue;
+        }
+        const ppcaddr_t out_address = record->second;
+        queue.pending_receives.erase(record);
+        static_cast<void>(write_message(memory, out_address, message));
+        threads.unblock(thread);
+        return true;
+    }
+    return false;
+}
+
+/// Let the highest-priority thread parked in OSSendMessage finish its send,
+/// now that there is room. Called after a receive takes a message out, so the
+/// admitted message takes its place among the ones already queued rather than
+/// in front of all of them -- except a jammed one, which asked for the head
+/// and does not lose it by having had to wait for room.
+void admit_pending_sender(Scheduler& threads, u32 handle, MessageQueue& queue) {
+    const std::vector<u32> waiting = threads.waiters(handle + message_queue_send_wait_offset);
+    prune_pending(queue.pending_sends, waiting);
+
+    for (const u32 thread : waiting) {
+        const auto record = queue.pending_sends.find(thread);
+        if (record == queue.pending_sends.end()) {
+            continue;
+        }
+        if (record->second.jam) {
+            queue.entries.push_front(record->second.message);
+        } else {
+            queue.entries.push_back(record->second.message);
+        }
+        queue.pending_sends.erase(record);
+        threads.unblock(thread);
+        return;
+    }
+}
+
+void os_init_message_queue(Call& call) {
+    const u32 handle = call.next_word();
+    const u32 messages = call.next_word();
+    const auto size = static_cast<s32>(call.next_word());
+
+    if (size <= 0) {
+        WIIU_LOG_WARN(Coreinit,
+                      "OSInitMessageQueue({:#010x}) with {} entries; nothing can be sent through "
+                      "it",
+                      handle,
+                      size);
+    }
+
+    MessageQueue queue;
+    queue.messages = messages;
+    queue.capacity = size <= 0 ? 0 : static_cast<u32>(size);
+    sync().message_queues[handle] = std::move(queue);
+}
+
+/// OSSendMessage and OSJamMessage, which differ only in where the message
+/// goes. OS_MESSAGE_QUEUE_FLAG_HIGH_PRIORITY asks for the head too, so a send
+/// carrying it is a jam.
+void send_message(Call& call, bool force_jam) {
+    const u32 handle = call.next_word();
+    const u32 message_address = call.next_word();
+    const u32 flags = call.next_word();
+
+    MessageQueue* const queue = find_queue(sync(), handle);
+    if (queue == nullptr) {
+        call.state.gpr[3] = 0;
+        return;
+    }
+
+    const Message message = read_message(call.memory, message_address);
+    const bool jam = force_jam || (flags & message_flag_high_priority) != 0;
+
+    // A queue with someone waiting on it is empty, so the message never needs
+    // to touch the ring -- and handing it over directly is what makes the
+    // receiver's return value true without it running again.
+    if (hand_to_receiver(scheduler(), call.memory, handle, *queue, message)) {
+        call.state.gpr[3] = 1;
+        return;
+    }
+
+    if (queue->entries.size() < queue->capacity) {
+        if (jam) {
+            queue->entries.push_front(message);
+        } else {
+            queue->entries.push_back(message);
+        }
+        call.state.gpr[3] = 1;
+        return;
+    }
+
+    if ((flags & message_flag_block) == 0) {
+        call.state.gpr[3] = 0;
+        return;
+    }
+
+    // Full, and the caller asked to wait. Park the message with the thread: a
+    // receiver taking one out is what lets it in, and by then this handler is
+    // long gone.
+    const u32 thread = scheduler().current_handle();
+    queue->pending_sends[thread] = PendingSend{message, jam};
+    call.state.gpr[3] = 1; // a blocking send only ever comes back having sent
+    scheduler().block(
+        call.state, BlockReason::MessageQueue, handle + message_queue_send_wait_offset);
+}
+
+void os_send_message(Call& call) {
+    send_message(call, false);
+}
+
+void os_jam_message(Call& call) {
+    send_message(call, true);
+}
+
+void os_receive_message(Call& call) {
+    const u32 handle = call.next_word();
+    const u32 message_address = call.next_word();
+    const u32 flags = call.next_word();
+
+    MessageQueue* const queue = find_queue(sync(), handle);
+    if (queue == nullptr) {
+        call.state.gpr[3] = 0;
+        return;
+    }
+
+    if (!queue->entries.empty()) {
+        const Message message = queue->entries.front();
+        queue->entries.pop_front();
+        static_cast<void>(write_message(call.memory, message_address, message));
+
+        // Taking one out made room, so whoever was waiting to send can.
+        admit_pending_sender(scheduler(), handle, *queue);
+        call.state.gpr[3] = 1;
+        return;
+    }
+
+    if ((flags & message_flag_block) == 0) {
+        call.state.gpr[3] = 0;
+        return;
+    }
+
+    const u32 thread = scheduler().current_handle();
+    queue->pending_receives[thread] = message_address;
+    call.state.gpr[3] = 1; // a blocking receive only ever comes back with one
+    scheduler().block(
+        call.state, BlockReason::MessageQueue, handle + message_queue_recv_wait_offset);
+}
+
+void os_peek_message(Call& call) {
+    const u32 handle = call.next_word();
+    const u32 message_address = call.next_word();
+
+    MessageQueue* const queue = find_queue(sync(), handle);
+    if (queue == nullptr || queue->entries.empty()) {
+        call.state.gpr[3] = 0;
+        return;
+    }
+    static_cast<void>(write_message(call.memory, message_address, queue->entries.front()));
+    call.state.gpr[3] = 1;
+}
+
 // --- atomics ---------------------------------------------------------------
 //
 // These are ordinary reads and writes here, and that is correct rather than a
@@ -523,6 +737,80 @@ void os_or_atomic(Call& call) {
 }
 
 } // namespace
+
+void Context::reset() {
+    // The scheduler goes first: the threads parked on the sync objects are
+    // about to have nothing to be parked on, and forgetting them is what keeps
+    // "nothing can run" from being reported as a deadlock in a title that has
+    // simply been torn down.
+    scheduler.reset();
+    sync.reset();
+
+    alarms.clear();
+    busy_fs_blocks.clear();
+    next_async_id = async_id_base;
+    free_callback_stacks.clear();
+    next_callback_handle = callback_handle_base;
+}
+
+Message read_message(memory::Memory& memory, ppcaddr_t address) {
+    Message message;
+    if (address == 0) {
+        return message;
+    }
+    static_cast<void>(memory.try_read<u32>(address, message.value));
+    const auto count = static_cast<u32>(message.args.size());
+    for (u32 index = 0; index < count; ++index) {
+        static_cast<void>(memory.try_read<u32>(address + 4 + (index * 4), message.args[index]));
+    }
+    return message;
+}
+
+bool write_message(memory::Memory& memory, ppcaddr_t address, const Message& message) {
+    if (address == 0) {
+        return false;
+    }
+    bool ok = memory.try_write<u32>(address, message.value);
+    const auto count = static_cast<u32>(message.args.size());
+    for (u32 index = 0; index < count; ++index) {
+        ok = memory.try_write<u32>(address + 4 + (index * 4), message.args[index]) && ok;
+    }
+    return ok;
+}
+
+bool post_message(Context& context,
+                  memory::Memory& memory,
+                  ppcaddr_t queue_address,
+                  const Message& message,
+                  bool jam) {
+    MessageQueue* const queue = find_queue(context.sync, queue_address);
+    if (queue == nullptr) {
+        return false;
+    }
+
+    if (hand_to_receiver(context.scheduler, memory, queue_address, *queue, message)) {
+        return true;
+    }
+
+    if (queue->entries.size() >= queue->capacity) {
+        // Nothing to block here -- this is the system delivering something,
+        // not a thread that can wait -- so the message is dropped. Hardware
+        // has the same problem and the same answer; saying so is what turns
+        // "the title stopped getting events" into a line in the log.
+        WIIU_LOG_WARN(Coreinit,
+                      "message queue {:#010x} is full ({} entries); dropping a system message",
+                      queue_address,
+                      queue->capacity);
+        return false;
+    }
+
+    if (jam) {
+        queue->entries.push_front(message);
+    } else {
+        queue->entries.push_back(message);
+    }
+    return true;
+}
 
 u32 invoke_guest_callback(Context& context,
                           memory::Memory& memory,
@@ -656,6 +944,13 @@ void register_threads(Registry& registry, Context& context) {
 
     registry.add("coreinit", "OSInitRendezvous", os_init_rendezvous);
     registry.add("coreinit", "OSWaitRendezvous", os_wait_rendezvous);
+
+    registry.add("coreinit", "OSInitMessageQueue", os_init_message_queue);
+    registry.add("coreinit", "OSInitMessageQueueEx", os_init_message_queue);
+    registry.add("coreinit", "OSSendMessage", os_send_message);
+    registry.add("coreinit", "OSJamMessage", os_jam_message);
+    registry.add("coreinit", "OSReceiveMessage", os_receive_message);
+    registry.add("coreinit", "OSPeekMessage", os_peek_message);
 
     registry.add("coreinit", "OSSwapAtomic", os_swap_atomic);
     registry.add("coreinit", "OSCompareAndSwapAtomic", os_compare_and_swap_atomic);
