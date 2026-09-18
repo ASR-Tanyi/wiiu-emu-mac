@@ -78,6 +78,12 @@ struct Message {
 
 inline constexpr u32 message_size = 4 * sizeof(u32);
 
+/// How big `OSMessageQueue` is in guest memory. Nothing here reads its fields
+/// -- the queue's state is kept alongside it, as every other object's is --
+/// but a queue the emulator allocates itself has to reserve the space the
+/// title believes it has.
+inline constexpr u32 message_queue_size = 0x3C;
+
 /// `OSMessageFlags`. Bit 0 asks to block rather than fail; bit 1 puts the
 /// message at the head of the queue, which is what OSJamMessage does.
 inline constexpr u32 message_flag_block = 0x1;
@@ -198,6 +204,14 @@ inline constexpr u32 fs_async_result_status = 0x24;
 static_assert(fs_async_result_message + message_size == fs_async_result_client);
 static_assert(fs_async_result_status + sizeof(u32) == fs_async_result_size);
 
+/// How many messages the system message queue holds.
+///
+/// Hardware's is larger; what matters is that it is bounded, because the
+/// things posted to it -- a foreground transition, an exit request -- arrive
+/// faster than a title in the background processes them only if something has
+/// already gone wrong.
+inline constexpr s32 system_message_queue_capacity = 16;
+
 /// A recycled callback thread: its stack and the handle that goes with it.
 struct CallbackSlot {
     ppcaddr_t stack = 0;
@@ -247,6 +261,12 @@ struct Context {
     /// request: hardware refuses a second, and letting it through here would
     /// deliver two completions through the same structure.
     std::set<ppcaddr_t> busy_fs_blocks;
+
+    /// The queue coreinit posts system events to: foreground transitions and
+    /// the exit request, which is what ProcUI (6.11) reads. Allocated on first
+    /// use, because a title that never asks for it should not be charged for
+    /// one, and zero until then.
+    ppcaddr_t system_message_queue = 0;
 
     /// Ids for the asynchronous FS completions in flight, counting up through
     /// a range nothing else uses -- alarms are keyed by their guest address.
@@ -330,6 +350,20 @@ void register_threads(Registry& registry, Context& context);
 /// asynchronous filesystem builds one too.
 [[nodiscard]] Message read_message(memory::Memory& memory, ppcaddr_t address);
 bool write_message(memory::Memory& memory, ppcaddr_t address, const Message& message);
+
+/// The queue coreinit posts system events to, allocating it on first use.
+///
+/// Returns zero if there is no heap to take it from, which a caller has to
+/// check: a title handed a null queue would wait on nothing at all.
+[[nodiscard]] ppcaddr_t system_message_queue(Context& context, memory::Memory& memory);
+
+/// Take the message at the head of a queue from outside any guest call, if
+/// there is one, letting a thread parked on a full queue in.
+///
+/// The system reads its own queue this way (6.11). Popping the deque directly
+/// would work right up until something blocked on a full system queue, which
+/// would then never be woken.
+[[nodiscard]] bool take_message(Context& context, ppcaddr_t queue, Message& message);
 
 /// Post a message to a queue from outside any guest call.
 ///

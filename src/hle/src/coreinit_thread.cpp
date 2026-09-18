@@ -535,6 +535,14 @@ void os_init_message_queue(Call& call) {
                       size);
     }
 
+    if (handle != 0 && handle == detail::active_context()->system_message_queue) {
+        // The system queue is the emulator's, and something may well be parked
+        // on it. Replacing it wholesale would drop those waiters on the floor.
+        WIIU_LOG_WARN(
+            Coreinit, "OSInitMessageQueue on the system message queue {:#010x}; ignored", handle);
+        return;
+    }
+
     MessageQueue queue;
     queue.messages = messages;
     queue.capacity = size <= 0 ? 0 : static_cast<u32>(size);
@@ -646,6 +654,10 @@ void os_peek_message(Call& call) {
     call.state.gpr[3] = 1;
 }
 
+void os_get_system_message_queue(Call& call) {
+    call.state.gpr[3] = system_message_queue(*detail::active_context(), call.memory);
+}
+
 // --- atomics ---------------------------------------------------------------
 //
 // These are ordinary reads and writes here, and that is correct rather than a
@@ -738,6 +750,46 @@ void os_or_atomic(Call& call) {
 
 } // namespace
 
+ppcaddr_t system_message_queue(Context& context, memory::Memory& memory) {
+    if (context.system_message_queue != 0) {
+        return context.system_message_queue;
+    }
+
+    ExpandedHeap* const heap = context.heaps.find(context.heaps.default_handle());
+    if (heap == nullptr) {
+        WIIU_LOG_ERROR(Coreinit, "no heap to allocate the system message queue from");
+        return 0;
+    }
+
+    // The structure and the ring it points at. Both are the title's to see --
+    // it is handed the address and may pass it to OSReceiveMessage like any
+    // other queue -- so they are real guest memory rather than a reserved
+    // value that happens not to collide.
+    const u32 ring_bytes = static_cast<u32>(system_message_queue_capacity) * message_size;
+    const ppcaddr_t queue = heap->allocate(message_queue_size, 8);
+    const ppcaddr_t ring = queue == 0 ? 0 : heap->allocate(ring_bytes, 8);
+    if (queue == 0 || ring == 0) {
+        // Give back whichever one succeeded. Nothing points at it, and a
+        // caller that tries again should not be charged for the last attempt.
+        if (queue != 0) {
+            static_cast<void>(heap->free(queue));
+        }
+        WIIU_LOG_ERROR(Coreinit, "out of memory for the system message queue");
+        return 0;
+    }
+
+    static_cast<void>(memory.fill(queue, message_queue_size, 0));
+    static_cast<void>(memory.fill(ring, ring_bytes, 0));
+
+    MessageQueue state;
+    state.messages = ring;
+    state.capacity = static_cast<u32>(system_message_queue_capacity);
+    context.sync.message_queues[queue] = std::move(state);
+
+    context.system_message_queue = queue;
+    return queue;
+}
+
 void Context::reset() {
     // The scheduler goes first: the threads parked on the sync objects are
     // about to have nothing to be parked on, and forgetting them is what keeps
@@ -748,6 +800,7 @@ void Context::reset() {
 
     alarms.clear();
     busy_fs_blocks.clear();
+    system_message_queue = 0;
     next_async_id = async_id_base;
     free_callback_stacks.clear();
     next_callback_handle = callback_handle_base;
@@ -776,6 +829,17 @@ bool write_message(memory::Memory& memory, ppcaddr_t address, const Message& mes
         ok = memory.try_write<u32>(address + 4 + (index * 4), message.args[index]) && ok;
     }
     return ok;
+}
+
+bool take_message(Context& context, ppcaddr_t queue_address, Message& message) {
+    MessageQueue* const queue = find_queue(context.sync, queue_address);
+    if (queue == nullptr || queue->entries.empty()) {
+        return false;
+    }
+    message = queue->entries.front();
+    queue->entries.pop_front();
+    admit_pending_sender(context.scheduler, queue_address, *queue);
+    return true;
 }
 
 bool post_message(Context& context,
@@ -951,6 +1015,7 @@ void register_threads(Registry& registry, Context& context) {
     registry.add("coreinit", "OSJamMessage", os_jam_message);
     registry.add("coreinit", "OSReceiveMessage", os_receive_message);
     registry.add("coreinit", "OSPeekMessage", os_peek_message);
+    registry.add("coreinit", "OSGetSystemMessageQueue", os_get_system_message_queue);
 
     registry.add("coreinit", "OSSwapAtomic", os_swap_atomic);
     registry.add("coreinit", "OSCompareAndSwapAtomic", os_compare_and_swap_atomic);

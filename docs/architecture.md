@@ -106,12 +106,23 @@ And the OS calls back into the title — alarms, asynchronous completion — by
 running a guest function on its own scheduler thread, with a stack from a
 recycled pool, or by posting to a queue the title is waiting on.
 
-Two properties of the scheduler are load-bearing beyond it. Waiters are ordered
-by priority and then by how long they have waited, because Cafe OS thread
-queues are FIFO within a level and a title can observe the difference directly
-in the order its messages come back. And the timebase is machine state that
-survives a context switch, not part of the register file a switch restores: it
-only goes forward, and every deadline is measured against it.
+There is a third way into guest code, used by ProcUI: rather than running a
+callback on a thread of its own, the handler redirects the thread it is already
+on — saving where the title was going, pointing it at the callback with the
+return address set to an `sc` trampoline of ours, and putting it back when the
+chain ends. That is how a callback runs on the caller's own stack and is
+finished before the call returns, which is what the title expects.
+
+Three properties of the scheduler are load-bearing beyond it. Waiters are
+ordered by priority and then by how long they have waited, because Cafe OS
+thread queues are FIFO within a level and a title can observe the difference
+directly in the order its messages come back. The timebase is machine state
+that survives a context switch, not part of the register file a switch
+restores: it only goes forward, and every deadline is measured against it. And
+a thread has a generation as well as a handle, because a handle is a guest
+`OSThread*` that a title reuses — so anything remembering a thread across calls
+can tell that the thread it meant is gone and a different one now answers to
+its name.
 
 Waiting is not emulated. Every deadline the machine is waiting for, whether a
 sleeping thread or an alarm, lives in one list, so when nothing can run the

@@ -62,6 +62,7 @@ void Scheduler::reset() {
     switches_ = 0;
     skipped_ticks_ = 0;
     next_block_sequence_ = 1;
+    next_generation_ = 1;
     servicing_timers_ = false;
 }
 
@@ -76,6 +77,7 @@ u32 Scheduler::create(u32 handle,
                       u32 affinity) {
     Thread thread;
     thread.handle = handle;
+    thread.generation = next_generation_++;
     thread.name = name.empty() ? fmt::format("thread_{:#x}", handle) : std::move(name);
     thread.priority = std::clamp(priority, highest_priority, lowest_priority);
     thread.affinity = affinity == 0 ? 0x7U : affinity;
@@ -176,6 +178,7 @@ bool Scheduler::remove(u32 handle) {
 u32 Scheduler::adopt_main(const cpu::CoreState& state, u32 handle) {
     Thread thread;
     thread.handle = handle;
+    thread.generation = next_generation_++;
     thread.name = "main";
     thread.context = state;
     thread.state = ThreadState::Running;

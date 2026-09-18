@@ -108,6 +108,7 @@ wiiu_add_test(hle
         hle/test_coreinit.cpp
         hle/test_hle.cpp
         hle/test_recording.cpp
+        hle/test_proc_ui.cpp
         hle/test_scheduler.cpp
     DEPS
         wiiu::hle)

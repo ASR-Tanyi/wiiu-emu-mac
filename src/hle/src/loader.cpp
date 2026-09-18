@@ -347,9 +347,20 @@ RunReport run(cpu::Interpreter& interpreter,
 
         if (result == cpu::StepResult::SystemCall) {
             // The trampoline is the instruction just executed.
+            const u32 before = scheduler == nullptr ? 0 : scheduler->current_handle();
             if (registry.dispatch(state.pc - 4, state, memory)) {
                 ++report.hle_calls;
-                since_switch = 0; // the call may have switched threads
+
+                // Only a call that *did* switch starts the timeslice again.
+                // Resetting on every call looks harmless and is not: a title's
+                // main loop calls into the OS several times a frame, so the
+                // counter never reached the timeslice, `reschedule` was never
+                // called, and with it went every alarm, every deadline and
+                // every other thread's turn. A busy title starved everything
+                // else and nothing in the run loop said so.
+                if (scheduler != nullptr && scheduler->current_handle() != before) {
+                    since_switch = 0;
+                }
                 if (recording != nullptr && recording->stop_requested()) {
                     report.outcome = RunOutcome::Diverged;
                     break;

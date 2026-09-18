@@ -81,6 +81,15 @@ struct Thread {
     u32 handle = 0; ///< the guest OSThread pointer
     std::string name;
 
+    /// Which thread this is, as distinct from which handle it has.
+    ///
+    /// A handle is a guest `OSThread*` and a title reuses one as soon as it
+    /// frees the structure, so "the thread at handle X" is not a stable
+    /// identity. Anything that remembers a thread across calls -- a ProcUI
+    /// callback chain, say -- has to be able to tell that the thread it was
+    /// talking about is gone and a different one now answers to its name.
+    u64 generation = 0;
+
     cpu::CoreState context;
     ThreadState state = ThreadState::Suspended;
     BlockReason block_reason = BlockReason::None;
@@ -297,6 +306,7 @@ private:
     u32 current_ = 0;
     u32 next_core_ = 0;
     u64 next_block_sequence_ = 1;
+    u64 next_generation_ = 1;
     u64 switches_ = 0;
     u64 skipped_ticks_ = 0;
     bool servicing_timers_ = false;

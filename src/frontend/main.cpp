@@ -10,7 +10,9 @@
 #include <wiiu/cpu/interpreter.hpp>
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/loader.hpp>
+#include <wiiu/hle/proc_ui.hpp>
 #include <wiiu/hle/recording.hpp>
+#include <wiiu/hle/system_libraries.hpp>
 #include <wiiu/loader/rpl.hpp>
 #include <wiiu/loader/vfs.hpp>
 #include <wiiu/memory/memory.hpp>
@@ -320,6 +322,12 @@ int main(int argc, char** argv) {
 
     wiiu::hle::coreinit::Context coreinit;
     wiiu::hle::coreinit::register_all(registry, coreinit);
+
+    // ProcUI drives the title's main loop, and the system libraries are what
+    // it touches on the way there (6.11).
+    wiiu::hle::procui::State procui;
+    wiiu::hle::procui::register_all(registry, coreinit, procui);
+    wiiu::hle::register_system_libraries(registry);
 
     if (std::string heap_error; !coreinit.heaps.create_default_heaps(memory, heap_error)) {
         WIIU_LOG_ERROR(Core, "{}", heap_error);
