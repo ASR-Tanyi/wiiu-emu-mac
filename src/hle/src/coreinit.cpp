@@ -682,6 +682,7 @@ void register_all(Registry& registry, Context& context) {
     detail::set_active_context(&context);
     register_threads(registry, context);
     register_time(registry, context);
+    register_ios(registry, context);
 
     registry.add("coreinit", "OSReport", os_report);
     registry.add("coreinit", "OSConsoleWrite", os_report);

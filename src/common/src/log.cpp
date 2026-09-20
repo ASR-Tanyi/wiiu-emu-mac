@@ -22,6 +22,7 @@ constexpr std::array<std::string_view, channel_count> kChannelNames{
     "mem",
     "loader",
     "coreinit",
+    "ios",
     "gx2",
     "gpu",
     "ax",

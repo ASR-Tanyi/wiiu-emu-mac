@@ -7,6 +7,7 @@
 
 #include <wiiu/hle/filesystem.hpp>
 #include <wiiu/hle/heap.hpp>
+#include <wiiu/hle/ios.hpp>
 #include <wiiu/hle/recording.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/hle/scheduler.hpp>
@@ -234,11 +235,32 @@ inline constexpr u32 async_id_base = 0xFFFF0000;
 /// real time -- the idle skip (P2) jumps straight there.
 inline constexpr u64 fs_async_latency_ticks = 1000;
 
+/// Where the asynchronous IPC completion ids start, and where they stop.
+///
+/// A separate range from the FS one above, immediately below it: the two
+/// share the scheduler's timer list, and an id collision would mean one
+/// completion silently replacing another. The static assertion is what keeps
+/// the two ranges adjacent rather than overlapping if either moves.
+inline constexpr u32 ios_async_id_base = 0xFFFE0000;
+inline constexpr u32 ios_async_id_limit = 0xFFFF0000;
+
+static_assert(ios_async_id_limit == async_id_base,
+              "the IOS and FS completion id ranges must abut without overlapping");
+
+/// How long an `IOS_*Async` call takes to come back, in timebase ticks.
+///
+/// The same modelled IPC round trip as `fs_async_latency_ticks` — which is
+/// the same trip, seen from one layer up, since coreinit's FS API is built on
+/// IPC on hardware. Nothing waits for it in real time: the idle skip (P2)
+/// jumps straight there.
+inline constexpr u64 ios_async_latency_ticks = fs_async_latency_ticks;
+
 struct Context {
     HeapManager heaps;
     FileSystem filesystem;
     Scheduler scheduler;
     SyncObjects sync;
+    IosManager ios;
     ReportSink report_sink;
 
     std::map<u32, Alarm> alarms;
@@ -272,6 +294,9 @@ struct Context {
     /// a range nothing else uses -- alarms are keyed by their guest address.
     /// Each id is released when its completion fires.
     u32 next_async_id = async_id_base;
+
+    /// The same, for the asynchronous IPC completions in flight (6.10).
+    u32 next_ios_async_id = ios_async_id_base;
 
     /// Record/replay (10.4). Attached before the run starts; null means
     /// neither, and every host value is simply taken as it comes.
@@ -403,6 +428,11 @@ void reap_callback_threads(Context& context);
 
 /// Time and alarms (6.7). Called by register_all.
 void register_time(Registry& registry, Context& context);
+
+/// The `IOS_*` entry points, and the devices behind them (6.10). Called by
+/// register_all, which is also where `/dev/fsa` is bound to the context's own
+/// filesystem — so the device and the `FS*` API share one set of open files.
+void register_ios(Registry& registry, Context& context);
 
 /// printf-style formatting against guest varargs. Exposed because OSReport,
 /// OSFatal and __os_snprintf all need the same thing, and because the

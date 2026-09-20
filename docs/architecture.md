@@ -129,6 +129,16 @@ sleeping thread or an alarm, lives in one list, so when nothing can run the
 clock jumps to the next one; and a thread found spinning on a flag hands the
 core back immediately rather than at the end of its timeslice (**P2**).
 
+Everything a title cannot do for itself goes through IOSU, and none of IOSU is
+emulated. The interception is at the `IOS_*` functions rather than the IPC
+doorbell: `ios.hpp` holds a table from `/dev/...` to a native device, so a
+request never becomes a packet and Starbuck never has to exist. A device nobody
+has written is refused with its path in the log rather than given a handle that
+answers everything with zero, which is the missing-function policy one level
+down. The asynchronous forms do the work inside the call and schedule only the
+reply, through the same timer list, so a title that starts a request and then
+sets a flag sees them in that order.
+
 ### cpu
 
 An Espresso interpreter: three PowerPC 750CL-derived cores, big-endian, with

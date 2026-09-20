@@ -802,6 +802,13 @@ void Context::reset() {
     busy_fs_blocks.clear();
     system_message_queue = 0;
     next_async_id = async_id_base;
+
+    // Handles the title opened, not the devices behind them: a device is the
+    // emulator's, like a registered HLE function, and survives a title being
+    // torn down and another being started.
+    ios.reset();
+    next_ios_async_id = ios_async_id_base;
+
     free_callback_stacks.clear();
     next_callback_handle = callback_handle_base;
 }

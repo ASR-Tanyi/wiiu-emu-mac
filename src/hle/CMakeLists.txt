@@ -3,10 +3,12 @@
 wiiu_add_library(hle
     SOURCES
         src/coreinit.cpp
+        src/coreinit_ios.cpp
         src/coreinit_thread.cpp
         src/coreinit_time.cpp
         src/filesystem.cpp
         src/heap.cpp
+        src/ios.cpp
         src/loader.cpp
         src/proc_ui.cpp
         src/recording.cpp
@@ -17,6 +19,7 @@ wiiu_add_library(hle
         include/wiiu/hle/coreinit.hpp
         include/wiiu/hle/filesystem.hpp
         include/wiiu/hle/heap.hpp
+        include/wiiu/hle/ios.hpp
         include/wiiu/hle/loader.hpp
         include/wiiu/hle/proc_ui.hpp
         include/wiiu/hle/recording.hpp

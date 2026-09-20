@@ -29,6 +29,7 @@ enum class Channel : u8 {
     Mem,      // address space, MMU, cache model
     Loader,   // RPX/RPL, discs, filesystem
     Coreinit, // coreinit.rpl and kernel HLE
+    Ios,      // IPC to IOSU: device opens, ioctls, /dev/fsa
     Gx2,      // GX2 API layer
     Gpu,      // PM4, shader translation, Metal backend
     Ax,       // audio
