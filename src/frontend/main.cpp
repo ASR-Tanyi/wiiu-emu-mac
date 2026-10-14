@@ -8,6 +8,7 @@
 #include <wiiu/common/version.hpp>
 #include <wiiu/cpu/backtrace.hpp>
 #include <wiiu/cpu/interpreter.hpp>
+#include <wiiu/gpu/backend.hpp>
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/loader.hpp>
 #include <wiiu/hle/proc_ui.hpp>
@@ -16,6 +17,9 @@
 #include <wiiu/loader/rpl.hpp>
 #include <wiiu/loader/vfs.hpp>
 #include <wiiu/memory/memory.hpp>
+
+#include "platform/jit_probe.hpp"
+#include "platform/window.hpp"
 
 #include <fmt/format.h>
 
@@ -39,6 +43,9 @@ constexpr std::string_view kUsage = R"(usage: wiiu-emu [options]
 options:
   -h, --help              show this message
   -r, --run FILE          load and run an RPX
+      --window            open a window and present frames (Phase 1.4)
+      --frames N          with --window, stop after N frames
+      --jit-check         prove the MAP_JIT + entitlement path and exit
       --trace             log every HLE call as it happens
       --stats             print HLE call counts when the run ends
       --record FILE       write a deterministic trace of this run
@@ -65,6 +72,9 @@ struct Arguments {
     std::string run_path;
     bool trace = false;
     bool stats = false;
+    bool window = false;
+    bool jit_check = false;
+    wiiu::u64 frames = 0; ///< zero means until the window is closed
     std::string record_path;
     std::string replay_path;
     wiiu::u64 checkpoint_interval = wiiu::hle::RecordingOptions{}.checkpoint_interval;
@@ -150,6 +160,22 @@ bool parse_arguments(std::span<const std::string_view> argv, Arguments& args) {
                 fmt::print(stderr, "wiiu-emu: --checkpoint wants a number, got '{}'\n", value);
                 return false;
             }
+        } else if (arg == "--window") {
+            args.window = true;
+        } else if (arg == "--frames") {
+            std::string_view value;
+            if (!next(value)) {
+                return false;
+            }
+            const std::string text{value};
+            char* end = nullptr;
+            args.frames = std::strtoull(text.c_str(), &end, 0);
+            if (end == text.c_str() || *end != '\0') {
+                fmt::print(stderr, "wiiu-emu: --frames wants a number, got '{}'\n", value);
+                return false;
+            }
+        } else if (arg == "--jit-check") {
+            args.jit_check = true;
         } else if (arg == "--list-settings") {
             args.list_settings = true;
         } else if (arg == "-c" || arg == "--config") {
@@ -185,6 +211,88 @@ bool parse_arguments(std::span<const std::string_view> argv, Arguments& args) {
         }
     }
     return true;
+}
+
+/// Phase 1.4's "done when": a window opens, clears to a colour, and closes.
+///
+/// The colour moves rather than standing still, because a static clear proves
+/// only that one frame was presented. A drifting one proves the loop is
+/// turning, the drawable is being acquired and released, and the frame is
+/// reaching the display -- which is most of 7.2 and 7.7 demonstrating itself.
+int run_window(wiiu::u64 frames) {
+    std::unique_ptr<wiiu::gpu::GpuBackend> backend = wiiu::gpu::create_metal_backend();
+    if (backend == nullptr) {
+        return 1;
+    }
+
+    std::string error;
+    if (!backend->initialize(error)) {
+        // Capability shortfalls land here: ADR-002 refuses with a reason
+        // rather than rendering something wrong.
+        WIIU_LOG_ERROR(Gpu, "{}", error);
+        return 1;
+    }
+
+    std::unique_ptr<wiiu::platform::Window> window =
+        wiiu::platform::create_window(wiiu::platform::WindowDesc{}, error);
+    if (window == nullptr) {
+        WIIU_LOG_ERROR(Frontend, "{}", error);
+        backend->shutdown();
+        return 1;
+    }
+
+    wiiu::gpu::NativeSurface attached = window->surface();
+    if (!backend->attach_surface(attached, error)) {
+        WIIU_LOG_ERROR(Gpu, "{}", error);
+        backend->shutdown();
+        return 1;
+    }
+    backend->set_vsync(true);
+
+    wiiu::u64 presented = 0;
+    while (window->poll()) {
+        if (const wiiu::gpu::NativeSurface surface = window->surface();
+            surface.width != attached.width || surface.height != attached.height) {
+            if (!backend->attach_surface(surface, error)) {
+                WIIU_LOG_ERROR(Gpu, "{}", error);
+                break;
+            }
+            attached = surface;
+        }
+
+        wiiu::gpu::FrameInfo frame;
+        if (!backend->begin_frame(frame)) {
+            // No drawable this time: occluded, or resizing. Skipping is the
+            // right answer; waiting for one would stall the whole emulator
+            // on the window server.
+            continue;
+        }
+
+        const auto phase = static_cast<float>(frame.index % 240) / 240.0F;
+        wiiu::gpu::RenderPassDesc pass;
+        pass.label = "clear";
+        pass.color_count = 1;
+        pass.colors[0].texture = frame.drawable;
+        pass.colors[0].load = wiiu::gpu::LoadAction::Clear;
+        // Nothing reads this back -- it goes straight to the display -- but
+        // the display is a reader, so Store it is (P20).
+        pass.colors[0].store = wiiu::gpu::StoreAction::Store;
+        pass.colors[0].clear = wiiu::gpu::ClearColor{phase, 0.25F, 1.0F - phase, 1.0F};
+
+        if (backend->begin_render_pass(pass)) {
+            backend->end_render_pass();
+        }
+        backend->end_frame();
+
+        ++presented;
+        if (frames != 0 && presented >= frames) {
+            break;
+        }
+    }
+
+    WIIU_LOG_INFO(Frontend, "presented {} frames", presented);
+    backend->shutdown();
+    return 0;
 }
 
 } // namespace
@@ -269,6 +377,23 @@ int main(int argc, char** argv) {
     WIIU_LOG_WARN(Core,
                   "platform: core-only build — the emulator requires macOS 13+ on Apple silicon");
 #endif
+
+    if (args.jit_check) {
+        const wiiu::platform::JitProbeResult probe = wiiu::platform::probe_jit();
+        if (probe.ok()) {
+            WIIU_LOG_INFO(Core, "jit check: {}", probe.detail);
+        } else {
+            WIIU_LOG_ERROR(Core, "jit check: {}", probe.detail);
+        }
+        wiiu::log::shutdown();
+        return probe.ok() ? 0 : 1;
+    }
+
+    if (args.window) {
+        const int status = run_window(args.frames);
+        wiiu::log::shutdown();
+        return status;
+    }
 
     if (args.run_path.empty()) {
         WIIU_LOG_INFO(Core, "nothing to run — pass --run FILE.rpx");

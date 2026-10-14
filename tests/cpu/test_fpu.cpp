@@ -107,12 +107,25 @@ TEST_CASE_METHOD(FpuFixture, "double arithmetic", "[cpu][fpu]") {
 }
 
 TEST_CASE_METHOD(FpuFixture, "multiply-add is fused, not two roundings", "[cpu][fpu]") {
-    // Chosen so the unfused and fused answers differ: the product needs more
-    // bits than a double can hold, and rounding it before the add loses the
-    // difference entirely.
-    const f64 a = 1.0 + std::ldexp(1.0, -27); // 1 + 2^-27
+    // a = 1 + 2^-27, so a*a is 1 + 2^-26 + 2^-54 exactly -- two bits wider
+    // than a double holds at that exponent. Rounding the product first throws
+    // the 2^-54 away; fusing keeps it, and subtracting one brings it back up
+    // to where it is representable again. That is the whole difference.
+    const f64 a = 1.0 + std::ldexp(1.0, -27);
     const f64 c = a;
     const f64 b = -1.0;
+
+    // Both answers are written out rather than computed, because computing
+    // the unfused one is precisely what a compiler is allowed to fuse: on
+    // arm64 `a * c + b` becomes a single FMADD under clang's default
+    // -ffp-contract, and the test then compares fma against itself and fails
+    // its own premise. The build turns contraction off for exactly this
+    // reason (see the root CMakeLists), and these literals mean the test
+    // keeps its meaning regardless of who compiles it.
+    const f64 fused = std::ldexp(1.0, -26) + std::ldexp(1.0, -54);
+    const f64 unfused = std::ldexp(1.0, -26);
+    REQUIRE(fused != unfused);           // the test is only meaningful if they differ
+    REQUIRE(std::fma(a, c, b) == fused); // and only honest if the literals are right
 
     state.fpr[2].ps0 = a;
     state.fpr[4].ps0 = c;
@@ -120,10 +133,8 @@ TEST_CASE_METHOD(FpuFixture, "multiply-add is fused, not two roundings", "[cpu][
 
     REQUIRE(exec(kEnc_fmadd) == StepResult::Ok);
 
-    const f64 fused = std::fma(a, c, b);
-    const f64 unfused = a * c + b;
-    REQUIRE(fused != unfused); // the test is only meaningful if they differ
     CHECK(state.fpr[1].ps0 == fused);
+    CHECK(state.fpr[1].ps0 != unfused);
 }
 
 TEST_CASE_METHOD(FpuFixture, "single-precision instructions round once", "[cpu][fpu]") {

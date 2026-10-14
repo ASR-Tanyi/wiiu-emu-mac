@@ -84,6 +84,23 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 # place (Phase 3), so strict aliasing is off globally and deliberately.
 add_compile_options(-fno-strict-aliasing)
 
+# The host compiler does not get to decide how guest arithmetic rounds.
+#
+# Clang defaults to contracting `a * b + c` into a fused multiply-add wherever
+# the target has one. On arm64 it always does; on x86-64 without -mfma it
+# never does. That is the same source producing two different answers on two
+# hosts -- which for an emulator is not an optimisation, it is a correctness
+# bug that only appears on one machine. Espresso's `fmadd` really is fused and
+# its `fmul`/`fadd` really are not, so the distinction is modelled explicitly
+# with std::fma (Phase 4.6) and the compiler must leave it alone.
+#
+# It also protects what 10.4 and 12.7 are built on: a replay only reproduces a
+# run, and a JIT only matches the interpreter bit-for-bit, if the arithmetic
+# does not depend on which machine compiled it. Found by the one test that
+# compared a fused result against a deliberately unfused one and watched the
+# compiler fuse both.
+add_compile_options(-ffp-contract=off)
+
 if(WIIU_ENABLE_LTO)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT WIIU_IPO_OK OUTPUT WIIU_IPO_MSG)
@@ -123,7 +140,7 @@ add_subdirectory(src/memory)                 # Phase 3
 add_subdirectory(src/cpu)                    # Phase 4
 add_subdirectory(src/loader)                 # Phase 5
 add_subdirectory(src/hle)                    # Phase 6
-# add_subdirectory(src/gpu)                  # Phase 7-8
+add_subdirectory(src/gpu)                    # Phase 7-8
 # add_subdirectory(src/audio)                # Phase 9
 # add_subdirectory(src/input)                # Phase 9
 add_subdirectory(src/frontend)               # Phase 1

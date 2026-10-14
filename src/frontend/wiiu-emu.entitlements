@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Phase 1.8 — what the emulator asks the Hardened Runtime for.
+
+  One entitlement, and it is the one Phase 12 cannot work without: MAP_JIT
+  mappings are refused outright unless the binary is signed with this. It is
+  requested from Phase 1 rather than Phase 12 so that the signing pipeline is
+  proved on an empty application, long before a recompiler is depending on it.
+
+  Deliberately *not* here:
+
+    com.apple.security.cs.allow-unsigned-executable-memory — a much blunter
+    instrument that disables the protection entirely rather than carving out
+    MAP_JIT pages. A JIT that uses pthread_jit_write_protect_np properly does
+    not need it, and asking for it would weaken every page in the process.
+
+    com.apple.security.get-task-allow — set by Xcode for debugging, and
+    explicitly rejected by the notary service. It must never reach a build
+    that is going to be distributed.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+</dict>
+</plist>

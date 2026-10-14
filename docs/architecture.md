@@ -184,16 +184,58 @@ one. It also hashes machine state at intervals, so a replay that stops
 matching is reported at the first point it could be known rather than wherever
 the consequences surface.
 
-### gpu *(not built — Phases 7–8)*
+### gpu *(interface built — Phase 7.1; the renderer is Phases 7–8)*
 
-GX2 calls append PM4 packets to a ring buffer; a separate GPU thread consumes
-it asynchronously, mirroring the hardware. R700 shader microcode is lowered to
-an internal IR and emitted as MSL. Geometry shaders become Metal object+mesh
-pipelines; stream-out becomes a rasterization-disabled vertex pass.
+One rule holds this subsystem together: **no Metal type crosses
+`gpu/backend.hpp`**. Everything above it — and Phase 8's PM4 translator is
+all of it — is written against an interface of plain values and opaque
+integer handles, so a second backend would be a new file rather than a new
+emulator, and so the translator can be tested on a machine with no GPU at
+all. `create_null_backend()` is that machine: a backend that records what it
+was told, validates everything the real one validates, and draws nothing.
+
+Handles are integers rather than pointers because two later phases want them
+to be: a save state (11.2) and an API trace (8.16) can both write one down
+and read it back, and a stale one is then a lookup failure instead of a
+crash. Zero is reserved, so a zeroed descriptor refers to nothing.
+
+Two decisions are encoded in the types rather than written down somewhere
+hopeful. Load and store actions have no default: `Unspecified` is the zero
+value and every backend refuses it, because on a tile-based GPU the wrong
+action is still *correct* — the image is right, it is merely moving the whole
+framebuffer through memory twice — and a mistake that produces correct output
+never arrives as a bug report (**P20**). And the binding model is absent from
+the interface entirely: callers bind by stage and index, and whether that
+reaches the shader through a slot or a descriptor in an argument buffer is
+the backend's business ([ADR-003](decisions/ADR-003-argument-buffers.md)).
+
+Beyond that, the shape is the hardware's. GX2 calls append PM4 packets to a
+ring buffer; a separate GPU thread consumes it asynchronously. R700 shader
+microcode is lowered to an internal IR and emitted as MSL — not through
+SPIR-V, whose only route to MSL has no mesh shader support, which would kill
+the geometry path outright. Geometry shaders and Latte's RECTS become Metal
+object+mesh pipelines; stream-out becomes a rasterization-disabled vertex
+pass.
 
 See [ADR-001](decisions/ADR-001-metal-over-vulkan.md) for why the backend is
 Metal, and the Phase 7 table in `plan.md` for the Metal gaps that need
 shader-side emulation.
+
+### frontend / platform
+
+`metal-cpp` excludes MetalKit and AppKit, so there is no `MTKView`: the
+window and its `CAMetalLayer` are made by hand in the project's one
+Objective-C++ file, and handed to the backend as a `void*` and a size.
+Nothing between the two learns what it is.
+
+Two things about that file are worth knowing before reading it. ARC is off,
+so Objective-C ownership is manual — objects from `alloc` are owned and
+released once, everything else is autoreleased and must be retained to
+outlive its pool — and `metal-cpp` has the same rules on the C++ side, which
+is what `gpu/metal/raii.hpp` exists to make automatic. And points are not
+pixels: the drawable size is the view's bounds times the window's backing
+scale, rechecked every poll, because a window dragged between displays
+changes scale without changing size.
 
 ## Conventions
 

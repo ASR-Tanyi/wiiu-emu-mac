@@ -48,6 +48,32 @@ FetchContent_Declare(pugixml
 
 FetchContent_MakeAvailable(fmt spdlog tomlplusplus pugixml)
 
+# metal-cpp — Apple's header-only C++ interface to Metal (Phase 1.4).
+#
+# Apple-only, and fetched only there: a Linux core build has no use for it.
+# The repository publishes no releases, only tags of the form
+# `release/metal-cpp_macOS<n>_iOS<n>`, and the tag has to match the SDK being
+# built against rather than being the newest -- headers for an SDK newer than
+# the one installed reference symbols that are not there.
+#
+# There is no CMakeLists in the repository, so `MakeAvailable` only downloads
+# it and the interface target below is ours. The include root is the
+# repository root: `#include <Metal/Metal.hpp>`.
+if(WIIU_PLATFORM_APPLE)
+    FetchContent_Declare(metalcpp
+        GIT_REPOSITORY https://github.com/apple/metal-cpp.git
+        GIT_TAG        release/metal-cpp_macOS26_iOS26
+        GIT_SHALLOW    TRUE)
+    FetchContent_MakeAvailable(metalcpp)
+
+    if(NOT TARGET metal-cpp)
+        add_library(metal-cpp INTERFACE)
+        # SYSTEM, because these headers are not ours and do not survive the
+        # project's warning set (`-Wall -Wextra -Wpedantic -Werror`).
+        target_include_directories(metal-cpp SYSTEM INTERFACE "${metalcpp_SOURCE_DIR}")
+    endif()
+endif()
+
 if(WIIU_BUILD_TESTS)
     set(CATCH_INSTALL_DOCS OFF CACHE BOOL "" FORCE)
     set(CATCH_INSTALL_EXTRAS OFF CACHE BOOL "" FORCE)
@@ -62,10 +88,14 @@ endif()
 
 # ---- declared, enabled by a later phase -----------------------------------
 #
-# metal-cpp        metal-cpp_macOS26_iOS26   Phase 1.4  (Apple only, headers)
-#                  https://github.com/apple/metal-cpp
-# SDL3             release-3.4.8             Phase 1.4  window / input / audio
+# SDL3             release-3.4.8             Phase 9    input / audio device
 #                  https://github.com/libsdl-org/SDL
+#                  (Phase 1.4 was going to take SDL3's Metal view for the
+#                   window. It turned out to be about ninety lines of
+#                   Objective-C++ to make an NSWindow and a CAMetalLayer by
+#                   hand, against a dependency that also wants to own the
+#                   event loop -- so the window is ours and SDL3 waits for the
+#                   phase that actually needs a gamepad and an audio device.)
 # imgui            v1.92.9-docking           Phase 10.1 debug UI (Metal backend)
 #                  https://github.com/ocornut/imgui
 # zlib             v1.3.1                    Phase 5.1  RPL SHF_DEFLATED sections

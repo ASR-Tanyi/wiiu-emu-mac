@@ -92,6 +92,12 @@ if(Python3_FOUND AND WIIU_PPC_AS)
     add_custom_target(test_fixtures DEPENDS ${fixtures})
 endif()
 
+wiiu_add_test(gpu
+    SOURCES
+        gpu/test_backend.cpp
+    DEPS
+        wiiu::gpu)
+
 wiiu_add_test(loader
     SOURCES
         loader/test_metadata.cpp
