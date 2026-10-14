@@ -224,6 +224,8 @@ public:
     void set_vsync(bool enabled) override;
     [[nodiscard]] bool begin_frame(FrameInfo& out) override;
     void end_frame() override;
+    void submit() override;
+    void wait_idle() override;
 
     [[nodiscard]] FrameStats last_frame_stats() const override { return last_stats_; }
 
@@ -234,7 +236,10 @@ public:
 
     void destroy(BufferHandle handle) override { buffers_.erase(handle.value()); }
 
-    void destroy(TextureHandle handle) override { textures_.erase(handle.value()); }
+    void destroy(TextureHandle handle) override {
+        textures_.erase(handle.value());
+        texture_formats_.erase(handle.value());
+    }
 
     void destroy(SamplerHandle handle) override { samplers_.erase(handle.value()); }
 
@@ -245,6 +250,7 @@ public:
     [[nodiscard]] bool
     write_buffer(BufferHandle handle, u64 offset, std::span<const u8> data) override;
     [[nodiscard]] void* buffer_contents(BufferHandle handle) override;
+    [[nodiscard]] bool read_texture(TextureHandle handle, std::span<u8> out) override;
 
     [[nodiscard]] bool begin_render_pass(const RenderPassDesc& desc) override;
     void end_render_pass() override;
@@ -275,6 +281,17 @@ private:
 
     void refuse(std::string_view what);
 
+    /// Open a command buffer if there is not one already.
+    ///
+    /// Encoding does not require a frame: the headless runner (10.5) renders
+    /// with no swapchain at all. The buffer is retained rather than left
+    /// autoreleased, because it has to outlive whichever pool happened to be
+    /// open when it was made.
+    [[nodiscard]] bool ensure_commands();
+
+    /// Commit the open command buffer, optionally presenting first.
+    void flush(bool present);
+
     Ref<MTL::Device> device_;
     Ref<MTL::CommandQueue> queue_;
     Capabilities capabilities_;
@@ -287,13 +304,20 @@ private:
     // `end_frame` drains it -- which no RAII scope can express.
     NS::AutoreleasePool* frame_pool_ = nullptr;
     CA::MetalDrawable* drawable_ = nullptr;
-    MTL::CommandBuffer* commands_ = nullptr;
+    Ref<MTL::CommandBuffer> commands_;
+    Ref<MTL::CommandBuffer> submitted_; ///< the last one committed, for wait_idle
     MTL::RenderCommandEncoder* encoder_ = nullptr;
 
     u32 next_id_ = 1;
     TextureHandle drawable_handle_;
     std::map<u32, Ref<MTL::Buffer>> buffers_;
     std::map<u32, Ref<MTL::Texture>> textures_;
+
+    /// The format each texture was created with. Metal knows it too, but as
+    /// a `MTLPixelFormat`, and the one question asked of it here -- how many
+    /// bytes a pixel takes -- is answered by our own enum without a reverse
+    /// mapping that would need updating twice.
+    std::map<u32, TextureFormat> texture_formats_;
     std::map<u32, Ref<MTL::SamplerState>> samplers_;
 
     FrameStats stats_;
@@ -375,8 +399,11 @@ bool MetalBackend::initialize(std::string& error) {
 }
 
 void MetalBackend::shutdown() {
+    wait_idle();
+    commands_.reset();
     buffers_.clear();
     textures_.clear();
+    texture_formats_.clear();
     samplers_.clear();
     queue_.reset();
     device_.reset();
@@ -405,6 +432,7 @@ bool MetalBackend::attach_surface(const NativeSurface& surface, std::string& err
     // swapchain owns it and it changes every frame.
     if (!drawable_handle_.valid()) {
         drawable_handle_ = TextureHandle{next_id_++};
+        texture_formats_.emplace(drawable_handle_.value(), TextureFormat::BGRA8Unorm);
     }
 
     WIIU_LOG_INFO(Gpu, "metal: surface attached, {}x{}", surface.width, surface.height);
@@ -417,29 +445,83 @@ void MetalBackend::set_vsync(bool enabled) {
     }
 }
 
+bool MetalBackend::ensure_commands() {
+    if (commands_) {
+        return true;
+    }
+    if (!queue_) {
+        return false;
+    }
+    const AutoreleasePool pool;
+    commands_ = Ref<MTL::CommandBuffer>::retained(queue_->commandBuffer());
+    return static_cast<bool>(commands_);
+}
+
+void MetalBackend::flush(bool present) {
+    if (encoder_ != nullptr) {
+        // An encoder left open is a hang on Metal rather than a wrong pixel,
+        // so it is closed and complained about rather than ignored.
+        WIIU_LOG_WARN(Gpu, "metal: a render pass was still open at submission");
+        encoder_->endEncoding();
+        encoder_ = nullptr;
+    }
+    if (!commands_) {
+        return;
+    }
+
+    if (present && drawable_ != nullptr) {
+        commands_->presentDrawable(drawable_);
+    }
+    commands_->commit();
+
+    // Kept so `wait_idle` has something to wait on. Retained already, by
+    // `ensure_commands`.
+    submitted_ = commands_;
+    commands_.reset();
+}
+
+void MetalBackend::submit() {
+    flush(false);
+}
+
+void MetalBackend::wait_idle() {
+    if (commands_) {
+        flush(false);
+    }
+    if (submitted_) {
+        submitted_->waitUntilCompleted();
+        submitted_.reset();
+    }
+}
+
 bool MetalBackend::begin_frame(FrameInfo& out) {
     if (layer_ == nullptr || frame_pool_ != nullptr) {
         return false;
     }
 
     // Opened here and drained in `end_frame`. Everything Metal hands back in
-    // between -- the drawable, the command buffer, the descriptors, the
-    // encoder -- is autoreleased into this.
+    // between -- the drawable, the descriptors, the encoder -- is
+    // autoreleased into this.
     frame_pool_ = NS::AutoreleasePool::alloc()->init();
 
     drawable_ = layer_->nextDrawable();
     if (drawable_ == nullptr) {
         // No drawable is normal: the window is occluded, or being resized, or
-        // all three are still on screen. Skip the frame rather than stalling
-        // on one, which is what waiting here would do.
+        // all of them are still on screen. Skip the frame rather than
+        // stalling on one, which is what waiting here would do.
         frame_pool_->release();
         frame_pool_ = nullptr;
         return false;
     }
 
-    commands_ = queue_->commandBuffer();
-    stats_ = FrameStats{};
+    if (!ensure_commands()) {
+        frame_pool_->release();
+        frame_pool_ = nullptr;
+        drawable_ = nullptr;
+        return false;
+    }
 
+    stats_ = FrameStats{};
     out.drawable = drawable_handle_;
     out.width = surface_.width;
     out.height = surface_.height;
@@ -452,18 +534,9 @@ void MetalBackend::end_frame() {
     if (frame_pool_ == nullptr) {
         return;
     }
-    if (encoder_ != nullptr) {
-        WIIU_LOG_WARN(Gpu, "metal: a render pass was still open at the end of the frame");
-        encoder_->endEncoding();
-        encoder_ = nullptr;
-    }
 
-    if (commands_ != nullptr && drawable_ != nullptr) {
-        commands_->presentDrawable(drawable_);
-        commands_->commit();
-    }
+    flush(true);
 
-    commands_ = nullptr;
     drawable_ = nullptr;
     frame_pool_->release();
     frame_pool_ = nullptr;
@@ -542,6 +615,7 @@ TextureHandle MetalBackend::create_texture(const TextureDesc& desc) {
 
     const u32 id = next_id_++;
     textures_.emplace(id, std::move(texture));
+    texture_formats_.emplace(id, desc.format);
     return TextureHandle{id};
 }
 
@@ -610,8 +684,52 @@ void* MetalBackend::buffer_contents(BufferHandle handle) {
     return entry == buffers_.end() ? nullptr : entry->second->contents();
 }
 
+bool MetalBackend::read_texture(TextureHandle handle, std::span<u8> out) {
+    MTL::Texture* const texture = texture_for(handle);
+    if (texture == nullptr) {
+        return false;
+    }
+    if (texture->storageMode() != MTL::StorageModeShared) {
+        // A private texture has no CPU address. Copying one back needs a blit
+        // into a staging buffer, which belongs with the GPU thread (8.2);
+        // saying so beats returning a buffer of zeroes.
+        refuse("read_texture on a non-shared texture");
+        return false;
+    }
+
+    const auto format = texture_formats_.find(handle.value());
+    const u32 pixel = format == texture_formats_.end() ? 0 : format_bytes_per_pixel(format->second);
+    if (pixel == 0) {
+        refuse("read_texture of a compressed texture");
+        return false;
+    }
+
+    const auto width = static_cast<u32>(texture->width());
+    const auto height = static_cast<u32>(texture->height());
+    const std::size_t row = static_cast<std::size_t>(width) * pixel;
+    if (out.size() < row * height) {
+        WIIU_LOG_ERROR(Gpu,
+                       "metal: {} bytes of room for a {}x{} readback needing {}",
+                       out.size(),
+                       width,
+                       height,
+                       row * height);
+        return false;
+    }
+
+    // Whatever was drawn has to have happened before it can be read.
+    wait_idle();
+
+    const AutoreleasePool pool;
+    texture->getBytes(out.data(), row, MTL::Region::Make2D(0, 0, width, height), 0);
+    return true;
+}
+
 bool MetalBackend::begin_render_pass(const RenderPassDesc& desc) {
-    if (commands_ == nullptr || encoder_ != nullptr) {
+    if (encoder_ != nullptr) {
+        return false;
+    }
+    if (!ensure_commands()) {
         return false;
     }
     if (const std::string problem = desc.validate(); !problem.empty()) {

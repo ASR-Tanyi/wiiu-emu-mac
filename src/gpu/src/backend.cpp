@@ -108,6 +108,40 @@ bool format_is_compressed(TextureFormat format) noexcept {
     }
 }
 
+u32 format_bytes_per_pixel(TextureFormat format) noexcept {
+    switch (format) {
+        case TextureFormat::R8Unorm:
+        case TextureFormat::Stencil8:
+            return 1;
+        case TextureFormat::RG8Unorm:
+        case TextureFormat::R16Float:
+            return 2;
+        case TextureFormat::RGBA8Unorm:
+        case TextureFormat::RGBA8UnormSrgb:
+        case TextureFormat::BGRA8Unorm:
+        case TextureFormat::BGRA8UnormSrgb:
+        case TextureFormat::RGB10A2Unorm:
+        case TextureFormat::Depth32Float:
+            return 4;
+        case TextureFormat::RGBA16Float:
+        case TextureFormat::Depth32FloatStencil8:
+            return 8;
+        case TextureFormat::RGBA32Float:
+            return 16;
+        case TextureFormat::BC1Unorm:
+        case TextureFormat::BC2Unorm:
+        case TextureFormat::BC3Unorm:
+        case TextureFormat::BC4Unorm:
+        case TextureFormat::BC5Unorm:
+        case TextureFormat::Unknown:
+            break;
+    }
+    // Compressed formats have no per-pixel size, and neither does Unknown.
+    // Zero rather than a guess: a caller computing a row stride from this
+    // should notice, not quietly allocate a quarter of what it needs.
+    return 0;
+}
+
 std::string_view storage_name(Storage storage) noexcept {
     switch (storage) {
         case Storage::Private:

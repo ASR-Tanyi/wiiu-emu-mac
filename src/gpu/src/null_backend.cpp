@@ -72,6 +72,9 @@ void NullBackend::kill(ResourceKind kind, u32 id, std::string_view what) {
     if (kind == ResourceKind::Buffer) {
         buffer_bytes_.erase(id);
     }
+    if (kind == ResourceKind::Texture) {
+        texture_pixels_.erase(id);
+    }
     if (kind == ResourceKind::Fence) {
         fences_.erase(id);
     }
@@ -131,6 +134,15 @@ bool NullBackend::attach_surface(const NativeSurface& surface, std::string& erro
         live_[index_of(ResourceKind::Texture)].emplace(id, "drawable");
         drawable_ = TextureHandle{id};
     }
+
+    // Resized along with the surface, so that what was presented can be read
+    // back at the size it was presented at.
+    TexturePixels pixels;
+    pixels.width = surface.width;
+    pixels.height = surface.height;
+    pixels.format = TextureFormat::BGRA8Unorm;
+    pixels.bytes.assign(static_cast<std::size_t>(surface.width) * surface.height * 4, 0);
+    texture_pixels_.insert_or_assign(drawable_.value(), std::move(pixels));
     record(fmt::format("attach_surface {}x{}", surface.width, surface.height));
     return true;
 }
@@ -218,6 +230,16 @@ TextureHandle NullBackend::create_texture(const TextureDesc& desc) {
 
     const u32 id = next_id(ResourceKind::Texture);
     live_[index_of(ResourceKind::Texture)].emplace(id, label_or(desc.label, "texture"));
+
+    if (const u32 pixel = format_bytes_per_pixel(desc.format); pixel != 0) {
+        TexturePixels pixels;
+        pixels.width = desc.width;
+        pixels.height = desc.height;
+        pixels.format = desc.format;
+        pixels.bytes.assign(static_cast<std::size_t>(desc.width) * desc.height * pixel, 0);
+        texture_pixels_.emplace(id, std::move(pixels));
+    }
+
     record(fmt::format("create_texture {} {}x{} format={} storage={} label={}",
                        id,
                        desc.width,
@@ -308,6 +330,69 @@ void* NullBackend::buffer_contents(BufferHandle handle) {
     return entry == buffer_bytes_.end() ? nullptr : entry->second.data();
 }
 
+void NullBackend::clear_pixels(TextureHandle handle, const ClearColor& color) {
+    const auto entry = texture_pixels_.find(handle.value());
+    if (entry == texture_pixels_.end()) {
+        return;
+    }
+    TexturePixels& pixels = entry->second;
+    if (format_bytes_per_pixel(pixels.format) != 4) {
+        // Only the eight-bit four-channel formats are modelled. Anything else
+        // keeps whatever it had, which is zeroes -- a wrong answer is worse
+        // than an obviously absent one.
+        return;
+    }
+
+    const auto quantize = [](f32 value) {
+        const f32 clamped = value < 0.0F ? 0.0F : (value > 1.0F ? 1.0F : value);
+        return static_cast<u8>((clamped * 255.0F) + 0.5F);
+    };
+
+    const bool bgra = pixels.format == TextureFormat::BGRA8Unorm ||
+                      pixels.format == TextureFormat::BGRA8UnormSrgb;
+    const std::array<u8, 4> texel{bgra ? quantize(color.blue) : quantize(color.red),
+                                  quantize(color.green),
+                                  bgra ? quantize(color.red) : quantize(color.blue),
+                                  quantize(color.alpha)};
+
+    for (std::size_t offset = 0; offset + 4 <= pixels.bytes.size(); offset += 4) {
+        std::copy(
+            texel.begin(), texel.end(), pixels.bytes.begin() + static_cast<std::ptrdiff_t>(offset));
+    }
+}
+
+bool NullBackend::read_texture(TextureHandle handle, std::span<u8> out) {
+    const auto entry = texture_pixels_.find(handle.value());
+    if (entry == texture_pixels_.end()) {
+        reject(fmt::format("read_texture {}: nothing readable behind that handle", handle.value()));
+        return false;
+    }
+    if (out.size() < entry->second.bytes.size()) {
+        reject(fmt::format("read_texture {}: {} bytes of room for {}",
+                           handle.value(),
+                           out.size(),
+                           entry->second.bytes.size()));
+        return false;
+    }
+    std::copy(entry->second.bytes.begin(), entry->second.bytes.end(), out.begin());
+    return true;
+}
+
+void NullBackend::submit() {
+    if (in_render_pass_) {
+        reject("submit with a render pass still open");
+        in_render_pass_ = false;
+    }
+    record("submit");
+}
+
+void NullBackend::wait_idle() {
+    // Nothing is running, so this is instantaneous -- but it is still
+    // recorded, because where the emulator waits is a question worth being
+    // able to ask of a trace (**P4**).
+    record("wait_idle");
+}
+
 // --------------------------------------------------------------------------
 // Encoding
 // --------------------------------------------------------------------------
@@ -332,6 +417,15 @@ bool NullBackend::begin_render_pass(const RenderPassDesc& desc) {
     in_render_pass_ = true;
     last_render_pass_ = desc;
     ++stats_.render_passes;
+
+    // A clear is the one piece of rendering a backend without a GPU can
+    // honestly carry out, and doing it means `read_texture` answers the same
+    // question here as it does on Metal.
+    for (u32 index = 0; index < desc.color_count; ++index) {
+        if (desc.colors[index].load == LoadAction::Clear) {
+            clear_pixels(desc.colors[index].texture, desc.colors[index].clear);
+        }
+    }
 
     std::string line = fmt::format(
         "begin_render_pass '{}' colors={}", label_or(desc.label, "-"), desc.color_count);

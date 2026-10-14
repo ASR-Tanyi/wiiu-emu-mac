@@ -245,6 +245,20 @@ public:
     /// Present, and make the frame's resources reclaimable.
     virtual void end_frame() = 0;
 
+    /// Commit whatever has been recorded, without presenting anything.
+    ///
+    /// Rendering does not require a window. The headless compatibility runner
+    /// (10.5) boots titles with no swapchain at all and hashes what they
+    /// drew, and a save-state test (11.4) does the same — so a render pass
+    /// outside a frame is an ordinary thing to want, not an edge case.
+    virtual void submit() = 0;
+
+    /// Block until everything submitted has finished.
+    ///
+    /// Unlike `wait(FenceHandle)` this is not something a guest ever asks
+    /// for: it is for shutdown, and for reading back what was drawn.
+    virtual void wait_idle() = 0;
+
     [[nodiscard]] virtual FrameStats last_frame_stats() const = 0;
 
     // --- resources --------------------------------------------------------
@@ -263,6 +277,14 @@ public:
     /// write would run past the end.
     [[nodiscard]] virtual bool
     write_buffer(BufferHandle handle, u64 offset, std::span<const u8> data) = 0;
+
+    /// Copy a texture's pixels back to the host, tightly packed.
+    ///
+    /// Only for `Shared` storage, and it waits for the GPU first — so this is
+    /// a debugging and testing path, not something a frame should do. It is
+    /// what 10.5 hashes framebuffers with, and what proves a clear actually
+    /// cleared.
+    [[nodiscard]] virtual bool read_texture(TextureHandle handle, std::span<u8> out) = 0;
 
     /// The host pointer behind a `Shared` buffer, or null.
     ///

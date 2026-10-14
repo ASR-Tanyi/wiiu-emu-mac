@@ -35,6 +35,8 @@ public:
     void set_vsync(bool enabled) override;
     [[nodiscard]] bool begin_frame(FrameInfo& out) override;
     void end_frame() override;
+    void submit() override;
+    void wait_idle() override;
 
     [[nodiscard]] FrameStats last_frame_stats() const override { return last_stats_; }
 
@@ -52,6 +54,7 @@ public:
     [[nodiscard]] bool
     write_buffer(BufferHandle handle, u64 offset, std::span<const u8> data) override;
     [[nodiscard]] void* buffer_contents(BufferHandle handle) override;
+    [[nodiscard]] bool read_texture(TextureHandle handle, std::span<u8> out) override;
 
     [[nodiscard]] bool begin_render_pass(const RenderPassDesc& desc) override;
     void end_render_pass() override;
@@ -127,6 +130,21 @@ private:
     /// Buffer contents, so `write_buffer` and `buffer_contents` mean
     /// something and a test can check what the translator uploaded.
     std::map<u32, std::vector<u8>> buffer_bytes_;
+
+    /// Texture contents, so a clear is something a test can look at rather
+    /// than only something it can see recorded. The headless compatibility
+    /// runner (10.5) hashes framebuffers; this is the same question asked of
+    /// a backend with no GPU.
+    struct TexturePixels {
+        u32 width = 0;
+        u32 height = 0;
+        TextureFormat format = TextureFormat::Unknown;
+        std::vector<u8> bytes;
+    };
+
+    std::map<u32, TexturePixels> texture_pixels_;
+
+    void clear_pixels(TextureHandle handle, const ClearColor& color);
 
     /// The drawable handed out by `begin_frame`, recreated per backend rather
     /// than per frame: a real swapchain rotates through a small set, and a

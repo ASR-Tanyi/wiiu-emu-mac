@@ -389,6 +389,73 @@ TEST_CASE_METHOD(BackendFixture, "binding a resource that is gone is refused", "
     CHECK(backend.rejected() == 4);
 }
 
+TEST_CASE_METHOD(BackendFixture, "a clear can be rendered and read back", "[gpu]") {
+    TextureDesc desc;
+    desc.width = 4;
+    desc.height = 4;
+    desc.format = TextureFormat::BGRA8Unorm;
+    desc.usage = TextureUsage::RenderTarget;
+    desc.storage = Storage::Shared;
+    desc.label = "offscreen";
+    const TextureHandle target = backend.create_texture(desc);
+    REQUIRE(target.valid());
+
+    RenderPassDesc pass;
+    pass.label = "offscreen clear";
+    pass.color_count = 1;
+    pass.colors[0].texture = target;
+    pass.colors[0].load = LoadAction::Clear;
+    pass.colors[0].store = StoreAction::Store;
+    pass.colors[0].clear = ClearColor{1.0F, 0.0F, 0.0F, 1.0F};
+
+    // No frame, and no window: rendering does not require a swapchain, which
+    // is what the headless compatibility runner (10.5) depends on.
+    REQUIRE(backend.begin_render_pass(pass));
+    backend.end_render_pass();
+    backend.submit();
+    backend.wait_idle();
+
+    std::vector<u8> pixels(4U * 4U * 4U, 0);
+    REQUIRE(backend.read_texture(target, pixels));
+
+    // BGRA: opaque red is 00 00 FF FF, and getting the channel order wrong
+    // is the classic way to read back a plausible but mirrored image.
+    CHECK(pixels[0] == 0x00);
+    CHECK(pixels[1] == 0x00);
+    CHECK(pixels[2] == 0xFF);
+    CHECK(pixels[3] == 0xFF);
+
+    // ... and every other texel too, not just the first.
+    CHECK(pixels[(15 * 4) + 2] == 0xFF);
+    CHECK(backend.rejected() == 0);
+}
+
+TEST_CASE_METHOD(BackendFixture, "a readback that does not fit is refused", "[gpu]") {
+    TextureDesc desc;
+    desc.width = 8;
+    desc.height = 8;
+    desc.format = TextureFormat::RGBA8Unorm;
+    desc.usage = TextureUsage::RenderTarget;
+    const TextureHandle target = backend.create_texture(desc);
+
+    std::vector<u8> small(16, 0);
+    CHECK_FALSE(backend.read_texture(target, small));
+    CHECK(backend.rejected() == 1);
+}
+
+TEST_CASE("bytes per pixel is zero where there is no such thing", "[gpu]") {
+    CHECK(format_bytes_per_pixel(TextureFormat::BGRA8Unorm) == 4);
+    CHECK(format_bytes_per_pixel(TextureFormat::R8Unorm) == 1);
+    CHECK(format_bytes_per_pixel(TextureFormat::RGBA32Float) == 16);
+
+    // Compressed formats have bytes per *block*. Zero rather than a guess:
+    // a row stride computed from a wrong answer allocates a fraction of what
+    // is needed and reads past the end of it.
+    CHECK(format_bytes_per_pixel(TextureFormat::BC3Unorm) == 0);
+    CHECK(format_bytes_per_pixel(TextureFormat::Unknown) == 0);
+    CHECK(format_is_compressed(TextureFormat::BC3Unorm));
+}
+
 TEST_CASE("the metal backend is absent on a host without Metal", "[gpu]") {
     wiiu::log::set_all_levels(wiiu::log::Level::Off);
 

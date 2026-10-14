@@ -107,6 +107,10 @@ enum class TextureFormat : u8 {
 [[nodiscard]] bool format_has_stencil(TextureFormat format) noexcept;
 [[nodiscard]] bool format_is_compressed(TextureFormat format) noexcept;
 
+/// Bytes per pixel, or zero for a compressed format — which has bytes per
+/// *block* and has to be asked a different question.
+[[nodiscard]] u32 format_bytes_per_pixel(TextureFormat format) noexcept;
+
 /// Where a resource lives.
 ///
 /// `Shared` is the interesting one on this hardware: CPU and GPU address the

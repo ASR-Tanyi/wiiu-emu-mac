@@ -92,11 +92,44 @@ if(Python3_FOUND AND WIIU_PPC_AS)
     add_custom_target(test_fixtures DEPENDS ${fixtures})
 endif()
 
+set(WIIU_GPU_TEST_SOURCES gpu/test_backend.cpp)
+if(WIIU_PLATFORM_APPLE)
+    # The one test that talks to a real GPU. It needs no window -- the
+    # headless path it uses is the same one the compatibility runner (10.5)
+    # will boot titles through -- so it runs anywhere the hardware is.
+    list(APPEND WIIU_GPU_TEST_SOURCES gpu/test_metal.cpp)
+endif()
+
 wiiu_add_test(gpu
-    SOURCES
-        gpu/test_backend.cpp
-    DEPS
-        wiiu::gpu)
+    SOURCES ${WIIU_GPU_TEST_SOURCES}
+    DEPS wiiu::gpu)
+
+# Phase 1.8 — the JIT probe, run on every build rather than by hand.
+#
+# The probe source is compiled straight into the test: it belongs to the
+# frontend executable, and making a library of two files to share it would be
+# more machinery than the sharing is worth.
+if(WIIU_PLATFORM_APPLE)
+    wiiu_add_test(platform
+        SOURCES
+            platform/test_jit.cpp
+            "${PROJECT_SOURCE_DIR}/src/frontend/platform/jit_probe_macos.cpp"
+        DEPS
+            wiiu::common)
+
+    target_include_directories(test_platform PRIVATE "${PROJECT_SOURCE_DIR}/src/frontend")
+
+    # MAP_JIT is refused unless the *binary making the call* carries the
+    # entitlement -- not the project, not the app bundle, the binary. So the
+    # test gets the same signature the app does; without this it would fail
+    # for a reason that has nothing to do with the code under test.
+    add_custom_command(TARGET test_platform POST_BUILD
+        COMMAND codesign --force --sign - --timestamp=none --options runtime
+                --entitlements "${PROJECT_SOURCE_DIR}/src/frontend/wiiu-emu.entitlements"
+                "$<TARGET_FILE:test_platform>"
+        COMMENT "Signing test_platform with the JIT entitlement (Phase 1.8)"
+        VERBATIM)
+endif()
 
 wiiu_add_test(loader
     SOURCES
