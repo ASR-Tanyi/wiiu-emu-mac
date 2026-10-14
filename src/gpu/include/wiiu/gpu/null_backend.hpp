@@ -15,6 +15,7 @@
 #include <wiiu/gpu/backend.hpp>
 
 #include <map>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -40,10 +41,14 @@ public:
 
     [[nodiscard]] FrameStats last_frame_stats() const override { return last_stats_; }
 
+    /// Nothing runs, so nothing fails on a GPU.
+    [[nodiscard]] u64 command_errors() const override { return 0; }
+
     [[nodiscard]] BufferHandle create_buffer(const BufferDesc& desc) override;
     [[nodiscard]] TextureHandle create_texture(const TextureDesc& desc) override;
     [[nodiscard]] SamplerHandle create_sampler(const SamplerDesc& desc) override;
-    [[nodiscard]] PipelineHandle create_pipeline(const PipelineDesc& desc) override;
+    [[nodiscard]] PipelineHandle create_pipeline(const PipelineDesc& desc,
+                                                 std::string& error) override;
 
     void destroy(BufferHandle handle) override;
     void destroy(TextureHandle handle) override;
@@ -55,6 +60,13 @@ public:
     write_buffer(BufferHandle handle, u64 offset, std::span<const u8> data) override;
     [[nodiscard]] void* buffer_contents(BufferHandle handle) override;
     [[nodiscard]] bool read_texture(TextureHandle handle, std::span<u8> out) override;
+    [[nodiscard]] bool write_texture(TextureHandle handle,
+                                     const Rect& region,
+                                     std::span<const u8> data,
+                                     u32 bytes_per_row) override;
+    [[nodiscard]] BufferHandle
+    import_host_memory(void* pointer, u64 size, std::string_view label) override;
+    [[nodiscard]] MemoryStats memory_stats() const override;
 
     [[nodiscard]] bool begin_render_pass(const RenderPassDesc& desc) override;
     void end_render_pass() override;
@@ -73,6 +85,9 @@ public:
     void signal(FenceHandle handle) override;
     [[nodiscard]] bool is_signalled(FenceHandle handle) override;
     void wait(FenceHandle handle) override;
+
+    [[nodiscard]] bool begin_capture(std::string_view path, std::string& error) override;
+    void end_capture() override;
 
     // --- what the tests look at -------------------------------------------
 
@@ -95,6 +110,8 @@ public:
 
     [[nodiscard]] bool in_render_pass() const noexcept { return in_render_pass_; }
 
+    [[nodiscard]] bool capturing() const noexcept { return capturing_; }
+
     /// The capabilities a test wants to pretend this machine has.
     void set_capabilities(Capabilities capabilities) { capabilities_ = std::move(capabilities); }
 
@@ -103,6 +120,14 @@ public:
 private:
     void record(std::string line);
     void reject(std::string line);
+
+    /// Encoding calls are made inside a render pass or not at all. False,
+    /// having rejected the call, if there is no pass open.
+    [[nodiscard]] bool require_pass(std::string_view what);
+
+    /// A binding index inside the stage's table. False, having rejected it,
+    /// if it is not.
+    [[nodiscard]] bool check_binding(std::string_view what, u32 index, u32 limit);
 
     [[nodiscard]] u32 next_id(ResourceKind kind);
 
@@ -115,6 +140,11 @@ private:
     bool vsync_ = true;
     bool in_render_pass_ = false;
     bool in_frame_ = false;
+    bool capturing_ = false;
+
+    /// The pipeline set in the current pass. Cleared when a pass begins,
+    /// because on Metal a new encoder starts with nothing set.
+    PipelineHandle pass_pipeline_;
 
     std::vector<std::string> events_;
     u64 rejected_ = 0;
@@ -131,6 +161,10 @@ private:
     /// something and a test can check what the translator uploaded.
     std::map<u32, std::vector<u8>> buffer_bytes_;
 
+    /// Buffers wrapping host memory (`import_host_memory`): the bytes are
+    /// the caller's, so they are remembered rather than copied.
+    std::map<u32, std::span<u8>> imported_;
+
     /// Texture contents, so a clear is something a test can look at rather
     /// than only something it can see recorded. The headless compatibility
     /// runner (10.5) hashes framebuffers; this is the same question asked of
@@ -139,6 +173,7 @@ private:
         u32 width = 0;
         u32 height = 0;
         TextureFormat format = TextureFormat::Unknown;
+        Storage storage = Storage::Private;
         std::vector<u8> bytes;
     };
 

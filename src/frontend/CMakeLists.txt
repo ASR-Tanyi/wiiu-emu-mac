@@ -5,7 +5,7 @@
 # implementation that reports it cannot do the thing, rather than being absent
 # and taking the whole frontend out of the core-only build with them.
 
-set(WIIU_FRONTEND_SOURCES main.cpp)
+set(WIIU_FRONTEND_SOURCES main.cpp display.cpp)
 
 if(WIIU_PLATFORM_APPLE)
     list(APPEND WIIU_FRONTEND_SOURCES

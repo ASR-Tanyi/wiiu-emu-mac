@@ -18,6 +18,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -132,6 +133,51 @@ TEST_CASE("the reciprocal square root estimate stays inside its bound", "[cpu][f
     INFO("worst relative error " << worst);
     CHECK(worst < 1.0 / 32.0);
     CHECK(worst > 0.0);
+}
+
+TEST_CASE("the estimates match hardware bit for bit", "[cpu][fpu][estimate]") {
+    // The bounds above say an estimate is good enough; they cannot say it is
+    // the *hardware's* estimate, and guest code that refines it with
+    // Newton-Raphson steps tuned to that estimate notices the difference in
+    // its last bits. These are the answers Dolphin's hardware-derived tables
+    // give (Gekko and Broadway share the 750CL's estimator), checked against
+    // an independent re-implementation of the same lookup.
+    struct Vector {
+        u64 input;
+        u64 fres;
+        u64 frsqrte;
+    };
+
+    constexpr std::array<Vector, 8> kVectors{{
+        {0x3FF0000000000000, 0x3FEFFF0000000000, 0x3FEFFE8000000000}, //  1.0
+        {0x4000000000000000, 0x3FDFFF0000000000, 0x3FE69FA000000000}, //  2.0
+        {0x4008000000000000, 0x3FD5550000000000, 0x3FE2794000000000}, //  3.0
+        {0x3FE0000000000000, 0x3FFFFF0000000000, 0x3FF69FA000000000}, //  0.5
+        {0x3FF8000000000000, 0x3FE5550000000000, 0x3FEA204000000000}, //  1.5
+        {0x4024000000000000, 0x3FB9990000000000, 0x3FD43C8000000000}, // 10.0
+        {0xC000000000000000, 0xBFDFFF0000000000, 0x7FF8000000000000}, // -2.0
+        {0x0000000000000001, 0x47EFFFFFE0000000, 0x617FFE8000000000}, // smallest subnormal
+    }};
+    for (const Vector& vector : kVectors) {
+        const f64 input = std::bit_cast<f64>(vector.input);
+        INFO("input " << std::hex << vector.input);
+        CHECK(std::bit_cast<u64>(Interpreter::reciprocal_estimate(input)) == vector.fres);
+        CHECK(std::bit_cast<u64>(Interpreter::reciprocal_sqrt_estimate(input)) == vector.frsqrte);
+    }
+
+    // Further into the reciprocal table, where the first transcription went
+    // wrong: rows 9, 18 and 26, and one well away from the unit interval.
+    CHECK(std::bit_cast<u64>(Interpreter::reciprocal_estimate(1.75)) == 0x3FE2488000000000ULL);
+    CHECK(std::bit_cast<u64>(Interpreter::reciprocal_estimate(0.3)) == 0x400AAB4DC0000000ULL);
+    CHECK(std::bit_cast<u64>(Interpreter::reciprocal_estimate(123456.0)) == 0x3EE0FCAC00000000ULL);
+    CHECK(std::bit_cast<u64>(Interpreter::reciprocal_estimate(-7e-30)) == 0xC5FCDA3800000000ULL);
+
+    // A signalling NaN comes back quiet, payload and sign intact.
+    const f64 signalling = std::bit_cast<f64>(0x7FF4000000000000ULL);
+    CHECK(std::bit_cast<u64>(Interpreter::reciprocal_estimate(signalling)) ==
+          0x7FFC000000000000ULL);
+    CHECK(std::bit_cast<u64>(Interpreter::reciprocal_sqrt_estimate(signalling)) ==
+          0x7FFC000000000000ULL);
 }
 
 TEST_CASE("the estimates are estimates, not divisions", "[cpu][fpu][estimate]") {

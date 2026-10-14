@@ -6,6 +6,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <utility>
 
 namespace wiiu::gpu {
@@ -55,6 +56,22 @@ u32 NullBackend::next_id(ResourceKind kind) {
     return next_id_[index_of(kind)]++;
 }
 
+bool NullBackend::require_pass(std::string_view what) {
+    if (in_render_pass_) {
+        return true;
+    }
+    reject(fmt::format("{} outside a render pass", what));
+    return false;
+}
+
+bool NullBackend::check_binding(std::string_view what, u32 index, u32 limit) {
+    if (index < limit) {
+        return true;
+    }
+    reject(fmt::format("{} index {} is past the {} the stage has", what, index, limit));
+    return false;
+}
+
 bool NullBackend::live(ResourceKind kind, u32 id) const {
     const auto& table = live_[index_of(kind)];
     return id != 0 && table.find(id) != table.end();
@@ -71,6 +88,7 @@ void NullBackend::kill(ResourceKind kind, u32 id, std::string_view what) {
     table.erase(entry);
     if (kind == ResourceKind::Buffer) {
         buffer_bytes_.erase(id);
+        imported_.erase(id);
     }
     if (kind == ResourceKind::Texture) {
         texture_pixels_.erase(id);
@@ -200,6 +218,12 @@ BufferHandle NullBackend::create_buffer(const BufferDesc& desc) {
         reject("create_buffer of zero bytes");
         return {};
     }
+    if (desc.storage == Storage::Memoryless) {
+        // Only render targets can live in tile memory alone; Metal refuses
+        // a memoryless buffer, so this does too.
+        reject(fmt::format("create_buffer '{}' is memoryless", label_or(desc.label, "-")));
+        return {};
+    }
     const u32 id = next_id(ResourceKind::Buffer);
     live_[index_of(ResourceKind::Buffer)].emplace(id, label_or(desc.label, "buffer"));
     buffer_bytes_[id].assign(static_cast<std::size_t>(desc.size), 0);
@@ -236,6 +260,7 @@ TextureHandle NullBackend::create_texture(const TextureDesc& desc) {
         pixels.width = desc.width;
         pixels.height = desc.height;
         pixels.format = desc.format;
+        pixels.storage = desc.storage;
         pixels.bytes.assign(static_cast<std::size_t>(desc.width) * desc.height * pixel, 0);
         texture_pixels_.emplace(id, std::move(pixels));
     }
@@ -271,9 +296,22 @@ SamplerHandle NullBackend::create_sampler(const SamplerDesc& desc) {
     return SamplerHandle{id};
 }
 
-PipelineHandle NullBackend::create_pipeline(const PipelineDesc& desc) {
-    if (const std::string problem = desc.validate(); !problem.empty()) {
-        reject(fmt::format("create_pipeline '{}': {}", label_or(desc.label, "-"), problem));
+PipelineHandle NullBackend::create_pipeline(const PipelineDesc& desc, std::string& error) {
+    error = desc.validate();
+
+    // There is no compiler here, but there is one question a compiler would
+    // answer first that a string search can answer too: whether the function
+    // the pipeline names is in the source at all.
+    if (error.empty() && desc.vertex_source.find(desc.vertex_entry) == std::string::npos) {
+        error = fmt::format("no function '{}' in the vertex source", desc.vertex_entry);
+    }
+    const std::string& fragment =
+        desc.fragment_source.empty() ? desc.vertex_source : desc.fragment_source;
+    if (error.empty() && fragment.find(desc.fragment_entry) == std::string::npos) {
+        error = fmt::format("no function '{}' in the fragment source", desc.fragment_entry);
+    }
+    if (!error.empty()) {
+        reject(fmt::format("create_pipeline '{}': {}", label_or(desc.label, "-"), error));
         return {};
     }
     const u32 id = next_id(ResourceKind::Pipeline);
@@ -306,28 +344,131 @@ void NullBackend::destroy(FenceHandle handle) {
 }
 
 bool NullBackend::write_buffer(BufferHandle handle, u64 offset, std::span<const u8> data) {
-    const auto entry = buffer_bytes_.find(handle.value());
-    if (entry == buffer_bytes_.end()) {
+    std::span<u8> bytes;
+    if (const auto entry = buffer_bytes_.find(handle.value()); entry != buffer_bytes_.end()) {
+        bytes = entry->second;
+    } else if (const auto wrapped = imported_.find(handle.value()); wrapped != imported_.end()) {
+        bytes = wrapped->second;
+    } else {
         reject(fmt::format("write_buffer {}: not a live handle", handle.value()));
         return false;
     }
-    if (offset + data.size() > entry->second.size()) {
+    if (offset + data.size() > bytes.size()) {
         reject(fmt::format("write_buffer {}: {} bytes at {} runs past the end ({})",
                            handle.value(),
                            data.size(),
                            offset,
-                           entry->second.size()));
+                           bytes.size()));
         return false;
     }
-    std::copy(
-        data.begin(), data.end(), entry->second.begin() + static_cast<std::ptrdiff_t>(offset));
+    std::copy(data.begin(), data.end(), bytes.begin() + static_cast<std::ptrdiff_t>(offset));
     record(fmt::format("write_buffer {} {} bytes at {}", handle.value(), data.size(), offset));
     return true;
 }
 
 void* NullBackend::buffer_contents(BufferHandle handle) {
-    const auto entry = buffer_bytes_.find(handle.value());
-    return entry == buffer_bytes_.end() ? nullptr : entry->second.data();
+    if (const auto entry = buffer_bytes_.find(handle.value()); entry != buffer_bytes_.end()) {
+        return entry->second.data();
+    }
+    const auto wrapped = imported_.find(handle.value());
+    return wrapped == imported_.end() ? nullptr : wrapped->second.data();
+}
+
+bool NullBackend::write_texture(TextureHandle handle,
+                                const Rect& region,
+                                std::span<const u8> data,
+                                u32 bytes_per_row) {
+    const auto entry = texture_pixels_.find(handle.value());
+    if (entry == texture_pixels_.end()) {
+        reject(
+            fmt::format("write_texture {}: nothing writable behind that handle", handle.value()));
+        return false;
+    }
+    TexturePixels& pixels = entry->second;
+    if (pixels.storage != Storage::Shared) {
+        // The same refusal Metal makes: a private texture has no CPU
+        // address, and filling one is a blit on the GPU thread (8.2).
+        reject(fmt::format("write_texture {}: {} storage has no CPU address",
+                           handle.value(),
+                           storage_name(pixels.storage)));
+        return false;
+    }
+    if (region.width == 0 || region.height == 0 || region.x + region.width > pixels.width ||
+        region.y + region.height > pixels.height) {
+        reject(fmt::format("write_texture {}: {}x{} at ({},{}) is not inside {}x{}",
+                           handle.value(),
+                           region.width,
+                           region.height,
+                           region.x,
+                           region.y,
+                           pixels.width,
+                           pixels.height));
+        return false;
+    }
+
+    const u32 pixel = format_bytes_per_pixel(pixels.format);
+    const std::size_t row = static_cast<std::size_t>(region.width) * pixel;
+    const std::size_t needed =
+        (static_cast<std::size_t>(bytes_per_row) * (region.height - 1)) + row;
+    if (bytes_per_row < row || data.size() < needed) {
+        reject(fmt::format("write_texture {}: {} bytes, {} to a row, for a {}x{} region",
+                           handle.value(),
+                           data.size(),
+                           bytes_per_row,
+                           region.width,
+                           region.height));
+        return false;
+    }
+
+    const std::size_t stride = static_cast<std::size_t>(pixels.width) * pixel;
+    for (u32 y = 0; y < region.height; ++y) {
+        const auto source =
+            data.begin() + static_cast<std::ptrdiff_t>(y * std::size_t{bytes_per_row});
+        const auto target =
+            pixels.bytes.begin() + static_cast<std::ptrdiff_t>(((region.y + y) * stride) +
+                                                               (region.x * std::size_t{pixel}));
+        std::copy(source, source + static_cast<std::ptrdiff_t>(row), target);
+    }
+    record(fmt::format("write_texture {} {}x{} at ({},{})",
+                       handle.value(),
+                       region.width,
+                       region.height,
+                       region.x,
+                       region.y));
+    return true;
+}
+
+BufferHandle NullBackend::import_host_memory(void* pointer, u64 size, std::string_view label) {
+    const u64 page = host_page_size();
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    if (pointer == nullptr || size == 0 || (address % page) != 0 || (size % page) != 0) {
+        // Metal's rule, enforced here too so that code which works against
+        // this backend does not fall over on the real one.
+        reject(fmt::format("import_host_memory '{}': {} bytes at {:#x} are not whole {}-byte pages",
+                           label_or(label, "-"),
+                           size,
+                           address,
+                           page));
+        return {};
+    }
+    const u32 id = next_id(ResourceKind::Buffer);
+    live_[index_of(ResourceKind::Buffer)].emplace(id, label_or(label, "imported"));
+    imported_.emplace(id, std::span<u8>{static_cast<u8*>(pointer), static_cast<std::size_t>(size)});
+    record(fmt::format("import_host_memory {} size={} label={}", id, size, label_or(label, "-")));
+    return BufferHandle{id};
+}
+
+MemoryStats NullBackend::memory_stats() const {
+    // No heaps: everything here is a resource of its own, which is the
+    // honest answer for a backend with no allocator to suballocate from.
+    MemoryStats stats;
+    stats.dedicated = buffer_bytes_.size() + live_[index_of(ResourceKind::Texture)].size();
+    stats.imported = imported_.size();
+    for (const auto& [id, bytes] : imported_) {
+        static_cast<void>(id);
+        stats.imported_bytes += bytes.size();
+    }
+    return stats;
 }
 
 void NullBackend::clear_pixels(TextureHandle handle, const ClearColor& color) {
@@ -415,6 +556,7 @@ bool NullBackend::begin_render_pass(const RenderPassDesc& desc) {
     }
 
     in_render_pass_ = true;
+    pass_pipeline_ = {};
     last_render_pass_ = desc;
     ++stats_.render_passes;
 
@@ -449,14 +591,21 @@ void NullBackend::end_render_pass() {
 }
 
 void NullBackend::set_pipeline(PipelineHandle pipeline) {
+    if (!require_pass("set_pipeline")) {
+        return;
+    }
     if (!live(ResourceKind::Pipeline, pipeline.value())) {
         reject(fmt::format("set_pipeline {}: not a live handle", pipeline.value()));
         return;
     }
+    pass_pipeline_ = pipeline;
     record(fmt::format("set_pipeline {}", pipeline.value()));
 }
 
 void NullBackend::set_viewport(const Viewport& viewport) {
+    if (!require_pass("set_viewport")) {
+        return;
+    }
     record(fmt::format("set_viewport {}x{} at ({},{}) depth [{},{}]",
                        viewport.width,
                        viewport.height,
@@ -467,10 +616,16 @@ void NullBackend::set_viewport(const Viewport& viewport) {
 }
 
 void NullBackend::set_scissor(const Rect& rect) {
+    if (!require_pass("set_scissor")) {
+        return;
+    }
     record(fmt::format("set_scissor {}x{} at ({},{})", rect.width, rect.height, rect.x, rect.y));
 }
 
 void NullBackend::bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer, u64 offset) {
+    if (!require_pass("bind_buffer") || !check_binding("bind_buffer", index, max_bound_buffers)) {
+        return;
+    }
     if (!live(ResourceKind::Buffer, buffer.value())) {
         reject(fmt::format("bind_buffer {}: not a live handle", buffer.value()));
         return;
@@ -480,6 +635,10 @@ void NullBackend::bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer,
 }
 
 void NullBackend::bind_texture(ShaderStage stage, u32 index, TextureHandle texture) {
+    if (!require_pass("bind_texture") ||
+        !check_binding("bind_texture", index, max_bound_textures)) {
+        return;
+    }
     if (!live(ResourceKind::Texture, texture.value())) {
         reject(fmt::format("bind_texture {}: not a live handle", texture.value()));
         return;
@@ -489,6 +648,10 @@ void NullBackend::bind_texture(ShaderStage stage, u32 index, TextureHandle textu
 }
 
 void NullBackend::bind_sampler(ShaderStage stage, u32 index, SamplerHandle sampler) {
+    if (!require_pass("bind_sampler") ||
+        !check_binding("bind_sampler", index, max_bound_samplers)) {
+        return;
+    }
     if (!live(ResourceKind::Sampler, sampler.value())) {
         reject(fmt::format("bind_sampler {}: not a live handle", sampler.value()));
         return;
@@ -503,10 +666,22 @@ void NullBackend::draw(const DrawCall& call) {
         return;
     }
 
+    if (!pass_pipeline_.valid()) {
+        // On Metal this is a validation failure at best: an encoder with no
+        // pipeline state has no idea what a vertex is.
+        reject("draw with no pipeline set in this pass");
+        return;
+    }
+
     const bool indexed = call.index_buffer.valid();
     if (indexed && !live(ResourceKind::Buffer, call.index_buffer.value())) {
         reject(
             fmt::format("draw: index buffer {} is not a live handle", call.index_buffer.value()));
+        return;
+    }
+    if (indexed && (call.index_offset % (call.index_is_32bit ? 4U : 2U)) != 0) {
+        reject(fmt::format("draw: an index offset of {} is not a multiple of the index size",
+                           call.index_offset));
         return;
     }
     const u32 count = indexed ? call.index_count : call.vertex_count;
@@ -560,6 +735,32 @@ void NullBackend::wait(FenceHandle handle) {
     // the CPU waits, and that question is answerable without a GPU.
     entry->second = true;
     record(fmt::format("wait {}", handle.value()));
+}
+
+// --------------------------------------------------------------------------
+// Tooling
+// --------------------------------------------------------------------------
+
+bool NullBackend::begin_capture(std::string_view path, std::string& error) {
+    if (capturing_) {
+        error = "a capture is already running";
+        reject(fmt::format("begin_capture {}: {}", path, error));
+        return false;
+    }
+    // Nothing to capture, but the bracket is real: a frontend that starts a
+    // capture and never ends it is the same bug here as on Metal.
+    capturing_ = true;
+    record(fmt::format("begin_capture {}", path));
+    return true;
+}
+
+void NullBackend::end_capture() {
+    if (!capturing_) {
+        reject("end_capture with no capture running");
+        return;
+    }
+    capturing_ = false;
+    record("end_capture");
 }
 
 std::unique_ptr<GpuBackend> create_null_backend() {

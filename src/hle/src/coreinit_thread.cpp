@@ -811,6 +811,9 @@ void Context::reset() {
 
     free_callback_stacks.clear();
     next_callback_handle = callback_handle_base;
+
+    // The title's buffers; the frontend's flip hook stays.
+    screens.reset();
 }
 
 Message read_message(memory::Memory& memory, ppcaddr_t address) {

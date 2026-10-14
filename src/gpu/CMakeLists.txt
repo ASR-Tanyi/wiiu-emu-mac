@@ -8,11 +8,15 @@
 
 set(WIIU_GPU_SOURCES
     src/backend.cpp
-    src/null_backend.cpp)
+    src/null_backend.cpp
+    src/presenter.cpp
+    src/shader_diagnostics.cpp)
 
 set(WIIU_GPU_HEADERS
     include/wiiu/gpu/backend.hpp
     include/wiiu/gpu/null_backend.hpp
+    include/wiiu/gpu/presenter.hpp
+    include/wiiu/gpu/shader_diagnostics.hpp
     include/wiiu/gpu/types.hpp)
 
 if(WIIU_PLATFORM_APPLE)

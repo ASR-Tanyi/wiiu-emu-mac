@@ -150,6 +150,7 @@ wiiu_add_test(hle
         hle/test_recording.cpp
         hle/test_proc_ui.cpp
         hle/test_scheduler.cpp
+        hle/test_screen.cpp
     DEPS
         wiiu::hle)
 

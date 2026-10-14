@@ -22,6 +22,7 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -204,6 +205,49 @@ struct IosFixture {
                       fsa::layout::response_size});
     }
 
+    /// What an FSA command replies with, as the signed word `icall` returns.
+    [[nodiscard]] static s32 reply(fsa::Status status) {
+        return static_cast<s32>(fsa::as_reply(status));
+    }
+
+    /// One IOSVec: wut's `{vaddr, len, paddr}`. The physical address is left
+    /// zero, as a title leaves it -- coreinit fills it in on hardware.
+    void put_vector(u32 index, ppcaddr_t address, u32 size) {
+        const ppcaddr_t base = kVectors + (index * ios_vector_size);
+        REQUIRE(memory.try_write<u32>(base, address));
+        REQUIRE(memory.try_write<u32>(base + 4, size));
+        REQUIRE(memory.try_write<u32>(base + 8, 0));
+    }
+
+    /// FSA ReadFile as coreinit sends it: an ioctlv with the request in, and
+    /// the data and response out.
+    [[nodiscard]] s32 fsa_read(s32 device,
+                               u32 file,
+                               u32 size,
+                               u32 count,
+                               u32 room,
+                               std::optional<u32> position = std::nullopt) {
+        clear_request();
+        REQUIRE(memory.fill(kBuffer, room, 0));
+        // coreinit's own pointer to the data; IOSU ignores it in favour of
+        // the vector, and so does the device.
+        REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_rw_buffer, 0xDEADBEEF));
+        REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_rw_size, size));
+        REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_rw_count, count));
+        REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_rw_handle, file));
+        if (position.has_value()) {
+            REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_rw_position, *position));
+            REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_rw_flags,
+                                          fsa::layout::rw_flag_with_position));
+        }
+        put_vector(fsa::layout::rw_vector_request, kRequest, fsa::layout::request_size);
+        put_vector(fsa::layout::rw_vector_data, kBuffer, room);
+        put_vector(fsa::layout::rw_vector_response, kResponse, fsa::layout::response_size);
+        return icall(
+            "IOS_Ioctlv",
+            {static_cast<u32>(device), static_cast<u32>(fsa::Command::ReadFile), 1, 2, kVectors});
+    }
+
     /// FSA OpenFile, returning the file handle it produced.
     [[nodiscard]] u32 fsa_open(s32 device, std::string_view path, std::string_view mode = "r") {
         clear_request();
@@ -349,15 +393,9 @@ TEST_CASE_METHOD(IosFixture, "a file opens, reads and closes through /dev/fsa", 
     REQUIRE(file != 0U);
     CHECK(os.filesystem.open_file_count() == 1);
 
-    clear_request();
-    REQUIRE(memory.fill(kBuffer, 32, 0));
-    REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_buffer, kBuffer));
-    REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_item_size, 1));
-    REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_item_count, 32));
-    REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_read_handle, file));
-
-    REQUIRE(fsa_ioctl(device, fsa::Command::ReadFile) == static_cast<s32>(IosError::Ok));
-    CHECK(memory.read<u32>(kResponse + fsa::layout::response_value) == kContent.size());
+    // The reply to a read is the number of bytes moved, not a status.
+    CHECK(fsa_read(device, file, 1, 32, 32) == static_cast<s32>(kContent.size()));
+    CHECK(fsa_device().layout_mismatches() == 0U);
 
     std::vector<u8> read(kContent.size());
     REQUIRE(memory.read_bytes(kBuffer, read));
@@ -369,11 +407,10 @@ TEST_CASE_METHOD(IosFixture, "a file opens, reads and closes through /dev/fsa", 
     REQUIRE(fsa_ioctl(device, fsa::Command::GetPosFile) == static_cast<s32>(IosError::Ok));
     CHECK(memory.read<u32>(kResponse + fsa::layout::response_value) == kContent.size());
 
-    // ... and it is at the end.
+    // ... and it is at the end, which IsEof answers with its status.
     clear_request();
     REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_handle, file));
-    REQUIRE(fsa_ioctl(device, fsa::Command::IsEof) == static_cast<s32>(IosError::Ok));
-    CHECK(memory.read<u32>(kResponse + fsa::layout::response_value) == 1U);
+    CHECK(fsa_ioctl(device, fsa::Command::IsEof) == reply(fsa::Status::EndOfFile));
 
     clear_request();
     REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_handle, file));
@@ -397,8 +434,7 @@ TEST_CASE_METHOD(IosFixture, "seeking through /dev/fsa moves the file", "[hle][i
 
     clear_request();
     REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_handle, file));
-    REQUIRE(fsa_ioctl(device, fsa::Command::IsEof) == static_cast<s32>(IosError::Ok));
-    CHECK(memory.read<u32>(kResponse + fsa::layout::response_value) == 0U);
+    CHECK(fsa_ioctl(device, fsa::Command::IsEof) == reply(fsa::Status::Ok));
 }
 
 TEST_CASE_METHOD(IosFixture, "a missing file fails as a missing file", "[hle][ios][fs]") {
@@ -409,9 +445,10 @@ TEST_CASE_METHOD(IosFixture, "a missing file fails as a missing file", "[hle][io
         put_string("/vol/content/not_here.bin", kRequest + fsa::layout::request_path));
     static_cast<void>(put_string("r", kRequest + fsa::layout::request_open_mode));
 
-    // NOEXISTS, and no layout complaint: the request was understood, the file
-    // was not there. Telling those two apart is the whole point of the check.
-    CHECK(fsa_ioctl(device, fsa::Command::OpenFile) == static_cast<s32>(IosError::NoExists));
+    // NotFound, and no layout complaint: the request was understood, the
+    // file was not there. Telling those two apart is the whole point of the
+    // check.
+    CHECK(fsa_ioctl(device, fsa::Command::OpenFile) == reply(fsa::Status::NotFound));
     CHECK(fsa_device().layout_mismatches() == 0U);
 }
 
@@ -433,7 +470,23 @@ TEST_CASE_METHOD(IosFixture, "a directory walks through /dev/fsa", "[hle][ios][f
         std::vector<u8> name(16);
         REQUIRE(memory.read_bytes(kResponse + fsa::layout::response_entry_name, name));
         names.emplace_back(reinterpret_cast<const char*>(name.data()));
+
+        // The entry is a whole FSStat followed by the name, so the flags say
+        // which of the two this is and a file carries its size.
+        const u32 flags = memory.read<u32>(kResponse + fsa::layout::response_entry_flags);
+        if (names.back() == "sub") {
+            CHECK(flags == fsa::layout::stat_flag_directory);
+        } else {
+            CHECK(flags == fsa::layout::stat_flag_file);
+            CHECK(memory.read<u32>(kResponse + fsa::layout::response_entry_size) ==
+                  kContent.size());
+        }
     }
+
+    // And then there are no more, which is a status rather than an entry.
+    clear_request();
+    REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_handle, directory));
+    CHECK(fsa_ioctl(device, fsa::Command::ReadDir) == reply(fsa::Status::EndOfDir));
 
     // Both entries turned up, and the subdirectory is marked as one. The
     // order is the filesystem's, so it is not asserted.
@@ -474,7 +527,7 @@ TEST_CASE_METHOD(IosFixture,
     // even a terminator. The arithmetic for "how much room is left" is
     // unsigned, so getting this wrong writes a whole filename past the end
     // rather than nothing.
-    CHECK(read_dir_into(fsa::layout::response_entry_name) == static_cast<s32>(IosError::Invalid));
+    CHECK(read_dir_into(fsa::layout::response_entry_name) == reply(fsa::Status::InvalidBuffer));
 
     // One byte further, and the name is truncated to fit -- terminator
     // included -- rather than refused.
@@ -508,10 +561,99 @@ TEST_CASE_METHOD(IosFixture,
     const s32 device = open_fsa();
     clear_request(); // all zeroes: no path anywhere in it
 
-    CHECK(fsa_ioctl(device, fsa::Command::OpenFile) == static_cast<s32>(IosError::Invalid));
+    CHECK(fsa_ioctl(device, fsa::Command::OpenFile) == reply(fsa::Status::InvalidPath));
     CHECK(fsa_device().layout_mismatches() == 1U);
 
     // Nothing was opened on the strength of a buffer that made no sense.
+    CHECK(os.filesystem.open_file_count() == 0);
+}
+
+TEST_CASE_METHOD(IosFixture, "a positioned read starts where it says", "[hle][ios][fs]") {
+    const s32 device = open_fsa();
+    const u32 file = fsa_open(device, kContentPath);
+
+    // Two-byte items from offset 3: the read seeks first, and only whole
+    // items count.
+    const s32 moved = fsa_read(device, file, 2, 4, 16, 3U);
+    CHECK(moved == 8);
+
+    std::vector<u8> read(8);
+    REQUIRE(memory.read_bytes(kBuffer, read));
+    CHECK(std::string(read.begin(), read.end()) == kContent.substr(3, 8));
+}
+
+TEST_CASE_METHOD(IosFixture, "a read never writes past its data vector", "[hle][ios][fs]") {
+    const s32 device = open_fsa();
+    const u32 file = fsa_open(device, kContentPath);
+
+    // The request asks for 32 bytes, the vector has room for 4. IOSU writes
+    // through the vector, so the vector is the limit.
+    REQUIRE(memory.fill(kBuffer, 32, 0xAA));
+    CHECK(fsa_read(device, file, 1, 32, 4) == 4);
+    CHECK(memory.read<u8>(kBuffer + 3) == static_cast<u8>(kContent[3]));
+    CHECK(memory.read<u8>(kBuffer + 4) == 0xAAU);
+}
+
+TEST_CASE_METHOD(IosFixture, "ReadFile sent as a plain ioctl is reported", "[hle][ios][fs]") {
+    const s32 device = open_fsa();
+    clear_request();
+
+    // IOSU only takes bulk data through a vector. A plain ioctl carrying a
+    // read means whoever built it read the format differently, which is
+    // worth a line in the log rather than a guess at where the data goes.
+    CHECK(fsa_ioctl(device, fsa::Command::ReadFile) == reply(fsa::Status::InvalidParam));
+    CHECK(fsa_device().layout_mismatches() == 1U);
+}
+
+TEST_CASE_METHOD(IosFixture, "StatFile and a stat query describe a file", "[hle][ios][fs]") {
+    const s32 device = open_fsa();
+    const u32 file = fsa_open(device, kContentPath);
+
+    clear_request();
+    REQUIRE(memory.fill(kResponse, fsa::layout::response_size, 0xAA));
+    REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_handle, file));
+    REQUIRE(fsa_ioctl(device, fsa::Command::StatFile) == reply(fsa::Status::Ok));
+
+    const ppcaddr_t stat = kResponse + fsa::layout::response_stat;
+    CHECK(memory.read<u32>(stat + fsa::layout::stat_flags) == fsa::layout::stat_flag_file);
+    CHECK(memory.read<u32>(stat + fsa::layout::stat_size) == kContent.size());
+    // The rest of the FSStat is written, not left as whatever was there.
+    CHECK(memory.read<u32>(stat + fsa::layout::stat_entry_id) == 0U);
+
+    // The path-based form is GetInfoByQuery asking the Stat question, which
+    // is what coreinit's FSGetStat sends.
+    clear_request();
+    static_cast<void>(put_string("/vol/content/sub", kRequest + fsa::layout::request_path));
+    REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_query_type,
+                                  fsa::layout::query_type_stat));
+    REQUIRE(fsa_ioctl(device, fsa::Command::GetInfoByQuery) == reply(fsa::Status::Ok));
+    CHECK(memory.read<u32>(stat + fsa::layout::stat_flags) == fsa::layout::stat_flag_directory);
+
+    // Any other question is refused by name rather than answered with zero.
+    REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_query_type, 0));
+    CHECK(fsa_ioctl(device, fsa::Command::GetInfoByQuery) ==
+          reply(fsa::Status::UnsupportedCommand));
+}
+
+TEST_CASE_METHOD(IosFixture, "a stale file handle is named as one", "[hle][ios][fs]") {
+    const s32 device = open_fsa();
+    clear_request();
+    REQUIRE(memory.try_write<u32>(kRequest + fsa::layout::request_handle, 0x12345678));
+    CHECK(fsa_ioctl(device, fsa::Command::CloseFile) == reply(fsa::Status::InvalidFileHandle));
+    CHECK(fsa_ioctl(device, fsa::Command::CloseDir) == reply(fsa::Status::InvalidDirHandle));
+}
+
+TEST_CASE_METHOD(IosFixture,
+                 "an emulated error is answered without being carried out",
+                 "[hle][ios][fs]") {
+    const s32 device = open_fsa();
+    clear_request();
+    static_cast<void>(put_string(kContentPath, kRequest + fsa::layout::request_path));
+    static_cast<void>(put_string("r", kRequest + fsa::layout::request_open_mode));
+    REQUIRE(memory.try_write<s32>(kRequest + fsa::layout::request_emulated_error,
+                                  static_cast<s32>(fsa::Status::MediaNotReady)));
+
+    CHECK(fsa_ioctl(device, fsa::Command::OpenFile) == reply(fsa::Status::MediaNotReady));
     CHECK(os.filesystem.open_file_count() == 0);
 }
 

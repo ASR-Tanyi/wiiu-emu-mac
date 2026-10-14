@@ -259,9 +259,46 @@ struct FrameStats {
     /// titles. A counter rather than a log line, because the question is what
     /// fraction of a frame it was.
     u64 cpu_stall_us = 0;
+
+    /// How long `begin_frame` waited for a frame slot, in microseconds.
+    ///
+    /// Kept apart from `cpu_stall_us` on purpose. This one is pacing: with
+    /// `frames_in_flight` frames queued the CPU *should* wait here, and with
+    /// vsync on it is most of an idle frame. A stall is the CPU waiting on the
+    /// GPU where the guest did not ask it to, which is never fine.
+    u64 pacing_wait_us = 0;
+};
+
+/// Where the backend's memory is, for the debug UI (10.1) and for the tests
+/// that check resources really are coming out of heaps (7.4).
+struct MemoryStats {
+    /// Heaps resources are suballocated from (**P22**), the bytes they
+    /// reserve, and how many of those are in use.
+    u64 heaps = 0;
+    u64 heap_bytes = 0;
+    u64 heap_used_bytes = 0;
+
+    /// Resources that had to be allocated on their own: memoryless targets,
+    /// which no heap can hold, and anything a heap refused.
+    u64 dedicated = 0;
+
+    /// Host ranges wrapped in place rather than copied (`import_host_memory`).
+    u64 imported = 0;
+    u64 imported_bytes = 0;
 };
 
 inline constexpr u32 max_color_attachments = 8;
+
+/// Binding indices per stage, until ADR-003's argument buffers lift them.
+///
+/// These are Metal's direct-binding limits, and they are the limits *now*
+/// because binding is direct now: an index reaches the shader as
+/// `[[buffer(n)]]`, `[[texture(n)]]` or `[[sampler(n)]]` in the stage it was
+/// bound for. ADR-003 moves the guest's resources into argument buffers with
+/// the MSL emitter (8.6, 8.12); the indices stay, the ceilings go.
+inline constexpr u32 max_bound_buffers = 31;
+inline constexpr u32 max_bound_textures = 128;
+inline constexpr u32 max_bound_samplers = 16;
 
 /// How many frames may be in flight before the CPU waits for the GPU.
 /// Triple buffering: one being displayed, one queued, one being built.

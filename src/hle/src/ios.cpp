@@ -286,6 +286,8 @@ std::string_view command_name(u32 command) noexcept {
             return "Mount";
         case Command::Unmount:
             return "Unmount";
+        case Command::GetVolumeInfo:
+            return "GetVolumeInfo";
         case Command::ChangeDir:
             return "ChangeDir";
         case Command::GetCwd:
@@ -316,50 +318,162 @@ std::string_view command_name(u32 command) noexcept {
             return "SetPosFile";
         case Command::IsEof:
             return "IsEof";
-        case Command::GetStatFile:
-            return "GetStatFile";
+        case Command::StatFile:
+            return "StatFile";
         case Command::CloseFile:
             return "CloseFile";
+        case Command::GetError:
+            return "GetError";
         case Command::FlushFile:
             return "FlushFile";
+        case Command::GetInfoByQuery:
+            return "GetInfoByQuery";
+        case Command::AppendFile:
+            return "AppendFile";
+        case Command::TruncateFile:
+            return "TruncateFile";
+    }
+    return "?";
+}
+
+std::string_view status_name(Status status) noexcept {
+    switch (status) {
+        case Status::Ok:
+            return "Ok";
+        case Status::NotInit:
+            return "NotInit";
+        case Status::Busy:
+            return "Busy";
+        case Status::Cancelled:
+            return "Cancelled";
+        case Status::EndOfDir:
+            return "EndOfDir";
+        case Status::EndOfFile:
+            return "EndOfFile";
+        case Status::MaxMountpoints:
+            return "MaxMountpoints";
+        case Status::MaxVolumes:
+            return "MaxVolumes";
+        case Status::MaxClients:
+            return "MaxClients";
+        case Status::MaxFiles:
+            return "MaxFiles";
+        case Status::MaxDirs:
+            return "MaxDirs";
+        case Status::AlreadyOpen:
+            return "AlreadyOpen";
+        case Status::AlreadyExists:
+            return "AlreadyExists";
+        case Status::NotFound:
+            return "NotFound";
+        case Status::NotEmpty:
+            return "NotEmpty";
+        case Status::AccessError:
+            return "AccessError";
+        case Status::PermissionError:
+            return "PermissionError";
+        case Status::DataCorrupted:
+            return "DataCorrupted";
+        case Status::StorageFull:
+            return "StorageFull";
+        case Status::JournalFull:
+            return "JournalFull";
+        case Status::UnavailableCommand:
+            return "UnavailableCommand";
+        case Status::UnsupportedCommand:
+            return "UnsupportedCommand";
+        case Status::InvalidParam:
+            return "InvalidParam";
+        case Status::InvalidPath:
+            return "InvalidPath";
+        case Status::InvalidBuffer:
+            return "InvalidBuffer";
+        case Status::InvalidAlignment:
+            return "InvalidAlignment";
+        case Status::InvalidClientHandle:
+            return "InvalidClientHandle";
+        case Status::InvalidFileHandle:
+            return "InvalidFileHandle";
+        case Status::InvalidDirHandle:
+            return "InvalidDirHandle";
+        case Status::NotFile:
+            return "NotFile";
+        case Status::NotDir:
+            return "NotDir";
+        case Status::FileTooBig:
+            return "FileTooBig";
+        case Status::OutOfRange:
+            return "OutOfRange";
+        case Status::OutOfResources:
+            return "OutOfResources";
+        case Status::MediaNotReady:
+            return "MediaNotReady";
+        case Status::MediaError:
+            return "MediaError";
+        case Status::WriteProtected:
+            return "WriteProtected";
+        case Status::InvalidMedia:
+            return "InvalidMedia";
     }
     return "?";
 }
 
 } // namespace fsa
 
-IosError ios_error_for(FsStatus status) noexcept {
+fsa::Status fsa_status_for(FsStatus status, fsa::Status end) noexcept {
+    using fsa::Status;
     switch (status) {
         case FsStatus::Ok:
-            return IosError::Ok;
-        case FsStatus::NotFound:
-            return IosError::NoExists;
-        case FsStatus::Exists:
-            return IosError::Exists;
-        case FsStatus::AlreadyOpen:
-            return IosError::Exists;
-        case FsStatus::Max:
-            return IosError::Max;
-        case FsStatus::PermissionError:
-        case FsStatus::AccessError:
-            return IosError::Access;
-        case FsStatus::MediaNotReady:
-            return IosError::NotReady;
+            return Status::Ok;
         case FsStatus::Cancelled:
-            return IosError::Interrupted;
+            return Status::Cancelled;
         case FsStatus::End:
+            return end;
+        case FsStatus::Max:
+            return Status::MaxFiles;
+        case FsStatus::AlreadyOpen:
+            return Status::AlreadyOpen;
+        case FsStatus::Exists:
+            return Status::AlreadyExists;
+        case FsStatus::NotFound:
+            return Status::NotFound;
         case FsStatus::NotFile:
+            return Status::NotFile;
         case FsStatus::NotDirectory:
+            return Status::NotDir;
+        case FsStatus::AccessError:
+            return Status::AccessError;
+        case FsStatus::PermissionError:
+            return Status::PermissionError;
         case FsStatus::FileTooBig:
+            return Status::FileTooBig;
         case FsStatus::StorageFull:
+            return Status::StorageFull;
         case FsStatus::UnsupportedCommand:
+            return Status::UnsupportedCommand;
+        case FsStatus::MediaNotReady:
+            return Status::MediaNotReady;
         case FsStatus::MediaError:
-        case FsStatus::Corrupted:
         case FsStatus::FatalError:
-            break;
+            return Status::MediaError;
+        case FsStatus::Corrupted:
+            return Status::DataCorrupted;
     }
-    return IosError::Invalid;
+    return Status::MediaError;
 }
+
+namespace {
+
+/// A handle-based command's failure. The FS layer says `NotFound` for a
+/// handle it has never heard of; IOSU says which kind of handle was wrong.
+[[nodiscard]] fsa::Status handle_status(FsStatus status, bool directory) noexcept {
+    if (status == FsStatus::NotFound) {
+        return directory ? fsa::Status::InvalidDirHandle : fsa::Status::InvalidFileHandle;
+    }
+    return fsa_status_for(status, directory ? fsa::Status::EndOfDir : fsa::Status::EndOfFile);
+}
+
+} // namespace
 
 IosError FsaDevice::open(s32 handle, IosOpenMode mode) {
     static_cast<void>(mode);
@@ -375,25 +489,28 @@ void FsaDevice::close(s32 handle) {
     WIIU_LOG_DEBUG(Ios, "/dev/fsa handle {} closed", handle);
 }
 
-void FsaDevice::report_mismatch(const memory::Memory& memory,
-                                const IosIoctl& request,
-                                std::string_view why) {
+void FsaDevice::report_mismatch(
+    const memory::Memory& memory, u32 command, ppcaddr_t buffer, u32 size, std::string_view why) {
     ++layout_mismatches_;
     WIIU_LOG_ERROR(Ios,
-                   "/dev/fsa {} ({:#x}): {}. The offsets in fsa::layout are this project's "
-                   "reading of the format and have not been checked against a real title -- "
-                   "this is the evidence to fix them with. request {:#010x} ({} bytes): {}",
-                   fsa::command_name(request.command),
-                   request.command,
+                   "/dev/fsa {} ({:#x}): {}. The offsets in fsa::layout come from wut's "
+                   "checked structures; if a real title disagrees, this is the evidence. "
+                   "request {:#010x} ({} bytes): {}",
+                   fsa::command_name(command),
+                   command,
                    why,
-                   request.input,
-                   request.input_size,
-                   dump_words(memory, request.input, request.input_size));
+                   buffer,
+                   size,
+                   dump_words(memory, buffer, size));
 }
 
 std::string FsaDevice::read_path(const memory::Memory& memory, const IosIoctl& request) {
     if (request.input == 0 || request.input_size <= fsa::layout::request_path) {
-        report_mismatch(memory, request, "no request buffer to take a path from");
+        report_mismatch(memory,
+                        request.command,
+                        request.input,
+                        request.input_size,
+                        "no request buffer to take a path from");
         return {};
     }
 
@@ -403,16 +520,50 @@ std::string FsaDevice::read_path(const memory::Memory& memory, const IosIoctl& r
                                                std::min(available, fsa::layout::request_path_max));
 
     if (!looks_like_path(path)) {
-        report_mismatch(memory, request, "the request does not hold a path where one is expected");
+        report_mismatch(memory,
+                        request.command,
+                        request.input,
+                        request.input_size,
+                        "the request does not hold a path where one is expected");
         return {};
     }
     return path;
 }
 
-IosError FsaDevice::open_file(memory::Memory& memory, const IosIoctl& request) {
+bool FsaDevice::read_handle(const memory::Memory& memory, const IosIoctl& request, u32& handle) {
+    if (request.input == 0 || request.input_size < fsa::layout::request_handle + sizeof(u32) ||
+        !memory.try_read<u32>(request.input + fsa::layout::request_handle, handle)) {
+        report_mismatch(
+            memory, request.command, request.input, request.input_size, "no handle in the request");
+        return false;
+    }
+    return true;
+}
+
+bool FsaDevice::write_stat(memory::Memory& memory, ppcaddr_t address, bool directory, u64 size) {
+    using namespace fsa::layout;
+
+    // Zero first: owner, group, quota, entry id and both timestamps are
+    // reported as zero, as decaf reports them, rather than as whatever the
+    // title's buffer held before.
+    if (!memory.fill(address, stat_bytes, 0)) {
+        return false;
+    }
+    bool ok = memory.try_write<u32>(address + stat_flags,
+                                    directory ? stat_flag_directory : stat_flag_file);
+    ok = memory.try_write<u32>(address + stat_mode, stat_default_mode) && ok;
+    if (!directory) {
+        // FSStat's sizes are 32 bits. Nothing on a Wii U disc is larger.
+        ok = memory.try_write<u32>(address + stat_size, static_cast<u32>(size)) && ok;
+        ok = memory.try_write<u32>(address + stat_alloc_size, static_cast<u32>(size)) && ok;
+    }
+    return ok;
+}
+
+fsa::Status FsaDevice::open_file(memory::Memory& memory, const IosIoctl& request) {
     const std::string path = read_path(memory, request);
     if (path.empty()) {
-        return IosError::Invalid;
+        return Status::InvalidPath;
     }
 
     std::string mode = "r";
@@ -432,191 +583,265 @@ IosError FsaDevice::open_file(memory::Memory& memory, const IosIoctl& request) {
     if (status != FsStatus::Ok) {
         WIIU_LOG_DEBUG(
             Ios, "/dev/fsa OpenFile('{}', '{}'): {}", path, mode, fs_status_name(status));
-        return ios_error_for(status);
+        return fsa_status_for(status);
     }
 
     if (request.output == 0 ||
         !memory.try_write<u32>(request.output + fsa::layout::response_value, handle)) {
         static_cast<void>(filesystem_->close(handle));
-        return IosError::Invalid;
+        return Status::InvalidBuffer;
     }
-    return IosError::Ok;
+    return Status::Ok;
 }
 
-IosError FsaDevice::read_file(memory::Memory& memory, const IosIoctl& request) {
-    u32 buffer = 0;
-    u32 item_size = 0;
-    u32 count = 0;
-    u32 handle = 0;
-    if (request.input == 0 || request.input_size < fsa::layout::request_read_handle + sizeof(u32) ||
-        !memory.try_read<u32>(request.input + fsa::layout::request_buffer, buffer) ||
-        !memory.try_read<u32>(request.input + fsa::layout::request_item_size, item_size) ||
-        !memory.try_read<u32>(request.input + fsa::layout::request_item_count, count) ||
-        !memory.try_read<u32>(request.input + fsa::layout::request_read_handle, handle)) {
-        report_mismatch(memory, request, "the read request could not be decoded");
-        return IosError::Invalid;
+IosError FsaDevice::read_file(memory::Memory& memory, const IosIoctlv& request) {
+    using namespace fsa::layout;
+
+    // One vector in (the request), two out (the data, then the response).
+    if (request.read_count != 1 || request.write_count != 2 || request.vectors.size() < 3) {
+        report_mismatch(memory,
+                        request.command,
+                        request.vectors.empty() ? 0 : request.vectors[0].address,
+                        request.vectors.empty() ? 0 : request.vectors[0].size,
+                        fmt::format("ReadFile wants 1 vector in and 2 out, not {} and {}",
+                                    request.read_count,
+                                    request.write_count));
+        return fsa::as_reply(Status::InvalidParam);
     }
 
-    const u64 wanted = static_cast<u64>(item_size) * count;
-    std::vector<u8> data;
-    const FsStatus status = filesystem_->read(handle, static_cast<u32>(wanted), data);
+    const IosVector& header = request.vectors[rw_vector_request];
+    const IosVector& data = request.vectors[rw_vector_data];
+
+    u32 size = 0;
+    u32 count = 0;
+    u32 position = 0;
+    u32 handle = 0;
+    u32 flags = 0;
+    if (header.size < request_rw_flags + sizeof(u32) ||
+        !memory.try_read<u32>(header.address + request_rw_size, size) ||
+        !memory.try_read<u32>(header.address + request_rw_count, count) ||
+        !memory.try_read<u32>(header.address + request_rw_position, position) ||
+        !memory.try_read<u32>(header.address + request_rw_handle, handle) ||
+        !memory.try_read<u32>(header.address + request_rw_flags, flags)) {
+        report_mismatch(memory,
+                        request.command,
+                        header.address,
+                        header.size,
+                        "the read request could not be decoded");
+        return fsa::as_reply(Status::InvalidParam);
+    }
+
+    if ((flags & rw_flag_with_position) != 0) {
+        if (const FsStatus sought = filesystem_->seek(handle, position); sought != FsStatus::Ok) {
+            return fsa::as_reply(handle_status(sought, false));
+        }
+    }
+
+    // The data vector is the real destination; the request's own buffer word
+    // is coreinit's virtual address for the same bytes, and IOSU never reads
+    // it. Reading no more than the vector holds keeps a short one from
+    // turning into a write past its end.
+    const u64 wanted = std::min<u64>(static_cast<u64>(size) * count, data.size);
+    std::vector<u8> bytes;
+    const FsStatus status = filesystem_->read(handle, static_cast<u32>(wanted), bytes);
     if (status == FsStatus::End) {
-        return IosError::Ok; // zero items, which is what the caller will read
+        return IosError::Ok; // zero bytes, which is what the caller will see
     }
     if (status != FsStatus::Ok) {
-        return ios_error_for(status);
-    }
-    if (!memory.write_bytes(buffer, data)) {
-        return IosError::Invalid;
+        return fsa::as_reply(handle_status(status, false));
     }
 
-    // Like the FS API, the count is in *items*.
-    const u32 read = item_size == 0 ? 0 : static_cast<u32>(data.size() / item_size);
-    if (request.output != 0) {
-        static_cast<void>(
-            memory.try_write<u32>(request.output + fsa::layout::response_value, read));
+    // Whole items only, as IOSU counts them: a trailing partial item is not
+    // reported as read. The position has still moved past it, as it does on
+    // hardware's FAT layer.
+    const auto moved = size == 0 ? 0U : static_cast<u32>((bytes.size() / size) * size);
+    if (!memory.write_bytes(data.address, std::span<const u8>{bytes}.first(moved))) {
+        return fsa::as_reply(Status::InvalidBuffer);
     }
-    return IosError::Ok;
+
+    // On success the reply word is the number of bytes moved, not a status.
+    return static_cast<IosError>(static_cast<s32>(moved));
 }
 
-IosError FsaDevice::close_file(memory::Memory& memory, const IosIoctl& request) {
+fsa::Status FsaDevice::close_file(memory::Memory& memory, const IosIoctl& request) {
     u32 handle = 0;
-    if (request.input == 0 ||
-        !memory.try_read<u32>(request.input + fsa::layout::request_handle, handle)) {
-        report_mismatch(memory, request, "no handle in the request");
-        return IosError::Invalid;
+    if (!read_handle(memory, request, handle)) {
+        return Status::InvalidParam;
     }
-    return ios_error_for(filesystem_->close(handle));
+    return handle_status(filesystem_->close(handle), false);
 }
 
-IosError FsaDevice::get_pos_file(memory::Memory& memory, const IosIoctl& request) {
+fsa::Status FsaDevice::get_pos_file(memory::Memory& memory, const IosIoctl& request) {
     u32 handle = 0;
-    if (request.input == 0 ||
-        !memory.try_read<u32>(request.input + fsa::layout::request_handle, handle)) {
-        report_mismatch(memory, request, "no handle in the request");
-        return IosError::Invalid;
+    if (!read_handle(memory, request, handle)) {
+        return Status::InvalidParam;
     }
 
     u64 position = 0;
-    const FsStatus status = filesystem_->tell(handle, position);
-    if (status != FsStatus::Ok) {
-        return ios_error_for(status);
+    if (const FsStatus status = filesystem_->tell(handle, position); status != FsStatus::Ok) {
+        return handle_status(status, false);
     }
     if (request.output == 0 || !memory.try_write<u32>(request.output + fsa::layout::response_value,
                                                       static_cast<u32>(position))) {
-        return IosError::Invalid;
+        return Status::InvalidBuffer;
     }
-    return IosError::Ok;
+    return Status::Ok;
 }
 
-IosError FsaDevice::set_pos_file(memory::Memory& memory, const IosIoctl& request) {
+fsa::Status FsaDevice::set_pos_file(memory::Memory& memory, const IosIoctl& request) {
     u32 handle = 0;
     u32 position = 0;
     if (request.input == 0 || request.input_size < fsa::layout::request_position + sizeof(u32) ||
         !memory.try_read<u32>(request.input + fsa::layout::request_handle, handle) ||
         !memory.try_read<u32>(request.input + fsa::layout::request_position, position)) {
-        report_mismatch(memory, request, "the seek request could not be decoded");
-        return IosError::Invalid;
+        report_mismatch(memory,
+                        request.command,
+                        request.input,
+                        request.input_size,
+                        "the seek request could not be decoded");
+        return Status::InvalidParam;
     }
-    return ios_error_for(filesystem_->seek(handle, position));
+    return handle_status(filesystem_->seek(handle, position), false);
 }
 
-IosError FsaDevice::is_eof(memory::Memory& memory, const IosIoctl& request) {
+fsa::Status FsaDevice::is_eof(memory::Memory& memory, const IosIoctl& request) {
     u32 handle = 0;
-    if (request.input == 0 ||
-        !memory.try_read<u32>(request.input + fsa::layout::request_handle, handle)) {
-        report_mismatch(memory, request, "no handle in the request");
-        return IosError::Invalid;
+    if (!read_handle(memory, request, handle)) {
+        return Status::InvalidParam;
     }
 
     u64 position = 0;
     u64 size = 0;
-    const FsStatus told = filesystem_->tell(handle, position);
-    if (told != FsStatus::Ok) {
-        return ios_error_for(told);
+    if (const FsStatus told = filesystem_->tell(handle, position); told != FsStatus::Ok) {
+        return handle_status(told, false);
     }
-    const FsStatus sized = filesystem_->size_of(handle, size);
-    if (sized != FsStatus::Ok) {
-        return ios_error_for(sized);
+    if (const FsStatus sized = filesystem_->size_of(handle, size); sized != FsStatus::Ok) {
+        return handle_status(sized, false);
     }
 
-    // Hardware answers this one with a status of its own rather than a flag.
-    // `IosError` has no value for end-of-file, and inventing one would be a
-    // guess on top of a guess, so the answer goes in the response word and
-    // the call itself succeeds — it did, after all, find out.
-    if (request.output == 0 || !memory.try_write<u32>(request.output + fsa::layout::response_value,
-                                                      position >= size ? 1U : 0U)) {
-        return IosError::Invalid;
-    }
-    return IosError::Ok;
+    // The answer is the status itself: end-of-file when there is nothing left,
+    // success when there is. Nothing is written to the response.
+    return position >= size ? Status::EndOfFile : Status::Ok;
 }
 
-IosError FsaDevice::open_dir(memory::Memory& memory, const IosIoctl& request) {
+fsa::Status FsaDevice::stat_file(memory::Memory& memory, const IosIoctl& request) {
+    u32 handle = 0;
+    if (!read_handle(memory, request, handle)) {
+        return Status::InvalidParam;
+    }
+
+    u64 size = 0;
+    if (const FsStatus status = filesystem_->size_of(handle, size); status != FsStatus::Ok) {
+        return handle_status(status, false);
+    }
+    if (request.output == 0 ||
+        !write_stat(memory, request.output + fsa::layout::response_stat, false, size)) {
+        return Status::InvalidBuffer;
+    }
+    return Status::Ok;
+}
+
+fsa::Status FsaDevice::get_info_by_query(memory::Memory& memory, const IosIoctl& request) {
     const std::string path = read_path(memory, request);
     if (path.empty()) {
-        return IosError::Invalid;
+        return Status::InvalidPath;
+    }
+
+    u32 type = 0;
+    if (request.input_size < fsa::layout::request_query_type + sizeof(u32) ||
+        !memory.try_read<u32>(request.input + fsa::layout::request_query_type, type)) {
+        report_mismatch(memory,
+                        request.command,
+                        request.input,
+                        request.input_size,
+                        "no query type after the path");
+        return Status::InvalidParam;
+    }
+
+    // Stat is the question coreinit's `FSGetStat` asks, and the only one a
+    // read-only virtual filesystem can answer honestly. Free space, journal
+    // size and the rest are refused by name rather than answered with zero.
+    if (type != fsa::layout::query_type_stat) {
+        WIIU_LOG_WARN(
+            Ios, "/dev/fsa GetInfoByQuery('{}'): query type {} is not supported", path, type);
+        return Status::UnsupportedCommand;
+    }
+
+    loader::FileInfo info;
+    if (const FsStatus status = filesystem_->stat(path, info); status != FsStatus::Ok) {
+        return fsa_status_for(status);
+    }
+    if (request.output == 0 ||
+        !write_stat(
+            memory, request.output + fsa::layout::response_stat, info.is_directory, info.size)) {
+        return Status::InvalidBuffer;
+    }
+    return Status::Ok;
+}
+
+fsa::Status FsaDevice::open_dir(memory::Memory& memory, const IosIoctl& request) {
+    const std::string path = read_path(memory, request);
+    if (path.empty()) {
+        return Status::InvalidPath;
     }
 
     u32 handle = 0;
     const FsStatus status = filesystem_->open_directory(path, handle);
     if (status != FsStatus::Ok) {
         WIIU_LOG_DEBUG(Ios, "/dev/fsa OpenDir('{}'): {}", path, fs_status_name(status));
-        return ios_error_for(status);
+        return fsa_status_for(status, Status::EndOfDir);
     }
     if (request.output == 0 ||
         !memory.try_write<u32>(request.output + fsa::layout::response_value, handle)) {
         static_cast<void>(filesystem_->close_directory(handle));
-        return IosError::Invalid;
+        return Status::InvalidBuffer;
     }
-    return IosError::Ok;
+    return Status::Ok;
 }
 
-IosError FsaDevice::read_dir(memory::Memory& memory, const IosIoctl& request) {
+fsa::Status FsaDevice::read_dir(memory::Memory& memory, const IosIoctl& request) {
+    using namespace fsa::layout;
+
     u32 handle = 0;
-    if (request.input == 0 ||
-        !memory.try_read<u32>(request.input + fsa::layout::request_handle, handle)) {
-        report_mismatch(memory, request, "no handle in the request");
-        return IosError::Invalid;
+    if (!read_handle(memory, request, handle)) {
+        return Status::InvalidParam;
     }
 
     loader::FileInfo entry;
-    const FsStatus status = filesystem_->read_directory(handle, entry);
-    if (status != FsStatus::Ok) {
-        return ios_error_for(status);
+    if (const FsStatus status = filesystem_->read_directory(handle, entry);
+        status != FsStatus::Ok) {
+        return handle_status(status, true);
     }
 
     // Strictly greater: a response that ends exactly where the name begins
     // has no room for even the terminator, and computing the room as
     // `size - offset - 1` would wrap rather than come out negative.
-    if (request.output == 0 || request.output_size <= fsa::layout::response_entry_name) {
-        report_mismatch(memory, request, "no room for a directory entry in the response");
-        return IosError::Invalid;
+    if (request.output == 0 || request.output_size <= response_entry_name) {
+        report_mismatch(memory,
+                        request.command,
+                        request.input,
+                        request.input_size,
+                        "no room for a directory entry in the response");
+        return Status::InvalidBuffer;
     }
 
-    const u32 flags = entry.is_directory ? fsa::layout::entry_flag_directory : 0U;
-    bool ok = memory.try_write<u32>(request.output + fsa::layout::response_entry_flags, flags);
-    ok = memory.try_write<u32>(request.output + fsa::layout::response_entry_size,
-                               static_cast<u32>(entry.size)) &&
-         ok;
+    bool ok = write_stat(memory, request.output + response_entry, entry.is_directory, entry.size);
 
-    const u32 room = std::min(request.output_size - fsa::layout::response_entry_name,
-                              fsa::layout::response_entry_name_max);
+    const u32 room = std::min(request.output_size - response_entry_name, response_entry_name_max);
     const auto length = std::min<u32>(static_cast<u32>(entry.name.size()), room - 1);
     const std::vector<u8> name(entry.name.begin(), entry.name.begin() + length);
-    ok = memory.write_bytes(request.output + fsa::layout::response_entry_name, name) && ok;
-    ok = memory.try_write<u8>(request.output + fsa::layout::response_entry_name + length, 0) && ok;
+    ok = memory.write_bytes(request.output + response_entry_name, name) && ok;
+    ok = memory.try_write<u8>(request.output + response_entry_name + length, 0) && ok;
 
-    return ok ? IosError::Ok : IosError::Invalid;
+    return ok ? Status::Ok : Status::InvalidBuffer;
 }
 
-IosError FsaDevice::close_dir(memory::Memory& memory, const IosIoctl& request) {
+fsa::Status FsaDevice::close_dir(memory::Memory& memory, const IosIoctl& request) {
     u32 handle = 0;
-    if (request.input == 0 ||
-        !memory.try_read<u32>(request.input + fsa::layout::request_handle, handle)) {
-        report_mismatch(memory, request, "no handle in the request");
-        return IosError::Invalid;
+    if (!read_handle(memory, request, handle)) {
+        return Status::InvalidParam;
     }
-    return ios_error_for(filesystem_->close_directory(handle));
+    return handle_status(filesystem_->close_directory(handle), true);
 }
 
 IosError FsaDevice::ioctl(memory::Memory& memory, const IosIoctl& request) {
@@ -632,31 +857,41 @@ IosError FsaDevice::ioctl(memory::Memory& memory, const IosIoctl& request) {
                    request.input_size,
                    request.output_size);
 
+    // coreinit's error injection: a negative first word is the answer.
+    if (s32 injected = 0;
+        request.input != 0 && request.input_size >= sizeof(u32) &&
+        memory.try_read<s32>(request.input + fsa::layout::request_emulated_error, injected) &&
+        injected < 0) {
+        return static_cast<IosError>(injected);
+    }
+
     switch (static_cast<fsa::Command>(request.command)) {
         case fsa::Command::OpenFile:
-            return open_file(memory, request);
-        case fsa::Command::ReadFile:
-            return read_file(memory, request);
+            return fsa::as_reply(open_file(memory, request));
         case fsa::Command::CloseFile:
-            return close_file(memory, request);
+            return fsa::as_reply(close_file(memory, request));
         case fsa::Command::GetPosFile:
-            return get_pos_file(memory, request);
+            return fsa::as_reply(get_pos_file(memory, request));
         case fsa::Command::SetPosFile:
-            return set_pos_file(memory, request);
+            return fsa::as_reply(set_pos_file(memory, request));
         case fsa::Command::IsEof:
-            return is_eof(memory, request);
+            return fsa::as_reply(is_eof(memory, request));
+        case fsa::Command::StatFile:
+            return fsa::as_reply(stat_file(memory, request));
+        case fsa::Command::GetInfoByQuery:
+            return fsa::as_reply(get_info_by_query(memory, request));
         case fsa::Command::OpenDir:
-            return open_dir(memory, request);
+            return fsa::as_reply(open_dir(memory, request));
         case fsa::Command::ReadDir:
-            return read_dir(memory, request);
+            return fsa::as_reply(read_dir(memory, request));
         case fsa::Command::CloseDir:
-            return close_dir(memory, request);
+            return fsa::as_reply(close_dir(memory, request));
 
         case fsa::Command::Mount:
         case fsa::Command::Unmount:
             // The Phase 5 VFS presents every mount from the start; there is
-            // nothing to attach. Succeeding is honest here — the title asked for
-            // a filesystem to be available, and it is.
+            // nothing to attach. Succeeding is honest here — the title asked
+            // for a filesystem to be available, and it is.
             WIIU_LOG_DEBUG(Ios,
                            "/dev/fsa {}: the virtual filesystem is always mounted",
                            fsa::command_name(request.command));
@@ -666,14 +901,28 @@ IosError FsaDevice::ioctl(memory::Memory& memory, const IosIoctl& request) {
             // Nothing is written yet (6.9), so there is nothing buffered to push.
             return IosError::Ok;
 
+        case fsa::Command::ReadFile:
+        case fsa::Command::WriteFile:
+            // These move bulk data and arrive as ioctlv on hardware. One sent
+            // as a plain ioctl is not something IOSU would carry out, and
+            // guessing where its data should go would be a specification.
+            report_mismatch(memory,
+                            request.command,
+                            request.input,
+                            request.input_size,
+                            "arrived as an ioctl; IOSU takes this command as an ioctlv");
+            return fsa::as_reply(Status::InvalidParam);
+
+        case fsa::Command::GetVolumeInfo:
         case fsa::Command::ChangeDir:
         case fsa::Command::GetCwd:
         case fsa::Command::MakeDir:
         case fsa::Command::Remove:
         case fsa::Command::Rename:
         case fsa::Command::RewindDir:
-        case fsa::Command::WriteFile:
-        case fsa::Command::GetStatFile:
+        case fsa::Command::GetError:
+        case fsa::Command::AppendFile:
+        case fsa::Command::TruncateFile:
             break;
     }
 
@@ -684,9 +933,17 @@ IosError FsaDevice::ioctl(memory::Memory& memory, const IosIoctl& request) {
 }
 
 IosError FsaDevice::ioctlv(memory::Memory& memory, const IosIoctlv& request) {
-    // FSA's vectored commands are the ones that move bulk data with the
-    // buffer supplied separately. None are implemented, and inventing a
-    // decode for them would be a specification rather than a device.
+    if (filesystem_ == nullptr) {
+        return IosError::NotReady;
+    }
+
+    if (static_cast<fsa::Command>(request.command) == fsa::Command::ReadFile) {
+        return read_file(memory, request);
+    }
+
+    // WriteFile is refused by the filesystem underneath anyway (6.9, save
+    // data in 9.8), and Mount's vectored form names a source device this
+    // emulator does not have. Both report themselves through the default.
     return IosDevice::ioctlv(memory, request);
 }
 

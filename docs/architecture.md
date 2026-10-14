@@ -184,7 +184,7 @@ one. It also hashes machine state at intervals, so a replay that stops
 matching is reported at the first point it could be known rather than wherever
 the consequences surface.
 
-### gpu *(interface built — Phase 7.1; the renderer is Phases 7–8)*
+### gpu *(Phase 7 built — interface, Metal backend, presenter; Phase 8 next)*
 
 One rule holds this subsystem together: **no Metal type crosses
 `gpu/backend.hpp`**. Everything above it — and Phase 8's PM4 translator is
@@ -208,6 +208,29 @@ never arrives as a bug report (**P20**). And the binding model is absent from
 the interface entirely: callers bind by stage and index, and whether that
 reaches the shader through a slot or a descriptor in an argument buffer is
 the backend's business ([ADR-003](decisions/ADR-003-argument-buffers.md)).
+
+Until the argument buffers arrive with the MSL emitter (8.6, 8.12), binding is
+direct: index `n` is `[[buffer(n)]]`, `[[texture(n)]]` or `[[sampler(n)]]` in
+that stage, inside the render pass it was made in. Vertices are never
+described to Metal — the shader fetches them from a bound buffer by
+`[[vertex_id]]`, because Latte's vertex fetch has no alignment rules and
+Metal's has. And shaders compile with fast math off, the GPU-side twin of
+`-ffp-contract=off`: Latte's IEEE and DX9 multiplies differ exactly where
+fast math takes liberties.
+
+Memory comes from hazard-tracked `MTLHeap`s rather than resource by resource,
+so that ADR-003's residency is a few `useHeap` calls an encoder rather than a
+list of every resource a draw might touch; guest RAM that the GPU reads can be
+wrapped in place (`import_host_memory`, **P22**) rather than copied. No more
+than `frames_in_flight` frames are ever between `begin_frame` and the GPU
+finishing them, which is what makes a ring of that many per-frame buffers
+safe to write from the CPU — the presenter's screen textures are one.
+
+The presenter (`gpu/presenter.hpp`) is the last step to the window: the
+newest image of each of the Wii U's two screens, copied when it is handed
+over (scan-out is a snapshot), fitted into the drawable with its aspect kept,
+TV above GamePad when both are shown. OSScreen (6.8) feeds it today; GX2's
+scan-out will feed it the same way.
 
 Beyond that, the shape is the hardware's. GX2 calls append PM4 packets to a
 ring buffer; a separate GPU thread consumes it asynchronously. R700 shader
@@ -236,6 +259,13 @@ is what `gpu/metal/raii.hpp` exists to make automatic. And points are not
 pixels: the drawable size is the view's bounds times the window's backing
 scale, rechecked every poll, because a window dragged between displays
 changes scale without changing size.
+
+`frontend/display.hpp` puts the window, the backend and the presenter
+together, and takes them apart in the reverse order. OSScreen's flips reach
+it from inside the guest's own call, so a title runs on the main thread and
+presents from there; closing the window halts the core from inside the next
+flip, which the run loop reports as a halt and the frontend recognises as the
+user's.
 
 ## Conventions
 

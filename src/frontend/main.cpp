@@ -1,7 +1,7 @@
 // wiiu-emu entry point.
 //
-// Phase 1.2: argument handling, logging bring-up, version banner. The window
-// arrives in Phase 1.4, and there is nothing to emulate until Phase 6.
+// Phase 1.2: argument handling, logging bring-up, version banner. Phase 1.4
+// added the window; Phase 7.6 puts a title's OSScreen output in it.
 
 #include <wiiu/common/config.hpp>
 #include <wiiu/common/log.hpp>
@@ -18,16 +18,20 @@
 #include <wiiu/loader/vfs.hpp>
 #include <wiiu/memory/memory.hpp>
 
+#include "display.hpp"
 #include "platform/jit_probe.hpp"
-#include "platform/window.hpp"
 
 #include <fmt/format.h>
 
+#include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -43,8 +47,13 @@ constexpr std::string_view kUsage = R"(usage: wiiu-emu [options]
 options:
   -h, --help              show this message
   -r, --run FILE          load and run an RPX
-      --window            open a window and present frames (Phase 1.4)
-      --frames N          with --window, stop after N frames
+      --window            open a window: alone, a test pattern; with --run,
+                          the title's screens (OSScreen today, GX2 later)
+      --frames N          with --window alone, stop after N frames
+      --gpu-validation    run under Metal's API and shader validation
+      --gpu-hud           show Metal's performance HUD over the window
+      --capture-frame N   write a GPU capture of frame N (open it in Xcode)
+      --capture-path FILE where --capture-frame writes (wiiu-emu.gputrace)
       --jit-check         prove the MAP_JIT + entitlement path and exit
       --trace             log every HLE call as it happens
       --stats             print HLE call counts when the run ends
@@ -74,6 +83,10 @@ struct Arguments {
     bool stats = false;
     bool window = false;
     bool jit_check = false;
+    bool gpu_validation = false;
+    bool gpu_hud = false;
+    wiiu::u64 capture_frame = 0;
+    std::string capture_path = "wiiu-emu.gputrace";
     wiiu::u64 frames = 0; ///< zero means until the window is closed
     std::string record_path;
     std::string replay_path;
@@ -176,6 +189,30 @@ bool parse_arguments(std::span<const std::string_view> argv, Arguments& args) {
             }
         } else if (arg == "--jit-check") {
             args.jit_check = true;
+        } else if (arg == "--gpu-validation") {
+            args.gpu_validation = true;
+        } else if (arg == "--gpu-hud") {
+            args.gpu_hud = true;
+        } else if (arg == "--capture-frame") {
+            std::string_view value;
+            if (!next(value)) {
+                return false;
+            }
+            const std::string text{value};
+            char* end = nullptr;
+            args.capture_frame = std::strtoull(text.c_str(), &end, 0);
+            if (end == text.c_str() || *end != '\0' || args.capture_frame == 0) {
+                fmt::print(stderr,
+                           "wiiu-emu: --capture-frame wants a frame number from 1, got '{}'\n",
+                           value);
+                return false;
+            }
+        } else if (arg == "--capture-path") {
+            std::string_view value;
+            if (!next(value)) {
+                return false;
+            }
+            args.capture_path = std::string{value};
         } else if (arg == "--list-settings") {
             args.list_settings = true;
         } else if (arg == "-c" || arg == "--config") {
@@ -213,64 +250,112 @@ bool parse_arguments(std::span<const std::string_view> argv, Arguments& args) {
     return true;
 }
 
-/// Phase 1.4's "done when": a window opens, clears to a colour, and closes.
+/// Metal reads its tooling switches from the environment when the first
+/// device is made, so they are set here, before anything has asked for one
+/// (7.8). Existing settings are kept: someone who exported a variable by hand
+/// meant it.
+void apply_gpu_tooling(const Arguments& args) {
+    if (args.gpu_validation) {
+        setenv("MTL_DEBUG_LAYER", "1", 0);
+        setenv("MTL_SHADER_VALIDATION", "1", 0);
+    }
+    if (args.gpu_hud) {
+        setenv("MTL_HUD_ENABLED", "1", 0);
+    }
+    if (args.capture_frame != 0) {
+        // Outside Xcode, a process may only capture if it said so up front.
+        setenv("MTL_CAPTURE_ENABLED", "1", 0);
+    }
+}
+
+[[nodiscard]] wiiu::frontend::DisplayOptions display_options(const Arguments& args,
+                                                             std::string title) {
+    wiiu::frontend::DisplayOptions options;
+    options.title = std::move(title);
+    options.capture_frame = args.capture_frame;
+    options.capture_path = args.capture_path;
+    return options;
+}
+
+/// A triangle that turns, over a clear that drifts.
 ///
-/// The colour moves rather than standing still, because a static clear proves
-/// only that one frame was presented. A drifting one proves the loop is
-/// turning, the drawable is being acquired and released, and the frame is
-/// reaching the display -- which is most of 7.2 and 7.7 demonstrating itself.
-int run_window(wiiu::u64 frames) {
-    std::unique_ptr<wiiu::gpu::GpuBackend> backend = wiiu::gpu::create_metal_backend();
-    if (backend == nullptr) {
-        return 1;
-    }
+/// The clear proves frames are reaching the display (1.4); the triangle
+/// proves a pipeline compiled, a buffer written by the CPU reached the GPU,
+/// and a draw happened (7.6). Its vertices are rewritten every frame into a
+/// ring of `frames_in_flight` buffers -- the pattern every per-frame upload
+/// follows, and the reason the backend bounds its frames in flight (7.2).
+constexpr std::string_view kDemoShader = R"msl(
+#include <metal_stdlib>
+using namespace metal;
 
+struct Out {
+    float4 position [[position]];
+    float3 colour;
+};
+
+vertex Out vertex_main(uint id [[vertex_id]], const device float2* positions [[buffer(0)]]) {
+    Out out;
+    out.position = float4(positions[id], 0.0, 1.0);
+    out.colour = float3(id == 0 ? 1.0 : 0.0, id == 1 ? 1.0 : 0.0, id == 2 ? 1.0 : 0.0);
+    return out;
+}
+
+fragment float4 fragment_main(Out in [[stage_in]]) {
+    return float4(in.colour, 1.0);
+}
+)msl";
+
+int run_window(const Arguments& args) {
+    wiiu::frontend::Display display;
     std::string error;
-    if (!backend->initialize(error)) {
-        // Capability shortfalls land here: ADR-002 refuses with a reason
-        // rather than rendering something wrong.
+    if (!display.open(display_options(args, "wiiu-emu"), error)) {
+        WIIU_LOG_ERROR(Gpu, "{}", error);
+        return 1;
+    }
+    wiiu::gpu::GpuBackend& backend = display.backend();
+
+    wiiu::gpu::PipelineDesc desc;
+    desc.label = "demo triangle";
+    desc.vertex_source = std::string{kDemoShader};
+    desc.color_formats[0] = wiiu::gpu::TextureFormat::BGRA8Unorm;
+    const wiiu::gpu::PipelineHandle pipeline = backend.create_pipeline(desc, error);
+    if (!pipeline.valid()) {
         WIIU_LOG_ERROR(Gpu, "{}", error);
         return 1;
     }
 
-    std::unique_ptr<wiiu::platform::Window> window =
-        wiiu::platform::create_window(wiiu::platform::WindowDesc{}, error);
-    if (window == nullptr) {
-        WIIU_LOG_ERROR(Frontend, "{}", error);
-        backend->shutdown();
-        return 1;
+    std::array<wiiu::gpu::BufferHandle, wiiu::gpu::frames_in_flight> vertices{};
+    for (wiiu::gpu::BufferHandle& buffer : vertices) {
+        wiiu::gpu::BufferDesc buffer_desc;
+        buffer_desc.size = 6 * sizeof(float);
+        buffer_desc.storage = wiiu::gpu::Storage::Shared;
+        buffer_desc.label = "demo vertices";
+        buffer = backend.create_buffer(buffer_desc);
     }
 
-    wiiu::gpu::NativeSurface attached = window->surface();
-    if (!backend->attach_surface(attached, error)) {
-        WIIU_LOG_ERROR(Gpu, "{}", error);
-        backend->shutdown();
-        return 1;
-    }
-    backend->set_vsync(true);
-
-    wiiu::u64 presented = 0;
-    while (window->poll()) {
-        if (const wiiu::gpu::NativeSurface surface = window->surface();
-            surface.width != attached.width || surface.height != attached.height) {
-            if (!backend->attach_surface(surface, error)) {
-                WIIU_LOG_ERROR(Gpu, "{}", error);
-                break;
-            }
-            attached = surface;
-        }
-
-        wiiu::gpu::FrameInfo frame;
-        if (!backend->begin_frame(frame)) {
-            // No drawable this time: occluded, or resizing. Skipping is the
-            // right answer; waiting for one would stall the whole emulator
-            // on the window server.
-            continue;
-        }
-
+    const auto draw = [&](wiiu::gpu::GpuBackend& gpu, const wiiu::gpu::FrameInfo& frame) {
         const auto phase = static_cast<float>(frame.index % 240) / 240.0F;
+
+        // This frame's slot in the ring. The two before it may still be on
+        // the GPU; this one cannot be, because the backend lets no more than
+        // `frames_in_flight` frames be outstanding.
+        const wiiu::gpu::BufferHandle buffer = vertices[frame.index % vertices.size()];
+        const float angle = phase * 6.2831853F;
+        const float aspect =
+            frame.width == 0 ? 1.0F
+                             : static_cast<float>(frame.height) / static_cast<float>(frame.width);
+        std::array<float, 6> corners{};
+        for (std::size_t corner = 0; corner < 3; ++corner) {
+            const float theta = angle + (static_cast<float>(corner) * 2.0943951F);
+            corners[corner * 2] = 0.6F * std::cos(theta) * aspect;
+            corners[(corner * 2) + 1] = 0.6F * std::sin(theta);
+        }
+        std::array<wiiu::u8, sizeof(corners)> bytes{};
+        std::memcpy(bytes.data(), corners.data(), bytes.size());
+        static_cast<void>(gpu.write_buffer(buffer, 0, bytes));
+
         wiiu::gpu::RenderPassDesc pass;
-        pass.label = "clear";
+        pass.label = "demo";
         pass.color_count = 1;
         pass.colors[0].texture = frame.drawable;
         pass.colors[0].load = wiiu::gpu::LoadAction::Clear;
@@ -278,21 +363,77 @@ int run_window(wiiu::u64 frames) {
         // the display is a reader, so Store it is (P20).
         pass.colors[0].store = wiiu::gpu::StoreAction::Store;
         pass.colors[0].clear = wiiu::gpu::ClearColor{phase, 0.25F, 1.0F - phase, 1.0F};
-
-        if (backend->begin_render_pass(pass)) {
-            backend->end_render_pass();
+        if (!gpu.begin_render_pass(pass)) {
+            return;
         }
-        backend->end_frame();
+        gpu.set_pipeline(pipeline);
+        gpu.set_viewport(wiiu::gpu::Viewport{0.0F,
+                                             0.0F,
+                                             static_cast<float>(frame.width),
+                                             static_cast<float>(frame.height),
+                                             0.0F,
+                                             1.0F});
+        gpu.bind_buffer(wiiu::gpu::ShaderStage::Vertex, 0, buffer, 0);
+        wiiu::gpu::DrawCall call;
+        call.vertex_count = 3;
+        gpu.draw(call);
+        gpu.end_render_pass();
+    };
 
-        ++presented;
-        if (frames != 0 && presented >= frames) {
+    while (display.frame(draw)) {
+        if (args.frames != 0 && display.presented() >= args.frames) {
             break;
         }
     }
 
-    WIIU_LOG_INFO(Frontend, "presented {} frames", presented);
-    backend->shutdown();
+    WIIU_LOG_INFO(Frontend, "presented {} frames", display.presented());
+    for (const wiiu::gpu::BufferHandle buffer : vertices) {
+        backend.destroy(buffer);
+    }
+    backend.destroy(pipeline);
     return 0;
+}
+
+/// Hand OSScreen's flips to the display (6.8 -> 7.6).
+///
+/// A flip copies the visible frame out at once, which is what scan-out is:
+/// the title will be drawing into that buffer again two flips from now. The
+/// TV's flip presents; the GamePad's only updates its image, so a title that
+/// flips both every frame does not present twice. A title that only ever
+/// uses the GamePad presents on its flips instead.
+void connect_screens(wiiu::hle::coreinit::Context& coreinit, wiiu::frontend::Display& display) {
+    using wiiu::hle::coreinit::ScreenFlip;
+    using wiiu::hle::coreinit::ScreenId;
+
+    coreinit.screens.on_flip = [&display](const ScreenFlip& flip,
+                                          const wiiu::memory::Memory& memory) {
+        const wiiu::u32 size = flip.geometry.frame_bytes();
+        const wiiu::u8* const host =
+            memory.translate(flip.address, size, wiiu::memory::Access::Read);
+        const auto screen = flip.screen == ScreenId::Tv ? wiiu::gpu::PresentScreen::Tv
+                                                        : wiiu::gpu::PresentScreen::Drc;
+
+        if (host != nullptr) {
+            display.presenter().update(screen,
+                                       wiiu::gpu::ScreenImage{{host, size},
+                                                              flip.geometry.width,
+                                                              flip.geometry.height,
+                                                              flip.geometry.pitch * 4});
+        } else {
+            WIIU_LOG_WARN(Frontend,
+                          "{} flip: the frame at {:#010x} is not readable",
+                          wiiu::hle::coreinit::screen_name(flip.screen),
+                          flip.address);
+        }
+        // A disabled screen shows black: not drawn, and its space given up.
+        display.presenter().set_shown(screen, flip.enabled);
+
+        if (flip.screen == ScreenId::Drc &&
+            display.presenter().has_image(wiiu::gpu::PresentScreen::Tv)) {
+            return display.poll();
+        }
+        return display.present();
+    };
 }
 
 } // namespace
@@ -389,8 +530,10 @@ int main(int argc, char** argv) {
         return probe.ok() ? 0 : 1;
     }
 
-    if (args.window) {
-        const int status = run_window(args.frames);
+    apply_gpu_tooling(args);
+
+    if (args.window && args.run_path.empty()) {
+        const int status = run_window(args);
         wiiu::log::shutdown();
         return status;
     }
@@ -523,6 +666,24 @@ int main(int argc, char** argv) {
         coreinit.recording = &recording;
     }
 
+    // --- the screen (7.6) ---------------------------------------------------
+    //
+    // Opened before the title starts, so that its first flip has somewhere
+    // to go. Declared after the coreinit context: the flip hook refers to it,
+    // and it has to be torn down while that hook can no longer be called.
+    wiiu::frontend::Display display;
+    if (args.window) {
+        std::string display_error;
+        const std::string title =
+            fmt::format("wiiu-emu - {}", std::filesystem::path{args.run_path}.filename().string());
+        if (!display.open(display_options(args, title), display_error)) {
+            WIIU_LOG_ERROR(Gpu, "{}", display_error);
+            wiiu::log::shutdown();
+            return 1;
+        }
+        connect_screens(coreinit, display);
+    }
+
     wiiu::cpu::CoreState state;
     wiiu::hle::LoadedModule module;
     const auto load_result = wiiu::hle::load_module(rpl, memory, registry, state, module);
@@ -544,8 +705,25 @@ int main(int argc, char** argv) {
         static_cast<void>(memory.try_write<wiiu::u32>(out, static_cast<wiiu::u32>(value)));
     });
 
-    const wiiu::hle::RunReport report = wiiu::hle::run(
-        interpreter, memory, registry, {.scheduler = &coreinit.scheduler, .recording = &recording});
+    // With a window the title runs until it returns or the window is closed,
+    // as a program does. Without one the budget stands, so a run that never
+    // finishes still ends and says where it was.
+    wiiu::hle::RunOptions run_options{.scheduler = &coreinit.scheduler, .recording = &recording};
+    if (args.window) {
+        run_options.budget = std::numeric_limits<wiiu::u64>::max();
+    }
+    const wiiu::hle::RunReport report = wiiu::hle::run(interpreter, memory, registry, run_options);
+
+    // Closing the window halts the core from inside a flip, which looks like
+    // any other halt to the run loop. It is the one that is not a problem.
+    const bool closed_by_user = coreinit.screens.stop_requested;
+    coreinit.screens.on_flip = nullptr;
+    if (closed_by_user) {
+        WIIU_LOG_INFO(Frontend,
+                      "window closed after {} frames and {} instructions",
+                      display.presented(),
+                      report.instructions);
+    }
 
     WIIU_LOG_INFO(Core,
                   "{} after {} instructions and {} HLE calls",
@@ -581,7 +759,7 @@ int main(int argc, char** argv) {
     // it stopped, the code there, the registers, the call stack, and what it
     // was calling just before. Reproducing a fault by hand to collect this is
     // the slowest part of debugging an emulator.
-    if (report.outcome != wiiu::hle::RunOutcome::Returned) {
+    if (report.outcome != wiiu::hle::RunOutcome::Returned && !closed_by_user) {
         fmt::print(stderr, "\n{}\n", wiiu::cpu::format_state_dump(state, memory));
         fmt::print(stderr, "{}\n", registry.format_summary());
 
@@ -600,6 +778,7 @@ int main(int argc, char** argv) {
         fmt::print("\n{}", registry.format_summary());
     }
 
+    display.close();
     wiiu::log::shutdown();
-    return report.outcome == wiiu::hle::RunOutcome::Returned ? 0 : 1;
+    return report.outcome == wiiu::hle::RunOutcome::Returned || closed_by_user ? 0 : 1;
 }

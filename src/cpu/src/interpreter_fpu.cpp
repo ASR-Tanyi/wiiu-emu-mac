@@ -78,33 +78,36 @@ template <typename T>
 //
 // The 750CL computes fres and frsqrte from a 32-entry table. Each entry gives
 // a base value for its interval and a decrement applied across it, so the
-// estimate is piecewise linear in the mantissa. The tables are hardware data;
-// the shape of the lookup -- which mantissa bits index it, and where the
-// result's exponent comes from -- is the part worth reading carefully, since
-// an off-by-one in either produces answers that look nearly right.
+// estimate is piecewise linear in the mantissa. The shape of the lookup --
+// which mantissa bits index it, and where the result's exponent comes from --
+// is the part worth reading carefully, since an off-by-one in either produces
+// answers that look nearly right.
+//
+// Both tables are hardware data, and both agree entry for entry with the
+// tables Dolphin derived from hardware tests on Gekko and Broadway, the
+// 750CL's siblings. The reciprocal table's first transcription here had 26
+// of its 32 bases wrong in the low bits and interpolated across thirteen
+// mantissa bits instead of ten -- all of it inside the architected 1/256, so
+// the accuracy test could not see it. The bit-exact vectors in
+// test_fpscr.cpp are what would.
 
 struct EstimateEntry {
     u32 base;
     u32 decrement;
 };
 
+/// Bases in units of 2^-23 of the result's mantissa: an `fres` answer is a
+/// single-precision value by construction, and every bit below the 23rd is
+/// zero.
 constexpr std::array<EstimateEntry, 32> kReciprocal{{
-    {0x3FFC000, 0x3E1}, {0x3C1F000, 0x3A7}, {0x3875000, 0x371}, {0x3504000, 0x340},
-    {0x31C4000, 0x313}, {0x2EB1000, 0x2EA}, {0x2BC8000, 0x2C4}, {0x2907000, 0x2A0},
-    {0x2669000, 0x27F}, {0x23EC000, 0x261}, {0x218D000, 0x245}, {0x1F4B000, 0x22A},
-    {0x1D22000, 0x212}, {0x1B12000, 0x1FB}, {0x1917000, 0x1E5}, {0x1732000, 0x1D1},
-    {0x1561000, 0x1BE}, {0x13A2000, 0x1AC}, {0x11F6000, 0x19B}, {0x105A000, 0x18B},
-    {0x0ECF000, 0x17C}, {0x0D51000, 0x16E}, {0x0BE1000, 0x15B}, {0x0A7D000, 0x15B},
-    {0x0926000, 0x143}, {0x07DA000, 0x143}, {0x0698000, 0x12D}, {0x0563000, 0x12D},
-    {0x0439000, 0x11A}, {0x0318000, 0x11A}, {0x0201000, 0x109}, {0x00F4000, 0x0F4},
+    {0x7FF800, 0x3E1}, {0x783800, 0x3A7}, {0x70EA00, 0x371}, {0x6A0800, 0x340}, {0x638800, 0x313},
+    {0x5D6200, 0x2EA}, {0x579000, 0x2C4}, {0x520800, 0x2A0}, {0x4CC800, 0x27F}, {0x47CA00, 0x261},
+    {0x430800, 0x245}, {0x3E8000, 0x22A}, {0x3A2C00, 0x212}, {0x360800, 0x1FB}, {0x321400, 0x1E5},
+    {0x2E4A00, 0x1D1}, {0x2AA800, 0x1BE}, {0x272C00, 0x1AC}, {0x23D600, 0x19B}, {0x209E00, 0x18B},
+    {0x1D8800, 0x17C}, {0x1A9000, 0x16E}, {0x17AE00, 0x15B}, {0x14F800, 0x15B}, {0x124400, 0x143},
+    {0x0FBE00, 0x143}, {0x0D3800, 0x12D}, {0x0ADE00, 0x12D}, {0x088400, 0x11A}, {0x065000, 0x11A},
+    {0x041C00, 0x108}, {0x020C00, 0x106},
 }};
-
-// The last row's decrement is the one value here that is derived rather than
-// transcribed: the reciprocal of a mantissa approaching 2.0 approaches 0.5
-// exactly, so the row's interpolation has to reach zero at its end, which
-// fixes the decrement at base/4096. Worth checking against the 750CL manual
-// along with the rest of the table -- the accuracy test below is what would
-// catch any of these being wrong, and it is deliberately tight.
 
 /// Sixteen entries for an even exponent and sixteen for an odd one: halving an
 /// odd exponent leaves a factor of sqrt(2) behind, and the second half of the
@@ -338,31 +341,31 @@ f64 Interpreter::reciprocal_estimate(f64 value) noexcept {
         return mantissa == 0 ? std::bit_cast<f64>(sign) : value + 0.0;
     }
 
-    // The estimate saturates rather than producing subnormals: the hardware's
-    // exponent arithmetic cannot express the answer outside this range.
+    // Outside this range the hardware's exponent arithmetic cannot express
+    // the answer, and it saturates: to the largest single for an input too
+    // small to invert (subnormals included -- they are not normalised first,
+    // unlike frsqrte's), and to zero for one too large.
     if (exponent < (895ULL << 52)) {
-        return std::bit_cast<f64>(sign | kExponentMask);
+        return std::copysign(static_cast<f64>(std::numeric_limits<f32>::max()), value);
     }
     if (exponent >= (1149ULL << 52)) {
         return std::bit_cast<f64>(sign);
     }
 
-    // The top eighteen mantissa bits: five choose the row, thirteen
-    // interpolate across it. The base and decrement are in units of 2^26, so
-    // the largest base fills the 52-bit mantissa exactly -- which is the check
-    // that the split above is the right one.
-    const auto index = static_cast<u32>(mantissa >> 34);
-    const EstimateEntry& entry = kReciprocal[index / 8192];
+    // The top fifteen mantissa bits: five choose the row, ten interpolate
+    // across it. The result is a single-precision mantissa placed at bit 29.
+    const auto index = static_cast<u32>(mantissa >> 37);
+    const EstimateEntry& entry = kReciprocal[index / 1024];
 
     // The interpolation never takes the fraction below zero on hardware. The
     // clamp costs nothing and means a mistranscribed table entry degrades the
     // estimate instead of borrowing into the exponent and returning something
     // twice the right size.
-    const u32 drop = ((entry.decrement * (index % 8192)) + 1) / 2;
+    const u32 drop = ((entry.decrement * (index % 1024)) + 1) / 2;
     const u32 fraction = drop < entry.base ? entry.base - drop : 0;
 
     return std::bit_cast<f64>(sign | ((0x7FDULL << 52) - exponent) |
-                              (static_cast<u64>(fraction) << 26));
+                              (static_cast<u64>(fraction) << 29));
 }
 
 f64 Interpreter::reciprocal_sqrt_estimate(f64 value) noexcept {

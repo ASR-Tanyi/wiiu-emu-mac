@@ -11,6 +11,7 @@
 #include <wiiu/hle/recording.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/hle/scheduler.hpp>
+#include <wiiu/hle/screen.hpp>
 
 #include <array>
 #include <deque>
@@ -263,6 +264,9 @@ struct Context {
     IosManager ios;
     ReportSink report_sink;
 
+    /// OSScreen's two framebuffers, and the frontend's hook on a flip (6.8).
+    Screens screens;
+
     std::map<u32, Alarm> alarms;
 
     /// Guest memory, remembered by the calls that can complete later.
@@ -428,6 +432,9 @@ void reap_callback_threads(Context& context);
 
 /// Time and alarms (6.7). Called by register_all.
 void register_time(Registry& registry, Context& context);
+
+/// OSScreen (6.8). Called by register_all.
+void register_screen(Registry& registry, Context& context);
 
 /// The `IOS_*` entry points, and the devices behind them (6.10). Called by
 /// register_all, which is also where `/dev/fsa` is bound to the context's own

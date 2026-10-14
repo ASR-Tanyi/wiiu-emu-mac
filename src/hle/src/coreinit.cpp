@@ -683,6 +683,7 @@ void register_all(Registry& registry, Context& context) {
     register_threads(registry, context);
     register_time(registry, context);
     register_ios(registry, context);
+    register_screen(registry, context);
 
     registry.add("coreinit", "OSReport", os_report);
     registry.add("coreinit", "OSConsoleWrite", os_report);
@@ -737,10 +738,6 @@ void register_all(Registry& registry, Context& context) {
              "OSDynLoad_Acquire",
              "OSDynLoad_FindExport",
              "OSDynLoad_Release",
-             "OSScreenInit",
-             "OSScreenFlipBuffersEx",
-             "OSScreenClearBufferEx",
-             "OSScreenPutFontEx",
              "exit",
              "__os_snprintf",
          }) {

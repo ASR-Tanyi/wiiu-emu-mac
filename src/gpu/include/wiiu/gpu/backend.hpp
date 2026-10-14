@@ -66,6 +66,12 @@ struct Capabilities {
 
     u32 max_texture_size_2d = 0;
 
+    /// Is the device wrapped by Metal's API validation layer (7.8)? Not a
+    /// capability, but the first thing a GPU bug report should say: a crash
+    /// with validation off and the same crash with it on are different
+    /// reports.
+    bool api_validation = false;
+
     /// Everything this machine is missing that the emulator cannot do
     /// without, in a sentence a user can act on. Empty when it can run.
     [[nodiscard]] std::string shortfall() const;
@@ -167,6 +173,18 @@ struct RenderPassDesc {
 /// Enough of a pipeline to clear a screen and draw a triangle. Phase 8.11
 /// grows this into the full Latte state translation — blend, depth/stencil,
 /// rasterizer, vertex fetch — and this is deliberately not that yet.
+///
+/// There is no vertex descriptor, and there will not be one: Latte's vertex
+/// fetch has no alignment rules and Metal's has, so vertices are fetched by
+/// the shader itself from bound buffers, indexed by `[[vertex_id]]` (the
+/// Phase 7 table).
+///
+/// Shaders are compiled with fast math **off**. Metal's default is on, which
+/// lets the compiler reassociate, contract and assume no NaNs -- the GPU-side
+/// twin of the `-ffp-contract=off` rule for guest CPU arithmetic. Latte's
+/// shaders have IEEE and DX9 multiplies that differ exactly where fast math
+/// takes liberties (0 * inf), so the decompiler (8.6) has to be able to say
+/// which one it meant and be obeyed.
 struct PipelineDesc {
     std::string_view label;
     std::string vertex_source;   ///< MSL, as 8.6 emits it
@@ -261,12 +279,24 @@ public:
 
     [[nodiscard]] virtual FrameStats last_frame_stats() const = 0;
 
+    /// Command buffers the GPU reported as failed, ever: a fault, a timeout,
+    /// a shader-validation error (7.8). Should be zero, and the GPU tests
+    /// say so -- nothing else would notice, because a failed buffer leaves
+    /// the CPU side looking exactly as if it had worked.
+    [[nodiscard]] virtual u64 command_errors() const = 0;
+
     // --- resources --------------------------------------------------------
 
     [[nodiscard]] virtual BufferHandle create_buffer(const BufferDesc& desc) = 0;
     [[nodiscard]] virtual TextureHandle create_texture(const TextureDesc& desc) = 0;
     [[nodiscard]] virtual SamplerHandle create_sampler(const SamplerDesc& desc) = 0;
-    [[nodiscard]] virtual PipelineHandle create_pipeline(const PipelineDesc& desc) = 0;
+
+    /// Compile and link a pipeline. On failure `error` holds the compiler's
+    /// own words, with each line it complains about quoted from the source --
+    /// which is what makes a decompiler bug (8.6) a five-minute fix instead of
+    /// a line number to count to.
+    [[nodiscard]] virtual PipelineHandle create_pipeline(const PipelineDesc& desc,
+                                                         std::string& error) = 0;
 
     virtual void destroy(BufferHandle handle) = 0;
     virtual void destroy(TextureHandle handle) = 0;
@@ -292,6 +322,38 @@ public:
     /// range can be the buffer rather than be copied into one.
     [[nodiscard]] virtual void* buffer_contents(BufferHandle handle) = 0;
 
+    /// Copy pixels into level 0 of a `Shared` texture, rows `bytes_per_row`
+    /// apart in `data`.
+    ///
+    /// Immediate and CPU-side, like `write_buffer`, so the caller owns the
+    /// hazard: a texture a frame still in flight is sampling must not be
+    /// written. Rotating through `frames_in_flight` copies is the usual answer
+    /// (the presenter does). A `Private` texture is refused -- that upload is
+    /// a blit, and blits belong to the GPU thread (8.2).
+    [[nodiscard]] virtual bool write_texture(TextureHandle handle,
+                                             const Rect& region,
+                                             std::span<const u8> data,
+                                             u32 bytes_per_row) = 0;
+
+    /// Wrap memory the emulator already owns as a `Shared` buffer, without
+    /// copying it (**P22**).
+    ///
+    /// This is how guest RAM becomes GPU-visible on unified memory: the bytes
+    /// the guest writes are the bytes the GPU reads, with no staging buffer
+    /// and no upload. `pointer` and `size` must be multiples of
+    /// `host_page_size()`, which Metal requires and the guest regions already
+    /// are. The memory must outlive the buffer; destroying the buffer does not
+    /// free it.
+    ///
+    /// Zero-copy is not always right. Anything the CPU will overwrite while a
+    /// frame that reads it is still in flight needs a copy instead -- which is
+    /// why OSScreen's scanout copies at the flip (7.6) and GX2's buffers, which
+    /// carry their own synchronisation, are what this is for (8.2).
+    [[nodiscard]] virtual BufferHandle
+    import_host_memory(void* pointer, u64 size, std::string_view label) = 0;
+
+    [[nodiscard]] virtual MemoryStats memory_stats() const = 0;
+
     // --- encoding ---------------------------------------------------------
 
     /// Begin a render pass. False if `desc.validate()` refused it, which has
@@ -299,10 +361,18 @@ public:
     [[nodiscard]] virtual bool begin_render_pass(const RenderPassDesc& desc) = 0;
     virtual void end_render_pass() = 0;
 
+    /// The pipeline, and every binding below, belong to the render pass they
+    /// were made in: Metal encodes them into the pass's encoder, so a new pass
+    /// starts with nothing bound. Both backends refuse them outside a pass
+    /// rather than remembering them for one.
     virtual void set_pipeline(PipelineHandle pipeline) = 0;
     virtual void set_viewport(const Viewport& viewport) = 0;
     virtual void set_scissor(const Rect& rect) = 0;
 
+    /// Bind by stage and index. Until ADR-003's argument buffers arrive with
+    /// the MSL emitter (8.6, 8.12), index `n` is `[[buffer(n)]]`,
+    /// `[[texture(n)]]` or `[[sampler(n)]]` in that stage's function, up to
+    /// `max_bound_buffers`, `max_bound_textures` and `max_bound_samplers`.
     virtual void bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer, u64 offset) = 0;
     virtual void bind_texture(ShaderStage stage, u32 index, TextureHandle texture) = 0;
     virtual void bind_sampler(ShaderStage stage, u32 index, SamplerHandle sampler) = 0;
@@ -324,7 +394,22 @@ public:
     /// asked to wait. Every other wait is a bug, and the time spent here
     /// lands in `FrameStats::cpu_stall_us` so that it is visible when it is.
     virtual void wait(FenceHandle handle) = 0;
+
+    // --- tooling (7.8) ----------------------------------------------------
+
+    /// Start writing a GPU capture to `path` (a `.gputrace` on Metal), which
+    /// opens in Xcode's Metal debugger. Everything submitted until
+    /// `end_capture` is in it. False, with the reason, if this process cannot
+    /// capture -- on macOS that usually means `MTL_CAPTURE_ENABLED=1` was not
+    /// set before the device was created.
+    [[nodiscard]] virtual bool begin_capture(std::string_view path, std::string& error) = 0;
+
+    virtual void end_capture() = 0;
 };
+
+/// The host's virtual memory page size: what `import_host_memory` wants its
+/// pointer and size aligned to. 16 KiB on Apple silicon.
+[[nodiscard]] u64 host_page_size() noexcept;
 
 /// A backend that records what it is told and draws nothing.
 ///

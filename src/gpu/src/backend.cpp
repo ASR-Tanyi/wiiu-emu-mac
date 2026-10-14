@@ -5,9 +5,17 @@
 
 #include <fmt/format.h>
 
+#include <unistd.h>
 #include <vector>
 
 namespace wiiu::gpu {
+
+u64 host_page_size() noexcept {
+    // Asked rather than assumed: 16 KiB on Apple silicon, 4 KiB on most
+    // other hosts, and Metal rejects a wrapped range that is not whole pages.
+    const long size = sysconf(_SC_PAGESIZE);
+    return size > 0 ? static_cast<u64>(size) : 4096U;
+}
 
 std::string_view resource_kind_name(ResourceKind kind) noexcept {
     switch (kind) {
@@ -256,7 +264,8 @@ std::string Capabilities::describe() const {
                        "  tile shaders ........... {}\n"
                        "  argument buffers ....... tier {}\n"
                        "  unified memory ......... {}\n"
-                       "  max 2D texture ......... {}",
+                       "  max 2D texture ......... {}\n"
+                       "  api validation ......... {}",
                        device_name.empty() ? "unknown device" : device_name,
                        api_version.empty() ? "unknown" : api_version,
                        metal3,
@@ -266,7 +275,8 @@ std::string Capabilities::describe() const {
                        tile_shaders,
                        argument_buffer_tier,
                        unified_memory,
-                       max_texture_size_2d);
+                       max_texture_size_2d,
+                       api_validation);
 }
 
 // --------------------------------------------------------------------------

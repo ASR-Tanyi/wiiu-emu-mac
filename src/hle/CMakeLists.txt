@@ -4,6 +4,7 @@ wiiu_add_library(hle
     SOURCES
         src/coreinit.cpp
         src/coreinit_ios.cpp
+        src/coreinit_screen.cpp
         src/coreinit_thread.cpp
         src/coreinit_time.cpp
         src/filesystem.cpp
@@ -25,6 +26,7 @@ wiiu_add_library(hle
         include/wiiu/hle/recording.hpp
         include/wiiu/hle/registry.hpp
         include/wiiu/hle/scheduler.hpp
+        include/wiiu/hle/screen.hpp
         include/wiiu/hle/system_libraries.hpp
     DEPS
         wiiu::common
