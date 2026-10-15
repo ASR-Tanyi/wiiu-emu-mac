@@ -48,6 +48,38 @@ FetchContent_Declare(pugixml
 
 FetchContent_MakeAvailable(fmt spdlog tomlplusplus pugixml)
 
+# addrlib — AMD's surface addressing library, for Latte's tiling (Phase 8.5).
+# MIT, AMD's notice. GX2 itself is built on AMD's addrlib; this is Mesa's R800
+# addrlib adapted to the R600/R700 variant in the Wii U, as decaf maintains it
+# (see docs/decisions/ADR-005-addrlib.md). It publishes no tags, so the pin is
+# a commit, which also rules out a shallow clone.
+#
+# No CMakeLists either: the target below is ours, built without the project's
+# warning set and exposed with SYSTEM includes, like metal-cpp.
+FetchContent_Declare(addrlib
+    GIT_REPOSITORY https://github.com/decaf-emu/addrlib.git
+    GIT_TAG        194162c47469ce620dd2470eb767ff5e42f5954a)
+FetchContent_MakeAvailable(addrlib)
+
+if(NOT TARGET addrlib)
+    add_library(addrlib STATIC
+        "${addrlib_SOURCE_DIR}/src/addrinterface.cpp"
+        "${addrlib_SOURCE_DIR}/src/core/addrelemlib.cpp"
+        "${addrlib_SOURCE_DIR}/src/core/addrlib.cpp"
+        "${addrlib_SOURCE_DIR}/src/core/addrobject.cpp"
+        "${addrlib_SOURCE_DIR}/src/r600/r600addrlib.cpp")
+    target_include_directories(addrlib
+        SYSTEM PUBLIC "${addrlib_SOURCE_DIR}/include"
+        PRIVATE "${addrlib_SOURCE_DIR}/include/addrlib"
+                "${addrlib_SOURCE_DIR}/src"
+                "${addrlib_SOURCE_DIR}/src/core"
+                "${addrlib_SOURCE_DIR}/src/r600")
+    # Its sources draw Clang's default warnings (unhandled enum values in
+    # switches, missing `override`); not ours to fix, so not ours to print.
+    target_compile_options(addrlib PRIVATE -w)
+    set_target_properties(addrlib PROPERTIES FOLDER "third_party" POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # metal-cpp — Apple's header-only C++ interface to Metal (Phase 1.4).
 #
 # Apple-only, and fetched only there: a Linux core build has no use for it.

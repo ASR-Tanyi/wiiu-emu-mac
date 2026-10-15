@@ -12,3 +12,4 @@ been thought through.
 | [002](ADR-002-apple-silicon-only.md) | Apple silicon only; no Intel Mac support | Accepted |
 | [003](ADR-003-argument-buffers.md) | Bindless resource binding via argument buffers (Tier 2) | Accepted |
 | [004](ADR-004-gpu-timeline.md) | The GPU runs on the guest's clock; a host GPU thread is an implementation detail | Accepted |
+| [005](ADR-005-addrlib.md) | Latte's surface layout comes from AMD's addrlib (decaf's R600 backend), behind one wrapper | Accepted |

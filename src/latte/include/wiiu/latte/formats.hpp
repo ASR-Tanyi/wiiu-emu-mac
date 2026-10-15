@@ -5,8 +5,8 @@
 // unorm, 0x100 uint, 0x200 snorm, 0x300 sint, 0x400 sRGB, 0x800 float. So
 // `0x01A` is 8_8_8_8 unorm and `0x41A` the same bits read as sRGB. Only the
 // low six bits decide how big an element is, which is all this file knows so
-// far; the rest of the format story -- tiling, compression, how a texture is
-// read -- is 8.13's.
+// far; how a surface is laid out is surface.hpp's (8.5), and how a texture is
+// read is still to come.
 #pragma once
 
 #include <wiiu/common/types.hpp>
@@ -20,7 +20,7 @@ namespace wiiu::latte {
 
 /// Bytes per element of a GX2 surface format, or zero for one that is not
 /// an uncompressed format this knows -- block-compressed formats measure in
-/// 4x4 blocks, not elements, and are left to 8.13.
+/// 4x4 blocks, which `bits_per_element` covers.
 ///
 /// The sizes follow from the R600 format names: 8 and 4_4 are a byte; 16,
 /// 8_8 and the five- and six-bit packings are two; everything packed into 32
@@ -48,6 +48,23 @@ namespace wiiu::latte {
         return 16;
     }
     return 0;
+}
+
+/// BC1 to BC5: 0x31 to 0x35, each element a 4x4 block of pixels.
+[[nodiscard]] constexpr bool is_block_compressed(u32 surface_format) noexcept {
+    const u32 format = color_format(surface_format);
+    return (surface_format & 0xC0) == 0 && format >= 0x31 && format <= 0x35;
+}
+
+/// Bits per element, counting a compressed format's 4x4 block as one
+/// element: BC1 and BC4 are 64 bits a block, BC2, BC3 and BC5 are 128. What
+/// AMD's addrlib takes as `bpp`. Zero for a format this does not know.
+[[nodiscard]] constexpr u32 bits_per_element(u32 surface_format) noexcept {
+    if (is_block_compressed(surface_format)) {
+        const u32 format = color_format(surface_format);
+        return format == 0x31 || format == 0x34 ? 64 : 128;
+    }
+    return bytes_per_element(surface_format) * 8;
 }
 
 } // namespace wiiu::latte

@@ -1,5 +1,5 @@
 // Latte's surface formats: the element sizes the scan buffers (8.1) and, later,
-// every surface (8.13) are measured in.
+// every surface (8.5) are measured in.
 
 #include <wiiu/latte/formats.hpp>
 
@@ -41,4 +41,20 @@ TEST_CASE("formats without an element size say so", "[latte][formats]") {
     CHECK(bytes_per_element(0x031) == 0); // UNORM_BC1: measured in blocks
     CHECK(bytes_per_element(0x035) == 0); // UNORM_BC5
     CHECK(bytes_per_element(0x081) == 0); // UNORM_NV12
+}
+
+TEST_CASE("compressed formats are measured in blocks", "[latte][formats]") {
+    CHECK(is_block_compressed(0x031)); // UNORM_BC1
+    CHECK(is_block_compressed(0x433)); // SRGB_BC3
+    CHECK_FALSE(is_block_compressed(0x01A));
+    CHECK_FALSE(is_block_compressed(0x081)); // NV12
+
+    CHECK(bits_per_element(0x031) == 64);  // BC1
+    CHECK(bits_per_element(0x032) == 128); // BC2
+    CHECK(bits_per_element(0x033) == 128); // BC3
+    CHECK(bits_per_element(0x234) == 64);  // SNORM_BC4
+    CHECK(bits_per_element(0x235) == 128); // SNORM_BC5
+    CHECK(bits_per_element(0x01A) == 32);
+    CHECK(bits_per_element(0x823) == 128);
+    CHECK(bits_per_element(0x000) == 0);
 }

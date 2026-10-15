@@ -220,10 +220,10 @@ struct ScanGeometry {
 /// element size. Zero for a format without one.
 ///
 /// This is decaf's linear figure. Hardware's is the size of a tiled surface,
-/// a little larger for the alignment; that one needs Latte's surface layout
-/// (8.13). The frames here are the emulator's own -- nothing but the
-/// emulator reads a scan buffer -- so the only thing the figure has to be is
-/// enough room for them, which it is.
+/// a little larger where the height needs padding (1080 rows become 1088);
+/// that one comes from Latte's surface layout (8.5). The frames here are the
+/// emulator's own -- nothing but the emulator reads a scan buffer -- so the
+/// only thing the figure has to be is enough room for them, which it is.
 [[nodiscard]] u32
 scan_buffer_bytes(const ScanGeometry& geometry, u32 surface_format, u32 buffering_mode) noexcept;
 

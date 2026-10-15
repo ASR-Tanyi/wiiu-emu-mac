@@ -120,6 +120,7 @@ wiiu_add_test(latte
         latte/test_formats.cpp
         latte/test_pm4.cpp
         latte/test_registers.cpp
+        latte/test_surface.cpp
         latte/test_timeline.cpp
     DEPS
         wiiu::latte)
