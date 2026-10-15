@@ -27,6 +27,17 @@ std::string_view scan_target_name(ScanTarget target) noexcept {
     return "unknown";
 }
 
+std::optional<ScanTarget> scan_target_from_gx2(u32 value) noexcept {
+    switch (value) {
+        case 1:
+            return ScanTarget::Tv;
+        case 4:
+            return ScanTarget::Drc;
+        default:
+            return std::nullopt;
+    }
+}
+
 std::optional<ScanGeometry> tv_scan_geometry(u32 render_mode) noexcept {
     switch (render_mode) {
         case 1:

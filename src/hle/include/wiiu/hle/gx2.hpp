@@ -33,10 +33,16 @@
 //     (Cemu and decaf agree on it), and it makes a flip's tick a pure function
 //     of the title's own calls.
 //
-// What is not here yet: what a flip shows (the scan buffers and the copy into
-// them), swap interval 0's flip-without-waiting (it waits for vsync like 1),
-// the overrun callback a full display list asks for, and the profiling and
-// toss-stage modes `GX2Init` can ask for.
+// What a flip shows is the scan buffers (gx2_display.cpp), filled by the
+// scan-out copy (gx2_surface.cpp). The swap, the clear and that copy reach the
+// GPU as the emulator's own packets (`pm4::Opcode::Hle*`), so each happens in
+// stream order when its submission retires -- from a display list as well as
+// the ring -- and the GPU, not the CPU, counts the swaps a copy lands
+// between.
+//
+// What is not here yet: swap interval 0's flip-without-waiting (it waits for
+// vsync like 1), the overrun callback a full display list asks for, and the
+// profiling and toss-stage modes `GX2Init` can ask for.
 #pragma once
 
 #include <wiiu/common/types.hpp>
@@ -49,13 +55,16 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace wiiu::hle {
 
 class Registry;
+struct Call;
 
 namespace coreinit {
 struct Context;
@@ -193,6 +202,10 @@ enum class ScanTarget : u32 {
 inline constexpr u32 scan_target_count = 2;
 
 [[nodiscard]] std::string_view scan_target_name(ScanTarget target) noexcept;
+
+/// The output a `GX2ScanTarget` names: 1 is the TV and 4 the GamePad (wut's
+/// and decaf's values). Nothing for anything else.
+[[nodiscard]] std::optional<ScanTarget> scan_target_from_gx2(u32 value) noexcept;
 
 /// A scan buffer's shape, in pixels.
 struct ScanGeometry {
@@ -382,6 +395,12 @@ public:
 
     [[nodiscard]] const latte::RegisterFile& registers() const noexcept { return *registers_; }
 
+    /// Swaps the GPU has reached in stream order: the `HleSwap` packets that
+    /// have run. A scan-out copy lands in the frame the next of them will
+    /// show -- frame `swaps_reached()` of the rotation, the same count the
+    /// flips take their frames by.
+    [[nodiscard]] u32 swaps_reached() const noexcept { return swaps_reached_; }
+
     /// Back to before `GX2Init`, with nothing in flight: the register file
     /// cleared and a fresh timeline started. The command processor's
     /// listeners and counters are the emulator's, and stay.
@@ -389,6 +408,13 @@ public:
 
 private:
     bool write_display_list(DisplayList& list, std::span<const u32> words);
+
+    /// One of the emulator's own packets, as it runs.
+    void run_hle(const latte::pm4::Packet& packet);
+
+    /// Log a problem with a packet the first time it is seen: a copy that
+    /// cannot be done fails the same way every frame.
+    void report(const std::string& problem);
 
     // Heap-held: 256 KiB of registers does not belong inside a Context that
     // tests put on the stack.
@@ -407,6 +433,8 @@ private:
     /// The timestamps of the submissions carrying the swaps not yet flipped,
     /// oldest first.
     std::deque<u64> pending_swaps_;
+    u32 swaps_reached_ = 0;
+    std::set<std::string> reported_;
     InitAttributes attributes_{};
     bool initialized_ = false;
     u32 main_core_ = 1;
@@ -424,6 +452,11 @@ void arm_retirement(coreinit::Context& context);
 /// Arm the vsync timer at the first vsync after `now`. From then on it keeps
 /// itself armed, one vsync at a time, until `GX2Shutdown` or a reset.
 void start_vsync(coreinit::Context& context, u64 now);
+
+/// Write packets for the calling core -- its open display list, or the main
+/// command buffer -- and keep the GPU's timer armed if that submitted
+/// anything. What every GX2 call that sends the GPU something goes through.
+bool emit(Call& call, std::span<const u32> words);
 
 /// Register the GX2 entry points under the `gx2` library.
 void register_gx2(Registry& registry, coreinit::Context& context);

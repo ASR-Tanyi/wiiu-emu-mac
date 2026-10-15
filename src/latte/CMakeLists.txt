@@ -9,6 +9,7 @@
 wiiu_add_library(latte
     SOURCES
         src/command_processor.cpp
+        src/formats.cpp
         src/pm4.cpp
         src/registers.cpp
         src/surface.cpp

@@ -4,12 +4,16 @@
 // R600 `COLOR_*`/`FMT_*` number -- with the number type above it: 0x000
 // unorm, 0x100 uint, 0x200 snorm, 0x300 sint, 0x400 sRGB, 0x800 float. So
 // `0x01A` is 8_8_8_8 unorm and `0x41A` the same bits read as sRGB. Only the
-// low six bits decide how big an element is, which is all this file knows so
-// far; how a surface is laid out is surface.hpp's (8.5), and how a texture is
-// read is still to come.
+// low six bits decide how big an element is; how a surface is laid out is
+// surface.hpp's (8.5). What a colour looks like as an element is
+// `encode_color`, for the few formats a clear can write so far; how a texture
+// is read is still to come.
 #pragma once
 
 #include <wiiu/common/types.hpp>
+
+#include <array>
+#include <optional>
 
 namespace wiiu::latte {
 
@@ -66,5 +70,26 @@ namespace wiiu::latte {
     }
     return bytes_per_element(surface_format) * 8;
 }
+
+/// A colour as one element of a format: the bytes the GPU stores, in memory
+/// order.
+struct EncodedColor {
+    std::array<u8, 16> bytes{};
+    u32 size = 0;
+};
+
+/// What a clear to (red, green, blue, alpha) stores in a surface of this
+/// format, or nothing for a format this does not encode yet.
+///
+/// So far: the 8-bit unorm formats -- 8, 8_8, 8_8_8_8 -- and 8_8_8_8 sRGB,
+/// which between them are every colour buffer and scan buffer a WHB title
+/// makes. Components go into memory red first, a byte each: an 8-bit-per-
+/// component format on a little-endian GPU, and the same order OSScreen's
+/// buffers hold (6.8). Unorm clamps to [0, 1] and rounds to nearest; NaN is
+/// zero. sRGB encodes red, green and blue with the standard curve, as a draw
+/// into an sRGB target does, and leaves alpha linear. Wider and float formats
+/// wait until their byte order has been checked against something real.
+[[nodiscard]] std::optional<EncodedColor> encode_color(u32 surface_format,
+                                                       const std::array<f32, 4>& rgba) noexcept;
 
 } // namespace wiiu::latte

@@ -76,6 +76,17 @@ void CommandProcessor::packet(const Packet& packet, u32 depth) {
             // GX2 writes markers and debug strings this way. Nothing to do.
             return;
 
+        case Opcode::HleSwap:
+        case Opcode::HleClearColor:
+        case Opcode::HleCopyColorToScan:
+            if (!hle_listener_) {
+                unhandled(packet, true);
+                return;
+            }
+            ++stats_.hle;
+            hle_listener_(packet);
+            return;
+
         case Opcode::SetConfigReg:
             set_window(packet, Window::Config);
             return;

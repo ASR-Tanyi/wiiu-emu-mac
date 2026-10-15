@@ -5,11 +5,15 @@
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/color_buffer.hpp>
 #include <wiiu/latte/formats.hpp>
+#include <wiiu/latte/pm4.hpp>
+
+#include <fmt/format.h>
 
 #include <algorithm>
 #include <bit>
 #include <cstring>
 #include <span>
+#include <vector>
 
 namespace wiiu::hle::gx2 {
 
@@ -97,7 +101,7 @@ template <typename T>
 
 } // namespace
 
-std::optional<latte::SurfaceLayout> surface_layout(const Surface& surface, u32 level) {
+latte::SurfaceDesc surface_desc(const Surface& surface, u32 level) {
     latte::SurfaceDesc desc;
     const u32 mode = surface.tile_mode;
     desc.tile_mode = mode == static_cast<u32>(TileMode::LinearSpecial)
@@ -140,8 +144,233 @@ std::optional<latte::SurfaceLayout> surface_layout(const Surface& surface, u32 l
             desc.slices = surface.depth;
             break;
     }
+    return desc;
+}
 
-    return latte::compute_layout(desc);
+std::optional<latte::SurfaceLayout> surface_layout(const Surface& surface, u32 level) {
+    return latte::compute_layout(surface_desc(surface, level));
+}
+
+std::optional<ppcaddr_t> level_address(const Surface& surface, u32 level) {
+    if (level == 0) {
+        if (surface.image == 0) {
+            return std::nullopt;
+        }
+        return surface.image.value();
+    }
+    if (surface.mipmaps == 0 || level >= max_mip_levels) {
+        return std::nullopt;
+    }
+    const u32 offset = level == 1 ? 0 : surface.mip_level_offset[level - 1].value();
+    return surface.mipmaps + offset;
+}
+
+latte::BankPipeSwizzle level_swizzle(const Surface& surface, u32 level) {
+    const u32 first_untiled = (surface.swizzle >> 16) & 0xFF;
+    if (!is_macro_tiled(surface.tile_mode) || level >= first_untiled) {
+        return {};
+    }
+    return latte::split_swizzle(surface.swizzle & 0xFFFF);
+}
+
+std::array<u32, color_buffer_words> color_buffer_to_words(const ColorBuffer& buffer) {
+    std::array<u8, sizeof(ColorBuffer)> bytes{};
+    std::memcpy(bytes.data(), &buffer, sizeof(ColorBuffer));
+    std::array<u32, color_buffer_words> words{};
+    for (u32 i = 0; i < color_buffer_words; ++i) {
+        const u8* const at = bytes.data() + (i * 4);
+        words[i] = (u32{at[0]} << 24) | (u32{at[1]} << 16) | (u32{at[2]} << 8) | u32{at[3]};
+    }
+    return words;
+}
+
+ColorBuffer color_buffer_from_words(std::span<const u32, color_buffer_words> words) {
+    std::array<u8, sizeof(ColorBuffer)> bytes{};
+    for (u32 i = 0; i < color_buffer_words; ++i) {
+        for (u32 b = 0; b < 4; ++b) {
+            bytes[(i * 4) + b] = static_cast<u8>(words[i] >> (24 - (8 * b)));
+        }
+    }
+    ColorBuffer buffer{};
+    std::memcpy(&buffer, bytes.data(), sizeof(ColorBuffer));
+    return buffer;
+}
+
+namespace {
+
+/// The level and slices a colour buffer's view names, laid out -- what both
+/// the clear and the copy start from. A view of no slices is taken as one,
+/// as decaf takes it.
+struct ViewedLevel {
+    latte::SurfaceDesc desc;
+    latte::SurfaceLayout layout;
+    ppcaddr_t address = 0;
+    u32 first_slice = 0;
+    u32 slices = 0;
+};
+
+[[nodiscard]] std::string describe(const Surface& s) {
+    return fmt::format("{}x{} format {:#x} tile mode {} at {:#010x}",
+                       s.width.value(),
+                       s.height.value(),
+                       s.format.value(),
+                       s.tile_mode.value(),
+                       s.image.value());
+}
+
+[[nodiscard]] std::optional<ViewedLevel> viewed_level(const ColorBuffer& buffer,
+                                                      std::string& problem) {
+    const Surface& s = buffer.surface;
+    const u32 level = buffer.view_mip;
+    const std::optional<latte::SurfaceLayout> layout = surface_layout(s, level);
+    if (!layout.has_value()) {
+        problem = fmt::format("level {} of a {} cannot be laid out", level, describe(s));
+        return std::nullopt;
+    }
+    const std::optional<ppcaddr_t> address = level_address(s, level);
+    if (!address.has_value()) {
+        problem = fmt::format("a {} has no memory for level {}", describe(s), level);
+        return std::nullopt;
+    }
+    ViewedLevel viewed{
+        .desc = surface_desc(s, level),
+        .layout = *layout,
+        .address = *address,
+        .first_slice = buffer.view_first_slice,
+        .slices = std::max<u32>(1, buffer.view_num_slices),
+    };
+    if (viewed.first_slice >= layout->depth) {
+        problem = fmt::format(
+            "slice {} of a {} with {} slices", viewed.first_slice, describe(s), layout->depth);
+        return std::nullopt;
+    }
+    viewed.slices = std::min(viewed.slices, layout->depth - viewed.first_slice);
+    return viewed;
+}
+
+[[nodiscard]] bool is_thick(TileMode mode) noexcept {
+    switch (mode) {
+        case TileMode::Tiled1DThick:
+        case TileMode::Tiled2DThick:
+        case TileMode::Tiled2BThick:
+        case TileMode::Tiled3DThick:
+        case TileMode::Tiled3BThick:
+            return true;
+        default:
+            return false;
+    }
+}
+
+} // namespace
+
+std::string clear_color_buffer(memory::Memory& memory,
+                               const ColorBuffer& buffer,
+                               const std::array<f32, 4>& rgba) {
+    std::string problem;
+    const std::optional<ViewedLevel> viewed = viewed_level(buffer, problem);
+    if (!viewed.has_value()) {
+        return "GX2ClearColor: " + problem;
+    }
+    const Surface& s = buffer.surface;
+
+    const std::optional<latte::EncodedColor> color = latte::encode_color(s.format, rgba);
+    if (!color.has_value() || color->size * 8 != viewed->layout.bits_per_element) {
+        return fmt::format("GX2ClearColor: clearing format {:#x} is not supported yet",
+                           s.format.value());
+    }
+    if (is_thick(viewed->layout.tile_mode)) {
+        return fmt::format("GX2ClearColor: a thick-tiled colour buffer ({}) is not cleared yet",
+                           describe(s));
+    }
+
+    const u64 slice_bytes = viewed->layout.slice_size;
+    const u64 start = viewed->address + (viewed->first_slice * slice_bytes);
+    const u64 bytes = viewed->slices * slice_bytes;
+    u8* const host = start + bytes <= 0x1'0000'0000ULL
+                         ? memory.translate(static_cast<ppcaddr_t>(start),
+                                            static_cast<u32>(bytes),
+                                            memory::Access::Write)
+                         : nullptr;
+    if (host == nullptr) {
+        return fmt::format("GX2ClearColor: {:#x} bytes at {:#010x} for a {} are not writable "
+                           "guest memory",
+                           bytes,
+                           start,
+                           describe(s));
+    }
+
+    for (u64 at = 0; at + color->size <= bytes; at += color->size) {
+        std::memcpy(host + at, color->bytes.data(), color->size);
+    }
+    return {};
+}
+
+std::string copy_to_scan_frame(memory::Memory& memory,
+                               const ColorBuffer& buffer,
+                               const ScanBuffer& scan,
+                               ppcaddr_t frame) {
+    std::string problem;
+    const std::optional<ViewedLevel> viewed = viewed_level(buffer, problem);
+    if (!viewed.has_value()) {
+        return "GX2CopyColorBufferToScanBuffer: " + problem;
+    }
+    const Surface& s = buffer.surface;
+
+    const u32 bytes = viewed->layout.bits_per_element / 8;
+    if (latte::color_format(s.format) != latte::color_format(scan.surface_format) ||
+        bytes != latte::bytes_per_element(scan.surface_format)) {
+        return fmt::format("GX2CopyColorBufferToScanBuffer: copying format {:#x} into a scan "
+                           "buffer of format {:#x} is not supported yet",
+                           s.format.value(),
+                           scan.surface_format);
+    }
+
+    const u8* const level = memory.translate(
+        viewed->address, static_cast<u32>(viewed->layout.size), memory::Access::Read);
+    if (level == nullptr) {
+        return fmt::format("GX2CopyColorBufferToScanBuffer: the {} is not readable guest memory",
+                           describe(s));
+    }
+    const latte::Extent extent = latte::level_extent(viewed->desc);
+    std::vector<u8> rows(static_cast<std::size_t>(extent.width) * extent.height * bytes);
+    if (!latte::detile(viewed->desc,
+                       viewed->layout,
+                       std::span<const u8>(level, viewed->layout.size),
+                       viewed->first_slice,
+                       0,
+                       level_swizzle(s, buffer.view_mip),
+                       rows)) {
+        return fmt::format("GX2CopyColorBufferToScanBuffer: the elements of a {} fall outside it",
+                           describe(s));
+    }
+
+    const ScanGeometry& geometry = scan.geometry;
+    const u64 frame_bytes = static_cast<u64>(geometry.pitch) * geometry.height * bytes;
+    u8* const out = memory.translate(frame, static_cast<u32>(frame_bytes), memory::Access::Write);
+    if (out == nullptr) {
+        return fmt::format("GX2CopyColorBufferToScanBuffer: the {}x{} scan frame at {:#010x} is "
+                           "not writable guest memory",
+                           geometry.width,
+                           geometry.height,
+                           frame);
+    }
+
+    const u64 out_row = static_cast<u64>(geometry.pitch) * bytes;
+    for (u32 y = 0; y < geometry.height; ++y) {
+        const u32 sy = static_cast<u32>((static_cast<u64>(y) * extent.height) / geometry.height);
+        const u8* const in = rows.data() + (static_cast<u64>(sy) * extent.width * bytes);
+        u8* const row = out + (y * out_row);
+        if (extent.width == geometry.width) {
+            std::memcpy(row, in, static_cast<std::size_t>(geometry.width) * bytes);
+            continue;
+        }
+        for (u32 x = 0; x < geometry.width; ++x) {
+            const u32 sx = static_cast<u32>((static_cast<u64>(x) * extent.width) / geometry.width);
+            std::memcpy(
+                row + (static_cast<u64>(x) * bytes), in + (static_cast<u64>(sx) * bytes), bytes);
+        }
+    }
+    return {};
 }
 
 bool calc_surface_size_and_alignment(Surface& surface) {
@@ -387,11 +616,55 @@ void gx2_init_color_buffer_regs(Call& call, u32 address) {
     static_cast<void>(write_guest(call.memory, address, buffer));
 }
 
+/// `void GX2ClearColor(GX2ColorBuffer *buffer, float r, float g, float b, float a)`.
+void gx2_clear_color(Call& call, u32 address, f32 red, f32 green, f32 blue, f32 alpha) {
+    ColorBuffer buffer{};
+    if (!read_guest(call.memory, address, buffer)) {
+        WIIU_LOG_ERROR(Gx2, "GX2ClearColor: no colour buffer at {:#010x}", address);
+        return;
+    }
+    std::vector<u32> packet;
+    packet.reserve(1 + 4 + color_buffer_words);
+    packet.push_back(
+        latte::pm4::type3_header(latte::pm4::Opcode::HleClearColor, 4 + color_buffer_words));
+    for (const f32 component : {red, green, blue, alpha}) {
+        packet.push_back(std::bit_cast<u32>(component));
+    }
+    const std::array<u32, color_buffer_words> words = color_buffer_to_words(buffer);
+    packet.insert(packet.end(), words.begin(), words.end());
+    static_cast<void>(emit(call, packet));
+}
+
+/// `void GX2CopyColorBufferToScanBuffer(GX2ColorBuffer *buffer, GX2ScanTarget target)`.
+void gx2_copy_color_buffer_to_scan_buffer(Call& call, u32 address, u32 target) {
+    if (!scan_target_from_gx2(target).has_value()) {
+        WIIU_LOG_WARN(
+            Gx2, "GX2CopyColorBufferToScanBuffer: {} is not a scan target; nothing copied", target);
+        return;
+    }
+    ColorBuffer buffer{};
+    if (!read_guest(call.memory, address, buffer)) {
+        WIIU_LOG_ERROR(
+            Gx2, "GX2CopyColorBufferToScanBuffer: no colour buffer at {:#010x}", address);
+        return;
+    }
+    std::vector<u32> packet;
+    packet.reserve(1 + 1 + color_buffer_words);
+    packet.push_back(
+        latte::pm4::type3_header(latte::pm4::Opcode::HleCopyColorToScan, 1 + color_buffer_words));
+    packet.push_back(target);
+    const std::array<u32, color_buffer_words> words = color_buffer_to_words(buffer);
+    packet.insert(packet.end(), words.begin(), words.end());
+    static_cast<void>(emit(call, packet));
+}
+
 } // namespace
 
 void register_gx2_surface(Registry& registry) {
     registry.add("gx2", "GX2CalcSurfaceSizeAndAlignment", gx2_calc_surface_size_and_alignment);
     registry.add("gx2", "GX2InitColorBufferRegs", gx2_init_color_buffer_regs);
+    registry.add("gx2", "GX2ClearColor", gx2_clear_color);
+    registry.add("gx2", "GX2CopyColorBufferToScanBuffer", gx2_copy_color_buffer_to_scan_buffer);
 }
 
 } // namespace wiiu::hle::gx2

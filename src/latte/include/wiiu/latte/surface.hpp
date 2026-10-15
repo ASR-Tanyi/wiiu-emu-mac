@@ -18,6 +18,7 @@
 #include <wiiu/common/types.hpp>
 
 #include <optional>
+#include <span>
 #include <string_view>
 
 namespace wiiu::latte {
@@ -110,5 +111,38 @@ struct BankPipeSwizzle {
 };
 
 [[nodiscard]] BankPipeSwizzle split_swizzle(u32 gx2_swizzle) noexcept;
+
+/// A level's size in elements -- pixels, or 4x4 blocks for a compressed
+/// format -- before any padding.
+struct Extent {
+    u32 width = 0;
+    u32 height = 0;
+};
+
+[[nodiscard]] Extent level_extent(const SurfaceDesc& surface) noexcept;
+
+/// The CPU detiler: read one slice and sample of a level out of its tiled
+/// layout into plain rows. Element (x, y) lands at byte
+/// `(y * width + x) * element size` of `rows`, for the level's unpadded
+/// extent; `level` is the level's own bytes, from where it starts, and
+/// `swizzle` the bank and pipe swizzle that applies to it. False if `rows`
+/// is too small, or an element would fall outside `level` -- in which case
+/// `rows` may be partly written.
+///
+/// Element by element this is `element_offset`, and that is the slow way:
+/// addrlib's arithmetic for every pixel of a 720p frame is a fifth of a
+/// second in a debug build. So where a micro-tile is known to sit in one
+/// piece -- the linear and 1D modes, and the 2D and 3D thin modes when a
+/// micro-tile and its samples fit in the 256-byte pipe interleave, inside
+/// which neither bank nor pipe changes -- it asks once per 8x8 micro-tile and
+/// places the rest of the tile by the pattern of the first. Everything else
+/// takes the slow way. The tests hold the two to the same answer.
+[[nodiscard]] bool detile(const SurfaceDesc& surface,
+                          const SurfaceLayout& layout,
+                          std::span<const u8> level,
+                          u32 slice,
+                          u32 sample,
+                          BankPipeSwizzle swizzle,
+                          std::span<u8> rows);
 
 } // namespace wiiu::latte

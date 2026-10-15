@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 
 namespace wiiu::hle::gx2 {
 
@@ -94,7 +95,9 @@ std::string_view event_type_name(u32 type) noexcept {
 
 Gpu::Gpu()
     : registers_(std::make_unique<latte::RegisterFile>()), processor_(*registers_),
-      timeline_(processor_) {}
+      timeline_(processor_) {
+    processor_.set_hle_listener([this](const latte::pm4::Packet& packet) { run_hle(packet); });
+}
 
 void Gpu::initialize(memory::Memory& memory, u32 main_core, const InitAttributes& attributes) {
     memory_ = &memory;
@@ -113,6 +116,7 @@ void Gpu::shutdown() noexcept {
     scan_buffers_ = {};
     drc_connect_ = 0;
     pending_swaps_.clear();
+    swaps_reached_ = 0;
     initialized_ = false;
 }
 
@@ -312,9 +316,74 @@ void Gpu::reset() {
     scan_buffers_ = {};
     drc_connect_ = 0;
     pending_swaps_.clear();
+    swaps_reached_ = 0;
     attributes_ = {};
+    reported_.clear();
     initialized_ = false;
     main_core_ = 1;
+}
+
+void Gpu::run_hle(const latte::pm4::Packet& packet) {
+    using latte::pm4::Opcode;
+    const std::span<const u32> payload = packet.payload;
+
+    switch (static_cast<Opcode>(packet.header.opcode)) {
+        case Opcode::HleSwap:
+            ++swaps_reached_;
+            return;
+
+        case Opcode::HleClearColor: {
+            if (payload.size() != 4 + color_buffer_words || memory_ == nullptr) {
+                report(fmt::format("a clear packet of {} words, or no memory to clear in",
+                                   payload.size()));
+                return;
+            }
+            const std::array<f32, 4> rgba{std::bit_cast<f32>(payload[0]),
+                                          std::bit_cast<f32>(payload[1]),
+                                          std::bit_cast<f32>(payload[2]),
+                                          std::bit_cast<f32>(payload[3])};
+            const ColorBuffer buffer =
+                color_buffer_from_words(payload.subspan<4, color_buffer_words>());
+            report(clear_color_buffer(*memory_, buffer, rgba));
+            return;
+        }
+
+        case Opcode::HleCopyColorToScan: {
+            if (payload.size() != 1 + color_buffer_words || memory_ == nullptr) {
+                report(fmt::format("a scan-out copy packet of {} words, or no memory to copy in",
+                                   payload.size()));
+                return;
+            }
+            const std::optional<ScanTarget> target = scan_target_from_gx2(payload[0]);
+            if (!target.has_value()) {
+                report(fmt::format("a scan-out copy to scan target {}", payload[0]));
+                return;
+            }
+            const ScanBuffer& scan = scan_buffer(*target);
+            const std::optional<ppcaddr_t> frame = scan_frame(scan, swaps_reached_);
+            if (!frame.has_value()) {
+                report(fmt::format("a scan-out copy to the {}, which has no frame to copy into: "
+                                   "no scan buffer set, or one narrower than four bytes a pixel",
+                                   scan_target_name(*target)));
+                return;
+            }
+            const ColorBuffer buffer =
+                color_buffer_from_words(payload.subspan<1, color_buffer_words>());
+            report(copy_to_scan_frame(*memory_, buffer, scan, *frame));
+            return;
+        }
+
+        default:
+            report(
+                fmt::format("an emulator packet {:#04x} GX2 does not write", packet.header.opcode));
+            return;
+    }
+}
+
+void Gpu::report(const std::string& problem) {
+    if (!problem.empty() && reported_.insert(problem).second) {
+        WIIU_LOG_WARN(Gx2, "{} (said once)", problem);
+    }
 }
 
 void pad_command_buffer(std::vector<u32>& words) {
@@ -444,9 +513,11 @@ physical_address(const memory::Memory& memory, ppcaddr_t address, std::string_vi
     return physical;
 }
 
-/// Append packets for the calling core. Every handler that writes PM4 goes
-/// through here: a write can fill the main buffer and submit it, and a
-/// submission nobody arms the timer for would sit until the next flush.
+} // namespace
+
+// Every handler that writes PM4 goes through here: a write can fill the main
+// buffer and submit it, and a submission nobody arms the timer for would sit
+// until the next flush.
 bool emit(Call& call, std::span<const u32> words) {
     coreinit::Context& context = active();
     const u64 before = context.gpu.timeline().submitted();
@@ -456,6 +527,8 @@ bool emit(Call& call, std::span<const u32> words) {
     }
     return written;
 }
+
+namespace {
 
 /// Submit the main command buffer and keep the GPU's timer at the next
 /// deadline.
@@ -706,9 +779,11 @@ void gx2_wait_for_flip(Call& call) {
     context.scheduler.block(call.state, BlockReason::Event, flip_wait_object);
 }
 
-/// What `GX2SwapScanBuffers` leaves in the stream: a NOP carrying "SWAP", so
-/// the swap has a submission to belong to even when nothing was drawn, and so
-/// a PM4 capture shows where each frame ends.
+/// What `GX2SwapScanBuffers` leaves in the stream: the emulator's swap packet,
+/// carrying "SWAP". The swap then has a submission to belong to even when
+/// nothing was drawn, a PM4 capture shows where each frame ends, and the GPU
+/// counts it as it runs -- which is what tells a scan-out copy which frame it
+/// is filling.
 inline constexpr u32 swap_marker = 0x53574150;
 
 void gx2_swap_scan_buffers(Call& call) {
@@ -729,7 +804,7 @@ void gx2_swap_scan_buffers(Call& call) {
     }
 
     const std::array<u32, 2> marker{
-        latte::pm4::type3_header(latte::pm4::Opcode::Nop, 1),
+        latte::pm4::type3_header(latte::pm4::Opcode::HleSwap, 1),
         swap_marker,
     };
     static_cast<void>(emit(call, marker));

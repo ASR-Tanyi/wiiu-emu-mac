@@ -16,6 +16,12 @@ std::string_view opcode_name(u8 opcode) noexcept {
     switch (static_cast<Opcode>(opcode)) {
         case Opcode::Nop:
             return "NOP";
+        case Opcode::HleSwap:
+            return "HLE_SWAP";
+        case Opcode::HleClearColor:
+            return "HLE_CLEAR_COLOR";
+        case Opcode::HleCopyColorToScan:
+            return "HLE_COPY_COLOR_TO_SCAN";
         case Opcode::IndirectBufferEnd:
             return "INDIRECT_BUFFER_END";
         case Opcode::SetPredication:

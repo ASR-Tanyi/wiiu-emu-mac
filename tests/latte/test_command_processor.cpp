@@ -408,3 +408,49 @@ TEST_CASE_METHOD(MemoryFixture,
     CHECK(processor.stats().errors == 2);
     CHECK(processor.stats().memory_writes == 0);
 }
+
+TEST_CASE_METHOD(MemoryFixture,
+                 "the emulator's own packets go to their listener, in stream order",
+                 "[latte][cp]") {
+    std::vector<std::pair<u8, std::vector<u32>>> seen;
+    processor.set_hle_listener([&seen](const pm4::Packet& packet) {
+        seen.emplace_back(packet.header.opcode,
+                          std::vector<u32>(packet.payload.begin(), packet.payload.end()));
+    });
+
+    // One from a called buffer, as from a display list: GX2 writes those
+    // big-endian into the title's memory, and they arrive the same.
+    put(kMem1 + 0x1000, {type3_header(Opcode::HleCopyColorToScan, 2), 1, 0xABCD});
+    const std::vector<u32> stream{
+        type3_header(Opcode::HleClearColor, 1),
+        0x3F800000,
+        type3_header(Opcode::IndirectBufferPriv, 3),
+        0x1000,
+        0,
+        3,
+        type3_header(Opcode::HleSwap, 1),
+        0x53574150,
+    };
+    REQUIRE(processor.execute(stream));
+    REQUIRE(seen.size() == 3);
+    CHECK(seen[0].first == static_cast<u8>(Opcode::HleClearColor));
+    CHECK(seen[0].second == std::vector<u32>{0x3F800000});
+    CHECK(seen[1].first == static_cast<u8>(Opcode::HleCopyColorToScan));
+    CHECK(seen[1].second == std::vector<u32>{1, 0xABCD});
+    CHECK(seen[2].first == static_cast<u8>(Opcode::HleSwap));
+    CHECK(processor.stats().hle == 3);
+    CHECK(processor.stats().unknown == 0);
+}
+
+TEST_CASE_METHOD(Fixture,
+                 "with nobody listening, the emulator's packets are deferred",
+                 "[latte][cp]") {
+    const std::vector<u32> stream{type3_header(Opcode::HleSwap, 1), 0x53574150};
+    REQUIRE(processor.execute(stream));
+    CHECK(processor.stats().hle == 0);
+    CHECK(processor.stats().deferred == 1);
+    CHECK(processor.stats().errors == 0);
+    CHECK(pm4::opcode_name(static_cast<u8>(Opcode::HleSwap)) == "HLE_SWAP");
+    CHECK(pm4::is_hle_opcode(static_cast<u8>(Opcode::HleCopyColorToScan)));
+    CHECK_FALSE(pm4::is_hle_opcode(static_cast<u8>(Opcode::SurfaceBaseUpdate)));
+}

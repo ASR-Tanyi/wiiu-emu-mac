@@ -5,6 +5,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
+
 using namespace wiiu;
 using namespace wiiu::latte;
 
@@ -57,4 +59,49 @@ TEST_CASE("compressed formats are measured in blocks", "[latte][formats]") {
     CHECK(bits_per_element(0x01A) == 32);
     CHECK(bits_per_element(0x823) == 128);
     CHECK(bits_per_element(0x000) == 0);
+}
+
+TEST_CASE("a clear colour is encoded as the format stores it", "[latte][formats]") {
+    // Red first, a byte each; unorm rounds to nearest: 0.5 is 127.5, so 128.
+    const auto rgba8 = encode_color(0x01A, {0.0F, 0.5F, 1.0F, 0.25F});
+    REQUIRE(rgba8.has_value());
+    CHECK(rgba8->size == 4);
+    CHECK(rgba8->bytes[0] == 0);
+    CHECK(rgba8->bytes[1] == 128);
+    CHECK(rgba8->bytes[2] == 255);
+    CHECK(rgba8->bytes[3] == 64);
+
+    // Out of range clamps, and NaN is zero.
+    const auto clamped = encode_color(0x01A, {-1.0F, 2.0F, std::nanf(""), 1.0F});
+    REQUIRE(clamped.has_value());
+    CHECK(clamped->bytes[0] == 0);
+    CHECK(clamped->bytes[1] == 255);
+    CHECK(clamped->bytes[2] == 0);
+
+    // Narrower unorm formats take the first components.
+    const auto r8 = encode_color(0x001, {1.0F, 0.0F, 0.0F, 0.0F});
+    REQUIRE(r8.has_value());
+    CHECK(r8->size == 1);
+    CHECK(r8->bytes[0] == 255);
+    const auto rg8 = encode_color(0x007, {0.0F, 1.0F, 0.0F, 0.0F});
+    REQUIRE(rg8.has_value());
+    CHECK(rg8->size == 2);
+    CHECK(rg8->bytes[1] == 255);
+}
+
+TEST_CASE("an sRGB clear is encoded with the sRGB curve", "[latte][formats]") {
+    // Linear 0.5 is sRGB 0.7354, which is 187.5 of 255: 188. Alpha stays
+    // linear. The curve's ends are fixed points, and its linear toe is 12.92x.
+    const auto srgb = encode_color(0x41A, {0.5F, 0.0F, 1.0F, 0.5F});
+    REQUIRE(srgb.has_value());
+    CHECK(srgb->bytes[0] == 188);
+    CHECK(srgb->bytes[1] == 0);
+    CHECK(srgb->bytes[2] == 255);
+    CHECK(srgb->bytes[3] == 128);
+    CHECK(encode_color(0x41A, {0.002F, 0, 0, 0})->bytes[0] == 7); // 0.02584 * 255 = 6.59
+
+    // Formats whose byte order has not been checked are refused, not guessed.
+    CHECK_FALSE(encode_color(0x823, {0, 0, 0, 0}).has_value()); // FLOAT_R32_G32_B32_A32
+    CHECK_FALSE(encode_color(0x019, {0, 0, 0, 0}).has_value()); // UNORM_R10_G10_B10_A2
+    CHECK_FALSE(encode_color(0x11A, {0, 0, 0, 0}).has_value()); // UINT_R8_G8_B8_A8
 }

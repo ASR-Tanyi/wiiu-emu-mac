@@ -13,6 +13,9 @@
 //     lists work, so a title's frame is usually a short ring stream calling a
 //     long buffer the title built itself.
 //
+//   * **The emulator's own.** The `Hle*` opcodes (pm4.hpp) are handed, whole,
+//     to a listener -- GX2 (8.1), which wrote them and knows what they carry.
+//
 //   * **Writes back.** `MEM_WRITE` and `EVENT_WRITE_EOP` put a value -- a
 //     fence, a timestamp, the GPU's clock -- into guest memory, which is how a
 //     title learns the GPU got somewhere. They are applied as the packet runs;
@@ -99,6 +102,9 @@ struct CommandProcessorStats {
     /// Opcodes this processor has no name for.
     u64 unknown = 0;
 
+    /// The emulator's own packets, handed to the HLE listener.
+    u64 hle = 0;
+
     /// Values written into guest memory by `MEM_WRITE` and `EVENT_WRITE_EOP`.
     u64 memory_writes = 0;
 
@@ -118,6 +124,10 @@ public:
     /// packet carried (or wrote). GX2 (8.1) is what listens.
     using InterruptListener = std::function<void(u32 event, u64 value)>;
 
+    /// One of the emulator's own packets (`pm4::Opcode::Hle*`). The payload
+    /// is a view into the stream, valid only for the call.
+    using HleListener = std::function<void(const pm4::Packet&)>;
+
     explicit CommandProcessor(RegisterFile& registers) : registers_(&registers) {}
 
     /// Guest memory, which `INDIRECT_BUFFER` and `DRAW_INDEX_2` read and
@@ -130,6 +140,8 @@ public:
     void set_interrupt_listener(InterruptListener listener) {
         interrupt_listener_ = std::move(listener);
     }
+
+    void set_hle_listener(HleListener listener) { hle_listener_ = std::move(listener); }
 
     /// The "GPU clock" a packet may ask to have written: the guest timebase
     /// at retirement (ADR-004), set by whoever runs the stream. Never the
@@ -176,6 +188,7 @@ private:
     memory::Memory* memory_ = nullptr;
     DrawListener draw_listener_;
     InterruptListener interrupt_listener_;
+    HleListener hle_listener_;
     u64 clock_ = 0;
 
     u32 instances_ = 1;

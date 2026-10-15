@@ -13,7 +13,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstring>
 #include <set>
+#include <vector>
 
 using namespace wiiu;
 using namespace wiiu::latte;
@@ -181,4 +183,105 @@ TEST_CASE("a GX2 swizzle splits into a pipe and a bank", "[latte][surface]") {
         CHECK(split.bank == ((base >> 1) & 3));
     }
     CHECK(split_swizzle(0x000D0000).pipe == 0); // bits outside the second byte do nothing
+}
+
+TEST_CASE("the detiler puts every element where element_offset says it is", "[latte][surface]") {
+    // The detiler's fast path places whole micro-tiles by one tile's
+    // pattern; this holds it, element by element, to the slow way. The level
+    // is filled with noise, so an element read from the wrong place shows.
+    struct Case {
+        TileMode mode;
+        u32 format;
+        u32 width;
+        u32 height;
+        u32 slices;
+        u32 slice;
+        u32 swizzle;
+    };
+
+    const Case cases[] = {
+        {TileMode::LinearAligned, kRgba8, 100, 37, 1, 0, 0},
+        {TileMode::LinearSpecial, kRgba8, 5, 3, 1, 0, 0},
+        {TileMode::Tiled1DThin1, kRgba8, 100, 37, 1, 0, 0},
+        {TileMode::Tiled1DThin1, 0x001, 64, 40, 3, 2, 0},
+        {TileMode::Tiled2DThin1, kRgba8, 1280, 720, 1, 0, 0},
+        {TileMode::Tiled2DThin1, kRgba8, 300, 200, 1, 0, 0x500},
+        {TileMode::Tiled2DThin1, kRgba8, 256, 128, 4, 3, 0x700},
+        {TileMode::Tiled2DThin1, 0x007, 200, 64, 1, 0, 0x300},
+        {TileMode::Tiled2DThin1, 0x001, 130, 70, 1, 0, 0x100},
+        {TileMode::Tiled2BThin1, kRgba8, 512, 64, 1, 0, 0x300},
+        {TileMode::Tiled2DThin2, kRgba8, 256, 256, 1, 0, 0x200},
+        {TileMode::Tiled3DThin1, kRgba8, 256, 128, 2, 1, 0x400},
+        {TileMode::Tiled2DThin1, kBc1, 512, 256, 1, 0, 0},
+        // Past the fast path: 64-bit elements split across pipes, and thick
+        // modes interleave slices. These take the slow way.
+        {TileMode::Tiled2DThin1, 0x01F, 128, 64, 1, 0, 0x700},
+        {TileMode::Tiled2DThick, kRgba8, 64, 64, 8, 5, 0},
+        {TileMode::Tiled1DThick, kRgba8, 32, 32, 4, 1, 0},
+    };
+
+    for (const Case& c : cases) {
+        SurfaceDesc desc = surface(c.mode, c.format, c.width, c.height);
+        desc.slices = c.slices;
+        const auto layout = compute_layout(desc);
+        REQUIRE(layout.has_value());
+        const BankPipeSwizzle swizzle = split_swizzle(c.swizzle);
+        const u32 bytes = layout->bits_per_element / 8;
+
+        std::vector<u8> level(layout->size);
+        u32 noise = 0x12345678;
+        for (u8& byte : level) {
+            noise = (noise * 1664525U) + 1013904223U;
+            byte = static_cast<u8>(noise >> 24);
+        }
+
+        const Extent extent = level_extent(desc);
+        std::vector<u8> rows(static_cast<std::size_t>(extent.width) * extent.height * bytes);
+        REQUIRE(detile(desc, *layout, level, c.slice, 0, swizzle, rows));
+
+        u64 wrong = 0;
+        for (u32 y = 0; y < extent.height; ++y) {
+            for (u32 x = 0; x < extent.width; ++x) {
+                const u64 offset =
+                    element_offset(desc, *layout, x, y, c.slice, 0, swizzle.pipe, swizzle.bank);
+                const u64 at = ((static_cast<u64>(y) * extent.width) + x) * bytes;
+                if (std::memcmp(rows.data() + at, level.data() + offset, bytes) != 0) {
+                    ++wrong;
+                }
+            }
+        }
+        INFO(tile_mode_name(c.mode) << " " << c.width << "x" << c.height << " format " << c.format
+                                    << " slice " << c.slice << " swizzle " << c.swizzle);
+        CHECK(wrong == 0);
+    }
+}
+
+TEST_CASE("the detiler refuses what it cannot fit", "[latte][surface]") {
+    const SurfaceDesc desc = surface(TileMode::Tiled2DThin1, kRgba8, 64, 64);
+    const auto layout = compute_layout(desc);
+    REQUIRE(layout.has_value());
+    const std::vector<u8> level(layout->size);
+
+    std::vector<u8> small(64 * 63 * 4);
+    CHECK_FALSE(detile(desc, *layout, level, 0, 0, {}, small));
+
+    std::vector<u8> rows(64 * 64 * 4);
+    const std::vector<u8> short_level(layout->size / 2);
+    CHECK_FALSE(detile(desc, *layout, short_level, 0, 0, {}, rows));
+    CHECK(detile(desc, *layout, level, 0, 0, {}, rows));
+}
+
+TEST_CASE("a level's extent is in elements, before padding", "[latte][surface]") {
+    SurfaceDesc desc = surface(TileMode::Tiled2DThin1, kRgba8, 100, 37);
+    CHECK(level_extent(desc).width == 100);
+    CHECK(level_extent(desc).height == 37);
+    desc.mip_level = 3;
+    CHECK(level_extent(desc).width == 12);
+    CHECK(level_extent(desc).height == 4);
+    desc.mip_level = 9;
+    CHECK(level_extent(desc).width == 1);
+
+    const SurfaceDesc bc1 = surface(TileMode::Tiled2DThin1, kBc1, 30, 9);
+    CHECK(level_extent(bc1).width == 8); // 4x4 blocks, rounded up
+    CHECK(level_extent(bc1).height == 3);
 }

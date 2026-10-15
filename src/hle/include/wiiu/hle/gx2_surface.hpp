@@ -1,5 +1,6 @@
-// Phase 8.1 — GX2's surfaces: how big one is, and the registers that
-// describe a colour buffer.
+// Phase 8.1 — GX2's surfaces: how big one is, the registers that describe a
+// colour buffer, and the two things done to one before anything is drawn --
+// clearing it, and copying it out to a scan buffer.
 //
 // Every image GX2 deals in -- texture, colour buffer, depth buffer -- is a
 // `GX2Surface`. The title fills in what it is (dimension, size, format,
@@ -37,15 +38,29 @@
 // overflow at 512 MiB, and no case for the multisampled dimensions, which it
 // sizes at zero); there this follows decaf. Where the two disagree about the
 // colour-buffer registers is set out at `color_buffer_registers`.
+//
+// `GX2ClearColor` and `GX2CopyColorBufferToScanBuffer` are GPU work, so
+// neither touches memory when called: each writes one of the emulator's own
+// packets carrying a snapshot of the colour buffer as it was at the call --
+// the whole structure, so a title free to reuse it afterwards changes
+// nothing -- and the work happens when the packet runs, on the CPU, in
+// stream order (ADR-004). That is `clear_color_buffer` and
+// `copy_to_scan_frame` below, which is all of it that needs guest memory.
+// The snapshot keeps the title's virtual addresses: these packets are the
+// emulator's and no hardware reads them.
 #pragma once
 
 #include <wiiu/common/endian.hpp>
 #include <wiiu/common/types.hpp>
+#include <wiiu/hle/gx2.hpp>
 #include <wiiu/latte/surface.hpp>
+#include <wiiu/memory/memory.hpp>
 
 #include <array>
 #include <cstddef>
 #include <optional>
+#include <span>
+#include <string>
 
 namespace wiiu::hle {
 
@@ -141,10 +156,24 @@ static_assert(offsetof(ColorBuffer, aa_buffer) == 0x80);
 static_assert(offsetof(ColorBuffer, cb_color_size) == 0x88);
 static_assert(offsetof(ColorBuffer, cmask_offset) == 0x98);
 
-/// How level `level` of a surface is laid out: GX2's reading of its
-/// dimension, samples and use, handed to Latte's layout. Nothing for a
-/// format with no element size, or a description addrlib refuses.
+/// Level `level` of a surface as Latte's layout reads it: GX2's dimension,
+/// samples and use turned into width, height, slices and flags.
+[[nodiscard]] latte::SurfaceDesc surface_desc(const Surface& surface, u32 level);
+
+/// How level `level` of a surface is laid out. Nothing for a format with no
+/// element size, or a description addrlib refuses.
 [[nodiscard]] std::optional<latte::SurfaceLayout> surface_layout(const Surface& surface, u32 level);
+
+/// Where level `level` starts in guest memory: `image` for level 0,
+/// `mipmaps` for level 1, and `mipmaps` plus the level's offset after that.
+/// Nothing for a level the surface has no memory for.
+[[nodiscard]] std::optional<ppcaddr_t> level_address(const Surface& surface, u32 level);
+
+/// The bank and pipe swizzle that applies to level `level`: the surface's
+/// own, in the swizzle word's second byte, up to the first level that is not
+/// macro-tiled (its third byte), and none from there -- GX2's
+/// `GX2GetSurfaceSwizzleOffset`.
+[[nodiscard]] latte::BankPipeSwizzle level_swizzle(const Surface& surface, u32 level);
 
 /// `GX2CalcSurfaceSizeAndAlignment`. Returns false, having logged why, if a
 /// level could not be laid out -- and then the surface is left exactly as it
@@ -179,8 +208,43 @@ struct ColorBufferRegisters {
 /// Nothing, having logged why, if the viewed level cannot be laid out.
 [[nodiscard]] std::optional<ColorBufferRegisters> color_buffer_registers(const ColorBuffer& buffer);
 
-/// Register `GX2CalcSurfaceSizeAndAlignment` and `GX2InitColorBufferRegs`.
-/// Called by `register_gx2`.
+/// Words a `ColorBuffer` takes in a packet: the structure, field by field.
+inline constexpr u32 color_buffer_words = sizeof(ColorBuffer) / 4;
+
+[[nodiscard]] std::array<u32, color_buffer_words> color_buffer_to_words(const ColorBuffer& buffer);
+
+[[nodiscard]] ColorBuffer color_buffer_from_words(std::span<const u32, color_buffer_words> words);
+
+/// What `GX2ClearColor`'s packet does when it runs: every element of the
+/// viewed level and slices becomes the colour, encoded for the format
+/// (`latte::encode_color`). Returns what went wrong, or nothing.
+///
+/// A clear writes one value everywhere, so where each element sits does not
+/// matter: in the thin modes a slice is one run of bytes, and filling the run
+/// fills every element of it, padding and all. Thick modes interleave four
+/// slices, and are not cleared yet.
+[[nodiscard]] std::string clear_color_buffer(memory::Memory& memory,
+                                             const ColorBuffer& buffer,
+                                             const std::array<f32, 4>& rgba);
+
+/// What `GX2CopyColorBufferToScanBuffer`'s packet does when it runs: the
+/// viewed level and first slice, detiled (`latte::detile`) into `frame` of
+/// the scan buffer. Returns what went wrong, or nothing.
+///
+/// The formats have to agree on their colour format and element size --
+/// unorm and sRGB 8_8_8_8 are the same bytes, and the scan-out does not
+/// convert. A buffer of another size is scaled to the frame by nearest
+/// pixel, which stands in for whatever filter the hardware's copy uses -- a
+/// WHB title never asks, its colour buffers being its frames' size. A
+/// multisampled buffer shows its first sample rather than a resolve.
+[[nodiscard]] std::string copy_to_scan_frame(memory::Memory& memory,
+                                             const ColorBuffer& buffer,
+                                             const ScanBuffer& scan,
+                                             ppcaddr_t frame);
+
+/// Register `GX2CalcSurfaceSizeAndAlignment`, `GX2InitColorBufferRegs`,
+/// `GX2ClearColor` and `GX2CopyColorBufferToScanBuffer`. Called by
+/// `register_gx2`.
 void register_gx2_surface(Registry& registry);
 
 } // namespace gx2

@@ -85,7 +85,24 @@ enum class Opcode : u8 {
     SetCtlConst = 0x6F,
     StreamOutBaseUpdate = 0x72,
     SurfaceBaseUpdate = 0x73,
+
+    // The emulator's own commands, from 0xF0 up -- R600's highest opcode is
+    // 0x73, so no packet meant for the hardware is one. Each stands for work GX2
+    // does on hardware with a draw, a DMA or the display controller, and
+    // which the emulator does in one step when the packet runs: in stream
+    // order, on the guest's clock (ADR-004), from a display list as well as
+    // the ring. Their payloads are GX2's business (8.1); the command processor
+    // only hands them over. decaf and Cemu each have packets of their own for
+    // the same jobs.
+    HleSwap = 0xF0,            ///< GX2SwapScanBuffers' place in the stream
+    HleClearColor = 0xF1,      ///< GX2ClearColor
+    HleCopyColorToScan = 0xF2, ///< GX2CopyColorBufferToScanBuffer
 };
+
+/// Whether an opcode is one of the emulator's own (`Hle*`).
+[[nodiscard]] constexpr bool is_hle_opcode(u8 opcode) noexcept {
+    return opcode >= 0xF0;
+}
 
 /// The opcode's name, or empty for a number this table does not know -- so
 /// a log line can say `0x5D` rather than inventing a name for it.

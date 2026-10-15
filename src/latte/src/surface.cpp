@@ -4,7 +4,9 @@
 
 #include <addrlib/addrinterface.h>
 #include <algorithm>
+#include <array>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 namespace wiiu::latte {
@@ -214,6 +216,117 @@ u64 element_offset(const SurfaceDesc& surface,
     output.size = sizeof(output);
     static_cast<void>(AddrComputeSurfaceAddrFromCoord(handle(), &input, &output));
     return output.addr;
+}
+
+Extent level_extent(const SurfaceDesc& surface) noexcept {
+    const u32 block = is_block_compressed(surface.format) ? 4 : 1;
+    const u32 width = std::max<u32>(1, surface.width >> surface.mip_level);
+    const u32 height = std::max<u32>(1, surface.height >> surface.mip_level);
+    return Extent{.width = (width + block - 1) / block, .height = (height + block - 1) / block};
+}
+
+namespace {
+
+/// Whether every 8x8 micro-tile of the level sits in one piece, laid out the
+/// same way as every other -- so one tile's pattern places them all.
+[[nodiscard]] bool micro_tiles_are_whole(const SurfaceDesc& surface,
+                                         const SurfaceLayout& layout) noexcept {
+    switch (layout.tile_mode) {
+        case TileMode::LinearGeneral:
+        case TileMode::LinearAligned:
+        case TileMode::LinearSpecial:
+        case TileMode::Tiled1DThin1:
+            // Linear is a pitch and nothing else, and a 1D micro-tile is
+            // always stored whole.
+            return true;
+        case TileMode::Tiled2DThin1:
+        case TileMode::Tiled2DThin2:
+        case TileMode::Tiled2DThin4:
+        case TileMode::Tiled2BThin1:
+        case TileMode::Tiled2BThin2:
+        case TileMode::Tiled2BThin4:
+        case TileMode::Tiled3DThin1:
+        case TileMode::Tiled3BThin1: {
+            // Bank and pipe are chosen per 256-byte group; a micro-tile that
+            // fits in one is never split between them.
+            const u64 tile_bits =
+                64ULL * layout.bits_per_element * std::max<u32>(1, surface.samples);
+            return tile_bits <= 256 * 8;
+        }
+        case TileMode::Tiled1DThick:
+        case TileMode::Tiled2DThick:
+        case TileMode::Tiled2BThick:
+        case TileMode::Tiled3DThick:
+        case TileMode::Tiled3BThick:
+            return false;
+    }
+    return false;
+}
+
+} // namespace
+
+bool detile(const SurfaceDesc& surface,
+            const SurfaceLayout& layout,
+            std::span<const u8> level,
+            u32 slice,
+            u32 sample,
+            BankPipeSwizzle swizzle,
+            std::span<u8> rows) {
+    const Extent extent = level_extent(surface);
+    const u32 bytes = layout.bits_per_element / 8;
+    if (bytes == 0 || rows.size() < static_cast<u64>(extent.width) * extent.height * bytes) {
+        return false;
+    }
+
+    const auto offset_of = [&](u32 x, u32 y) {
+        return element_offset(surface, layout, x, y, slice, sample, swizzle.pipe, swizzle.bank);
+    };
+    const auto place = [&](u32 x, u32 y, u64 offset) {
+        if (offset + bytes > level.size()) {
+            return false;
+        }
+        const u64 at = ((static_cast<u64>(y) * extent.width) + x) * bytes;
+        std::memcpy(rows.data() + at, level.data() + offset, bytes);
+        return true;
+    };
+
+    if (!micro_tiles_are_whole(surface, layout)) {
+        for (u32 y = 0; y < extent.height; ++y) {
+            for (u32 x = 0; x < extent.width; ++x) {
+                if (!place(x, y, offset_of(x, y))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Where each element of a micro-tile is, from the tile's corner. The
+    // corner is its first element in every mode, so these are never negative.
+    constexpr u32 tile = 8;
+    std::array<u64, tile * tile> pattern{};
+    const u64 origin = offset_of(0, 0);
+    for (u32 j = 0; j < tile; ++j) {
+        for (u32 i = 0; i < tile; ++i) {
+            pattern[(j * tile) + i] = offset_of(i, j) - origin;
+        }
+    }
+
+    for (u32 ty = 0; ty < extent.height; ty += tile) {
+        for (u32 tx = 0; tx < extent.width; tx += tile) {
+            const u64 base = offset_of(tx, ty);
+            const u32 rows_here = std::min(tile, extent.height - ty);
+            const u32 columns_here = std::min(tile, extent.width - tx);
+            for (u32 j = 0; j < rows_here; ++j) {
+                for (u32 i = 0; i < columns_here; ++i) {
+                    if (!place(tx + i, ty + j, base + pattern[(j * tile) + i])) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
 }
 
 BankPipeSwizzle split_swizzle(u32 gx2_swizzle) noexcept {
