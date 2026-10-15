@@ -735,3 +735,87 @@ TEST_CASE_METHOD(Gx2Fixture,
     CHECK(call("GX2SetDRCConnectCallback", {0, 0}) == kOther);
     CHECK(os.gpu.drc_connect_callback() == 0);
 }
+
+// --------------------------------------------------------------------------
+// A flip, shown
+// --------------------------------------------------------------------------
+
+TEST_CASE("a scan buffer's frames rotate, one per flip", "[hle][gx2]") {
+    gx2::ScanBuffer buffer;
+    buffer.address = 0xF4000000;
+    buffer.surface_format = kRgba8;
+    buffer.buffering_mode = kDouble;
+    buffer.geometry = *gx2::tv_scan_geometry(3);
+    constexpr u32 kFrame = 1280 * 720 * 4;
+
+    CHECK(*gx2::scan_frame(buffer, 0) == 0xF4000000);
+    CHECK(*gx2::scan_frame(buffer, 1) == 0xF4000000 + kFrame);
+    CHECK(*gx2::scan_frame(buffer, 2) == 0xF4000000);
+
+    buffer.buffering_mode = 3;
+    CHECK(*gx2::scan_frame(buffer, 2) == 0xF4000000 + (2 * kFrame));
+
+    // Too narrow to show as RGBA8, or not set: nothing.
+    buffer.surface_format = 0x008; // UNORM_R5_G6_B5
+    CHECK_FALSE(gx2::scan_frame(buffer, 0).has_value());
+    CHECK_FALSE(gx2::scan_frame(gx2::ScanBuffer{}, 0).has_value());
+}
+
+TEST_CASE_METHOD(Gx2Fixture,
+                 "a flip shows each output's frame through the screens' hook",
+                 "[hle][gx2]") {
+    constexpr ppcaddr_t kTvScan = kMem1 + 0x100000;
+    constexpr ppcaddr_t kDrcScan = kMem1 + 0x900000;
+    std::vector<coreinit::ScreenFlip> shown;
+    os.screens.on_flip = [&shown](const coreinit::ScreenFlip& flip, const memory::Memory&) {
+        shown.push_back(flip);
+        return true;
+    };
+
+    init();
+    call("GX2SetTVBuffer", {kTvScan, 0x708000, 3, kRgba8, kDouble});
+    call("GX2SetDRCBuffer", {kDrcScan, 0x32A000, 1, kRgba8, kDouble});
+    call("GX2SetTVEnable", {1});
+
+    frame(*this, 1);
+    advance_to(gx2::vsync_tick(1) - 1);
+    CHECK(shown.empty()); // nothing until the flip
+
+    advance_to(gx2::vsync_tick(1));
+    REQUIRE(shown.size() == 2);
+    // The GamePad first, so the TV's present carries both.
+    CHECK(shown[0].screen == coreinit::ScreenId::Drc);
+    CHECK(shown[0].address == kDrcScan);
+    CHECK(shown[0].geometry.pitch == 864);
+    CHECK_FALSE(shown[0].enabled);
+    CHECK(shown[1].screen == coreinit::ScreenId::Tv);
+    CHECK(shown[1].address == kTvScan);
+    CHECK(shown[1].geometry.width == 1280);
+    CHECK(shown[1].enabled);
+    CHECK(shown[1].flip_count == 1);
+
+    // The next flip shows the other frame.
+    frame(*this, 2);
+    advance_to(gx2::vsync_tick(2));
+    REQUIRE(shown.size() == 4);
+    CHECK(shown[3].address == kTvScan + (1280 * 720 * 4));
+    CHECK(shown[3].flip_count == 2);
+
+    // A vsync with nothing to flip shows nothing.
+    advance_to(gx2::vsync_tick(3));
+    CHECK(shown.size() == 4);
+}
+
+TEST_CASE_METHOD(Gx2Fixture, "closing the window during a flip stops the title", "[hle][gx2]") {
+    os.screens.on_flip = [](const coreinit::ScreenFlip&, const memory::Memory&) {
+        return false; // the window was closed
+    };
+    init();
+    call("GX2SetTVBuffer", {kMem1 + 0x100000, 0x708000, 3, kRgba8, kDouble});
+    frame(*this, 1);
+
+    CHECK_FALSE(state.halted);
+    advance_to(gx2::vsync_tick(1));
+    CHECK(os.screens.stop_requested);
+    CHECK(state.halted);
+}

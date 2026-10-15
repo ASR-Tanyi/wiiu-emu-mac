@@ -61,6 +61,16 @@ u32 scan_buffer_bytes(const ScanGeometry& geometry,
            scan_buffer_count(buffering_mode);
 }
 
+std::optional<ppcaddr_t> scan_frame(const ScanBuffer& buffer, u32 flip_index) noexcept {
+    const u32 bytes = latte::bytes_per_element(buffer.surface_format);
+    const u32 frames = scan_buffer_count(buffer.buffering_mode);
+    if (!buffer.configured() || buffer.geometry.height == 0 || bytes < 4 || frames == 0) {
+        return std::nullopt;
+    }
+    const u32 stride = buffer.geometry.pitch * buffer.geometry.height * bytes;
+    return buffer.address + ((flip_index % frames) * stride);
+}
+
 namespace {
 
 [[nodiscard]] coreinit::Context& active() {

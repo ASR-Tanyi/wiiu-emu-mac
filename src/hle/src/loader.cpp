@@ -249,6 +249,15 @@ RunReport run(cpu::Interpreter& interpreter,
             break;
         }
 
+        // A halt from a timer -- the window closed during a GX2 flip -- can
+        // land while nothing is runnable, and the idle skip below would then
+        // keep skipping to the next vsync rather than ever reaching a step
+        // that would notice.
+        if (state.halted) {
+            report.outcome = RunOutcome::Halted;
+            break;
+        }
+
         if (recording != nullptr) {
             recording->tick(state, &memory);
             if (recording->stop_requested()) {

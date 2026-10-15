@@ -219,8 +219,17 @@ public:
 
     /// Pick the next thread and switch to it if that is not the current one.
     /// Also wakes any sleeper whose deadline has passed, and fires any timer
-    /// that has come due.
+    /// that has come due -- and halts the core if one of them asked to stop.
     bool reschedule(cpu::CoreState& state);
+
+    /// Ask for the run to stop, from somewhere with no core to halt: a timer
+    /// callback. An HLE call halts its own core; a GX2 flip happens at a
+    /// vsync, and the window being closed during one has to end the run all
+    /// the same. The next `reschedule` halts the core, after the switch, so
+    /// whichever thread it lands on stops.
+    void request_halt() noexcept { halt_requested_ = true; }
+
+    [[nodiscard]] bool halt_requested() const noexcept { return halt_requested_; }
 
     // --- deadlines --------------------------------------------------------
     //
@@ -300,6 +309,9 @@ private:
     /// first, and among equals whoever has been waiting longest.
     [[nodiscard]] static bool waits_before(const Thread& left, const Thread& right) noexcept;
 
+    /// `reschedule` without the halt.
+    bool switch_threads(cpu::CoreState& state);
+
     ExitCallback on_exit_;
     std::map<u32, Thread> threads_;
     std::map<u32, Timer> timers_;
@@ -310,6 +322,7 @@ private:
     u64 switches_ = 0;
     u64 skipped_ticks_ = 0;
     bool servicing_timers_ = false;
+    bool halt_requested_ = false;
 
 public:
     /// Timebase ticks skipped rather than emulated (**P2**). A counter rather

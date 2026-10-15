@@ -18,6 +18,7 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <initializer_list>
 #include <string>
 #include <vector>
@@ -798,4 +799,32 @@ TEST_CASE_METHOD(CallbackFixture,
     // completion later that is never going to arrive.
     CHECK(os.scheduler.timer_count() == 0U);
     CHECK(os.busy_fs_blocks.empty());
+}
+
+TEST_CASE_METHOD(CallbackFixture,
+                 "a halt asked for by a timer ends the run even with nothing runnable",
+                 "[hle][callback]") {
+    // The shape of a window closed during a GX2 flip: the flip happens at a
+    // vsync, from a timer, while the title's thread waits -- here, asleep for
+    // far longer than the run -- and vsync keeps coming. Without the run loop
+    // looking at the halt itself, the idle skip carries on from vsync to vsync
+    // and the run ends "deadlocked" instead of stopped.
+    write_main_program("OSSleepTicks", {li(3, 0x7FFF), li(4, 0)});
+
+    constexpr u32 kTimer = 0xFFFC0000;
+    bool asked = false;
+    std::function<void(u64)> tick;
+    tick = [&](u64 now) {
+        if (!asked) {
+            asked = true;
+            os.scheduler.request_halt();
+        }
+        os.scheduler.set_timer(kTimer, now + 1000, tick);
+    };
+    os.scheduler.set_timer(kTimer, 1000, tick);
+
+    const RunReport report = run_it();
+    INFO("outcome: " << run_outcome_name(report.outcome));
+    CHECK(asked);
+    CHECK(report.outcome == RunOutcome::Halted);
 }

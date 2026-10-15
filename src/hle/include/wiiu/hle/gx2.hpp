@@ -244,6 +244,14 @@ struct ScanBuffer {
     [[nodiscard]] bool configured() const noexcept { return address != 0; }
 };
 
+/// Where frame `flip_index` (counting flips from zero) of a scan buffer is:
+/// the frames rotate, one per flip, as many as the buffering mode holds.
+/// Nothing for a buffer that is not set, or whose format is narrower than the
+/// four bytes a pixel is presented from -- a 16-bit scan buffer is legal and
+/// nobody uses one, and showing it as RGBA8 would read past its frames.
+[[nodiscard]] std::optional<ppcaddr_t> scan_frame(const ScanBuffer& buffer,
+                                                  u32 flip_index) noexcept;
+
 /// What the TV and the GamePad report about themselves. The console reports
 /// what its outputs are connected to; here that is a 1080p, 16:9 TV and one
 /// GamePad, which is what Cemu and decaf report too.

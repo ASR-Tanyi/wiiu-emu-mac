@@ -358,9 +358,44 @@ void raise_event(coreinit::Context& context, EventType type) {
         arguments));
 }
 
+/// Hand the frames a flip shows to the frontend, through the hook OSScreen's
+/// flips use (6.8): the same frames, read from guest memory, presented the
+/// same way.
+void present_flip(coreinit::Context& context) {
+    if (!context.screens.on_flip || context.memory == nullptr) {
+        return;
+    }
+    const u32 flips = context.gpu.swap_status().flips;
+
+    // The GamePad first. The frontend presents when the TV's frame arrives,
+    // so this way that present carries the GamePad's new frame as well.
+    for (const ScanTarget target : {ScanTarget::Drc, ScanTarget::Tv}) {
+        const ScanBuffer& buffer = context.gpu.scan_buffer(target);
+        const std::optional<ppcaddr_t> frame = scan_frame(buffer, flips - 1);
+        if (!frame.has_value()) {
+            continue;
+        }
+        const coreinit::ScreenFlip flip{
+            .screen = target == ScanTarget::Tv ? coreinit::ScreenId::Tv : coreinit::ScreenId::Drc,
+            .address = *frame,
+            .geometry = {buffer.geometry.width, buffer.geometry.height, buffer.geometry.pitch},
+            .enabled = buffer.enabled,
+            .flip_count = flips,
+        };
+        if (!context.screens.on_flip(flip, *context.memory)) {
+            // The window was closed. There is no guest call to halt the core
+            // from at a vsync; the scheduler halts it at the next switch.
+            context.screens.stop_requested = true;
+            context.scheduler.request_halt();
+            return;
+        }
+    }
+}
+
 void on_vsync(coreinit::Context& context, u64 index) {
     if (context.gpu.vsync(index)) {
         static_cast<void>(context.scheduler.unblock_all(flip_wait_object));
+        present_flip(context);
         raise_event(context, EventType::Flip);
     }
     // The vsync may have retired submissions itself.

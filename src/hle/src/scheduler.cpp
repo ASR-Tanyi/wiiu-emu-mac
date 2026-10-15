@@ -64,6 +64,7 @@ void Scheduler::reset() {
     next_block_sequence_ = 1;
     next_generation_ = 1;
     servicing_timers_ = false;
+    halt_requested_ = false;
 }
 
 u32 Scheduler::create(u32 handle,
@@ -394,6 +395,17 @@ u64 Scheduler::idle_skip_ticks(const cpu::CoreState& state) const noexcept {
 }
 
 bool Scheduler::reschedule(cpu::CoreState& state) {
+    const bool switched = switch_threads(state);
+
+    // After the switch, not before: a switch replaces the whole core state,
+    // and the flag would go with it.
+    if (halt_requested_) {
+        state.halted = true;
+    }
+    return switched;
+}
+
+bool Scheduler::switch_threads(cpu::CoreState& state) {
     static_cast<void>(service_timers(state.timebase));
     wake_sleepers(state.timebase);
 
