@@ -11,8 +11,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace wiiu;
@@ -280,4 +282,129 @@ TEST_CASE_METHOD(Fixture, "a stream that cannot be framed stops and says so", "[
     CHECK_FALSE(processor.execute(stream));
     CHECK(draws.size() == 1); // what came before still happened
     CHECK(processor.last_error().find("word 3") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Writes back to guest memory (8.2)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a GPU write is swapped the way its address says", "[latte][cp]") {
+    constexpr u64 kValue = 0x1122334455667788ULL;
+
+    // No swap: the GPU's own little-endian order.
+    CHECK(encode_write(kValue, 4, 0) ==
+          std::array<u8, 8>{0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11});
+    // Within 32 bits, on a 32-bit write: big-endian, which is what GX2 asks
+    // for so that the guest reads the value back as written.
+    const auto swapped32 = encode_write(kValue, 4, 2);
+    CHECK(swapped32[0] == 0x55);
+    CHECK(swapped32[3] == 0x88);
+    // Within 64 bits, on a 64-bit write: the whole value big-endian.
+    const auto swapped64 = encode_write(kValue, 8, 3);
+    CHECK(swapped64[0] == 0x11);
+    CHECK(swapped64[7] == 0x88);
+    // Within 16 bits: pairs.
+    const auto swapped16 = encode_write(kValue, 4, 1);
+    CHECK(swapped16[0] == 0x77);
+    CHECK(swapped16[1] == 0x88);
+    // A unit wider than the write is the whole write.
+    const auto wide = encode_write(0xAABBCCDD, 4, 3);
+    CHECK(wide[0] == 0xAA);
+    CHECK(wide[3] == 0xDD);
+}
+
+TEST_CASE_METHOD(MemoryFixture, "MEM_WRITE puts a value in guest memory", "[latte][cp]") {
+    // A 32-bit write to physical 0x4000 with the 32-bit swap: the guest reads
+    // exactly the value the packet carried.
+    const std::vector<u32> stream{
+        type3_header(Opcode::MemWrite, 4),
+        0x4000 | 2,
+        1U << 18,
+        0xDEADBEEF,
+        0,
+    };
+    REQUIRE(processor.execute(stream));
+    CHECK(memory.read<u32>(kMem1 + 0x4000) == 0xDEADBEEF);
+    CHECK(memory.read<u32>(kMem1 + 0x4004) == 0); // 32 bits, not 64
+    CHECK(processor.stats().memory_writes == 1);
+}
+
+TEST_CASE_METHOD(MemoryFixture, "MEM_WRITE of the clock writes the guest's clock", "[latte][cp]") {
+    // ADR-004: the "GPU clock" is the timebase the stream was run at, so two
+    // runs of the same stream write the same value.
+    processor.set_clock(0x0000000123456789ULL);
+    const std::vector<u32> stream{
+        type3_header(Opcode::MemWrite, 4),
+        0x4100 | 3,
+        1U << 16,
+        0,
+        0,
+    };
+    REQUIRE(processor.execute(stream));
+    CHECK(memory.read<u64>(kMem1 + 0x4100) == 0x0000000123456789ULL);
+}
+
+TEST_CASE_METHOD(MemoryFixture, "an end-of-pipe event writes and interrupts", "[latte][cp]") {
+    std::vector<std::pair<u32, u64>> interrupts;
+    processor.set_interrupt_listener(
+        [&interrupts](u32 event, u64 value) { interrupts.emplace_back(event, value); });
+
+    // 64-bit data (select 2), interrupt (select 2), 64-bit swap: a timestamp
+    // the way GX2 writes one.
+    const u32 address_hi = (2U << 29) | (2U << 24);
+    const std::vector<u32> stream{
+        type3_header(Opcode::EventWriteEop, 5),
+        0x515,
+        0x4200 | 3,
+        address_hi,
+        0x00000042,
+        0x1,
+    };
+    REQUIRE(processor.execute(stream));
+    CHECK(memory.read<u64>(kMem1 + 0x4200) == 0x0000000100000042ULL);
+    REQUIRE(interrupts.size() == 1);
+    CHECK(interrupts[0].first == 0x515);
+    CHECK(interrupts[0].second == 0x0000000100000042ULL);
+    CHECK(processor.stats().interrupts == 1);
+}
+
+TEST_CASE_METHOD(MemoryFixture,
+                 "an end-of-pipe event can interrupt without writing",
+                 "[latte][cp]") {
+    std::vector<u64> values;
+    processor.set_interrupt_listener([&values](u32, u64 value) { values.push_back(value); });
+
+    // Data select 0 discards; interrupt select 1 still interrupts.
+    const std::vector<u32> stream{
+        type3_header(Opcode::EventWriteEop, 5),
+        0x515,
+        0x4300 | 2,
+        1U << 24,
+        7,
+        0,
+    };
+    REQUIRE(processor.execute(stream));
+    CHECK(memory.read<u32>(kMem1 + 0x4300) == 0);
+    CHECK(processor.stats().memory_writes == 0);
+    CHECK(values.size() == 1);
+}
+
+TEST_CASE_METHOD(MemoryFixture,
+                 "a write somewhere unmapped is an error, not a write",
+                 "[latte][cp]") {
+    const std::vector<u32> stream{
+        type3_header(Opcode::MemWrite, 4),
+        0xF0000000 | 2,
+        1U << 18,
+        1,
+        0,
+        type3_header(Opcode::MemWrite, 4),
+        0x4000 | 2,
+        (1U << 18) | 0x1,
+        1,
+        0, // a 40-bit address
+    };
+    REQUIRE(processor.execute(stream));
+    CHECK(processor.stats().errors == 2);
+    CHECK(processor.stats().memory_writes == 0);
 }

@@ -232,6 +232,15 @@ over (scan-out is a snapshot), fitted into the drawable with its aspect kept,
 TV above GamePad when both are shown. OSScreen (6.8) feeds it today; GX2's
 scan-out will feed it the same way.
 
+Latte's own formats — PM4 streams, the register file, and later its shader
+microcode and surface tiling — live in `wiiu::latte`, the translator, which
+turns them into calls on this interface. The GPU there runs on the guest's
+clock ([ADR-004](decisions/ADR-004-gpu-timeline.md)): a submission retires a
+fixed latency after it was made, in order, and only then do its packets run
+and their writes reach guest memory — so a title polling a GPU timestamp reads
+the same value on every run, and a thread waiting for one parks on a deadline
+the idle skip jumps to.
+
 Beyond that, the shape is the hardware's. GX2 calls append PM4 packets to a
 ring buffer; a separate GPU thread consumes it asynchronously. R700 shader
 microcode is lowered to an internal IR and emitted as MSL — not through

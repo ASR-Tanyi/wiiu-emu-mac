@@ -11,10 +11,12 @@ wiiu_add_library(latte
         src/command_processor.cpp
         src/pm4.cpp
         src/registers.cpp
+        src/timeline.cpp
     HEADERS
         include/wiiu/latte/command_processor.hpp
         include/wiiu/latte/pm4.hpp
         include/wiiu/latte/registers.hpp
+        include/wiiu/latte/timeline.hpp
     DEPS
         wiiu::common
         wiiu::memory)
