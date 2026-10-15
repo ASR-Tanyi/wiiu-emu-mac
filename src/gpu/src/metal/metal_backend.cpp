@@ -798,6 +798,11 @@ bool MetalBackend::ensure_commands() {
     }
     const AutoreleasePool pool;
     commands_ = Ref<MTL::CommandBuffer>::retained(queue_->commandBuffer());
+    if (commands_) {
+        // Renamed by `begin_frame` when it is a frame's; anything else is
+        // work done with no swapchain at all.
+        commands_->setLabel(ns_string("headless"));
+    }
     return static_cast<bool>(commands_);
 }
 
@@ -911,6 +916,7 @@ bool MetalBackend::begin_frame(FrameInfo& out) {
         return false;
     }
     commands_hold_slot_ = true;
+    commands_->setLabel(ns_string(fmt::format("frame {}", frame_index_ + 1)));
 
     stats_ = FrameStats{};
     stats_.pacing_wait_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1051,6 +1057,11 @@ SamplerHandle MetalBackend::create_sampler(const SamplerDesc& desc) {
     descriptor->setLodMaxClamp(desc.lod_max);
     descriptor->setMaxAnisotropy(desc.max_anisotropy);
     descriptor->setBorderColor(to_metal(desc.border_color));
+    // A sampler state cannot be named after it exists, only through its
+    // descriptor -- which is why it showed up in a capture as an address.
+    if (!desc.label.empty()) {
+        descriptor->setLabel(ns_string(desc.label));
+    }
     if (desc.compare_enabled) {
         descriptor->setCompareFunction(static_cast<MTL::CompareFunction>(desc.compare));
     }
@@ -1387,6 +1398,11 @@ PipelineHandle MetalBackend::create_pipeline(const PipelineDesc& desc, std::stri
         Ref<MTL::Library> library{device_->newLibrary(ns_string(source), options.get(), &failure)};
         const std::string messages =
             failure == nullptr ? std::string{} : from_metal(failure->localizedDescription());
+        if (library) {
+            // Named after the pipeline, so a capture lists "present (vertex)"
+            // rather than an address.
+            library->setLabel(ns_string(fmt::format("{} ({})", desc.label, which)));
+        }
         if (!library) {
             error = fmt::format("the {} shader did not compile:\n{}",
                                 which,

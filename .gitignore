@@ -6,6 +6,7 @@ compile_commands.json
 .DS_Store
 *.dSYM/
 *.app/
+*.gputrace/
 keys.txt
 *.wud
 *.wux
