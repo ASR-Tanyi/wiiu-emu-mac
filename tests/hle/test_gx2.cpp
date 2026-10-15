@@ -16,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace wiiu;
@@ -600,4 +601,137 @@ TEST_CASE_METHOD(Gx2Fixture, "vsync and flip run the title's callbacks", "[hle][
     advance_to(gx2::vsync_tick(1));
     CHECK(callbacks_at(kVsyncCallback) == 1);
     CHECK(callbacks_at(kFlipCallback) == 1);
+}
+
+// --------------------------------------------------------------------------
+// The outputs
+// --------------------------------------------------------------------------
+
+namespace {
+
+constexpr u32 kRgba8 = 0x01A;  // GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8
+constexpr u32 kSrgb8 = 0x41A;  // GX2_SURFACE_FORMAT_SRGB_R8_G8_B8_A8
+constexpr u32 kRgba16 = 0x01F; // GX2_SURFACE_FORMAT_UNORM_R16_G16_B16_A16
+constexpr u32 kDouble = 2;     // GX2_BUFFERING_MODE_DOUBLE
+
+} // namespace
+
+TEST_CASE("the TV and the GamePad have the shapes their modes name", "[hle][gx2]") {
+    CHECK(gx2::tv_scan_geometry(1)->width == 640);
+    CHECK(gx2::tv_scan_geometry(2)->width == 854);
+    CHECK(gx2::tv_scan_geometry(3)->height == 720);
+    CHECK(gx2::tv_scan_geometry(4)->height == 720);
+    CHECK(gx2::tv_scan_geometry(5)->width == 1920);
+    CHECK(gx2::tv_scan_geometry(5)->height == 1080);
+    CHECK_FALSE(gx2::tv_scan_geometry(0).has_value()); // disabled
+    CHECK_FALSE(gx2::tv_scan_geometry(6).has_value());
+
+    CHECK(gx2::drc_scan_geometry(1)->width == 854);
+    CHECK(gx2::drc_scan_geometry(1)->pitch == 864);
+    CHECK_FALSE(gx2::drc_scan_geometry(0).has_value());
+
+    CHECK(gx2::scan_buffer_count(1) == 1);
+    CHECK(gx2::scan_buffer_count(3) == 3);
+    CHECK(gx2::scan_buffer_count(0) == 0);
+    CHECK(gx2::scan_buffer_count(4) == 0);
+}
+
+TEST_CASE_METHOD(Gx2Fixture, "GX2CalcTVSize and GX2CalcDRCSize size every frame", "[hle][gx2]") {
+    REQUIRE(memory.fill(kOut, 8, 0xFF));
+
+    // 720p, RGBA8, double-buffered: the same two frames OSScreen's TV buffer
+    // holds, and the same size.
+    call("GX2CalcTVSize", {3, kRgba8, kDouble, kOut, kOut + 4});
+    CHECK(memory.read<u32>(kOut) == 0x708000);
+    CHECK(memory.read<u32>(kOut + 4) == 0); // no scaling needed
+
+    call("GX2CalcTVSize", {5, kSrgb8, 3, kOut, kOut + 4});
+    CHECK(memory.read<u32>(kOut) == 1920U * 1080 * 4 * 3);
+    call("GX2CalcTVSize", {5, kRgba16, kDouble, kOut, kOut + 4});
+    CHECK(memory.read<u32>(kOut) == 1920U * 1080 * 8 * 2);
+
+    call("GX2CalcDRCSize", {1, kRgba8, kDouble, kOut, kOut + 4});
+    CHECK(memory.read<u32>(kOut) == 864U * 480 * 4 * 2);
+
+    // Disabled, or a format with no element size: nothing to allocate.
+    call("GX2CalcTVSize", {0, kRgba8, kDouble, kOut, kOut + 4});
+    CHECK(memory.read<u32>(kOut) == 0);
+    call("GX2CalcTVSize", {3, 0x031, kDouble, kOut, kOut + 4}); // BC1
+    CHECK(memory.read<u32>(kOut) == 0);
+}
+
+TEST_CASE_METHOD(Gx2Fixture, "the scan buffers are what the title set", "[hle][gx2]") {
+    init();
+    constexpr ppcaddr_t kTvScan = kMem1 + 0x100000;
+    constexpr ppcaddr_t kDrcScan = kMem1 + 0x900000;
+
+    call("GX2SetTVBuffer", {kTvScan, 0x708000, 3, kRgba8, kDouble});
+    call("GX2SetDRCBuffer", {kDrcScan, 0x32A000, 1, kRgba8, kDouble});
+    call("GX2SetTVEnable", {1});
+    call("GX2SetDRCScale", {854, 480});
+
+    const gx2::ScanBuffer& tv = os.gpu.scan_buffer(gx2::ScanTarget::Tv);
+    CHECK(tv.configured());
+    CHECK(tv.address == kTvScan);
+    CHECK(tv.size == 0x708000);
+    CHECK(tv.geometry.width == 1280);
+    CHECK(tv.surface_format == kRgba8);
+    CHECK(tv.buffering_mode == kDouble);
+    CHECK(tv.enabled);
+
+    const gx2::ScanBuffer& drc = os.gpu.scan_buffer(gx2::ScanTarget::Drc);
+    CHECK(drc.address == kDrcScan);
+    CHECK(drc.geometry.pitch == 864);
+    CHECK_FALSE(drc.enabled);
+    CHECK(drc.scale_x == 854);
+    CHECK(drc.scale_y == 480);
+
+    call("GX2SetTVEnable", {0});
+    CHECK_FALSE(tv.enabled);
+
+    // A shutdown forgets them; so does a reset.
+    call("GX2Shutdown", {});
+    CHECK_FALSE(os.gpu.scan_buffer(gx2::ScanTarget::Tv).configured());
+}
+
+TEST_CASE_METHOD(Gx2Fixture, "the outputs report a 1080p TV and one GamePad", "[hle][gx2]") {
+    CHECK(call("GX2GetSystemTVScanMode", {}) == 7);
+    CHECK(call("GX2GetSystemTVAspectRatio", {}) == 1);
+    CHECK(call("GX2GetSystemDRCMode", {}) == 1);
+    CHECK(call("GX2IsVideoOutReady", {}) == 1);
+}
+
+TEST_CASE_METHOD(Gx2Fixture,
+                 "a GamePad connect callback is told about its GamePad at once",
+                 "[hle][gx2]") {
+    constexpr ppcaddr_t kConnect = 0x02000300;
+    constexpr ppcaddr_t kOther = 0x02000400;
+    std::string error;
+    REQUIRE(os.heaps.create_default_heaps(memory, error)); // for the callbacks' stacks
+
+    const auto connect_calls = [this](ppcaddr_t entry) {
+        std::vector<std::pair<u32, u32>> calls;
+        for (const Thread* thread : os.scheduler.threads()) {
+            if (thread->context.pc == entry && thread->state != ThreadState::Exited) {
+                calls.emplace_back(thread->context.gpr[3], thread->context.gpr[4]);
+            }
+        }
+        return calls;
+    };
+
+    CHECK(call("GX2SetDRCConnectCallback", {0, kConnect}) == 0);
+    CHECK(os.gpu.drc_connect_callback() == kConnect);
+    const auto first = connect_calls(kConnect);
+    REQUIRE(first.size() == 1);
+    CHECK(first[0] == std::pair<u32, u32>{0, 1}); // slot 0, attached
+
+    // The second GamePad is never there; the old callback comes back.
+    CHECK(call("GX2SetDRCConnectCallback", {1, kOther}) == kConnect);
+    const auto second = connect_calls(kOther);
+    REQUIRE(second.size() == 1);
+    CHECK(second[0] == std::pair<u32, u32>{1, 0});
+
+    // Clearing it calls nothing.
+    CHECK(call("GX2SetDRCConnectCallback", {0, 0}) == kOther);
+    CHECK(os.gpu.drc_connect_callback() == 0);
 }

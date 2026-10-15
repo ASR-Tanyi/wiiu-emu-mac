@@ -183,6 +183,74 @@ struct DisplayList {
 /// The cores a display list can be open on: one each, as on hardware.
 inline constexpr u32 core_count = 3;
 
+/// The two outputs. GX2's display calls name them by function -- the TV
+/// calls and the DRC calls -- and this is the index for both.
+enum class ScanTarget : u32 {
+    Tv = 0,
+    Drc = 1,
+};
+
+inline constexpr u32 scan_target_count = 2;
+
+[[nodiscard]] std::string_view scan_target_name(ScanTarget target) noexcept;
+
+/// A scan buffer's shape, in pixels.
+struct ScanGeometry {
+    u32 width = 0;
+    u32 height = 0;
+    u32 pitch = 0; ///< pixels from one row to the next
+};
+
+/// The TV's shape for a `GX2TVRenderMode`: 480p at 4:3 and 16:9, 720p, and
+/// 1080p. Mode 4 is a second 720p that wut leaves unnamed; Cemu and decaf
+/// both size it as 1280x720. Nothing for 0, which is "disabled", or for a
+/// mode that does not exist.
+[[nodiscard]] std::optional<ScanGeometry> tv_scan_geometry(u32 render_mode) noexcept;
+
+/// The GamePad's shape for a `GX2DrcRenderMode`: 854x480, in rows of 864 --
+/// decaf's pitch, which is the width rounded up to a multiple of 32. Nothing
+/// for 0, "disabled", or a mode that does not exist.
+[[nodiscard]] std::optional<ScanGeometry> drc_scan_geometry(u32 render_mode) noexcept;
+
+/// How many frames a `GX2BufferingMode` holds -- the enum's own value, one to
+/// three -- or zero for one that is not a mode.
+[[nodiscard]] u32 scan_buffer_count(u32 buffering_mode) noexcept;
+
+/// What `GX2CalcTVSize`/`GX2CalcDRCSize` report: every frame, at the format's
+/// element size. Zero for a format without one.
+///
+/// This is decaf's linear figure. Hardware's is the size of a tiled surface,
+/// a little larger for the alignment; that one needs Latte's surface layout
+/// (8.13). The frames here are the emulator's own -- nothing but the
+/// emulator reads a scan buffer -- so the only thing the figure has to be is
+/// enough room for them, which it is.
+[[nodiscard]] u32
+scan_buffer_bytes(const ScanGeometry& geometry, u32 surface_format, u32 buffering_mode) noexcept;
+
+/// What `GX2SetTVBuffer`/`GX2SetDRCBuffer` were told, and the switches and
+/// scale that go with it.
+struct ScanBuffer {
+    ppcaddr_t address = 0;
+    u32 size = 0;
+    u32 render_mode = 0;    ///< GX2TVRenderMode or GX2DrcRenderMode
+    u32 surface_format = 0; ///< GX2SurfaceFormat
+    u32 buffering_mode = 0; ///< GX2BufferingMode: also the number of frames
+    ScanGeometry geometry;
+
+    bool enabled = false;
+    u32 scale_x = 0;
+    u32 scale_y = 0;
+
+    [[nodiscard]] bool configured() const noexcept { return address != 0; }
+};
+
+/// What the TV and the GamePad report about themselves. The console reports
+/// what its outputs are connected to; here that is a 1080p, 16:9 TV and one
+/// GamePad, which is what Cemu and decaf report too.
+inline constexpr u32 system_tv_scan_mode = 7;    ///< GX2_TV_SCAN_MODE_1080P
+inline constexpr u32 system_tv_aspect_ratio = 1; ///< GX2_ASPECT_RATIO_16_9
+inline constexpr u32 system_drc_mode = 1;        ///< GX2_DRC_RENDER_MODE_SINGLE
+
 /// What `GX2GetSwapStatus` reports, and what decides the next flip.
 struct SwapStatus {
     u32 interval = default_swap_interval;
@@ -252,6 +320,27 @@ public:
     /// The list `core` is writing, if any.
     [[nodiscard]] const DisplayList* display_list(u32 core) const noexcept;
 
+    // --- the outputs ---------------------------------------------------------
+
+    [[nodiscard]] ScanBuffer& scan_buffer(ScanTarget target) noexcept {
+        return scan_buffers_[static_cast<u32>(target)];
+    }
+
+    [[nodiscard]] const ScanBuffer& scan_buffer(ScanTarget target) const noexcept {
+        return scan_buffers_[static_cast<u32>(target)];
+    }
+
+    /// The title's `GX2DRCConnectCallback`, as `GX2SetDRCConnectCallback`
+    /// left it.
+    [[nodiscard]] ppcaddr_t drc_connect_callback() const noexcept { return drc_connect_; }
+
+    /// Returns the one it replaces.
+    ppcaddr_t set_drc_connect_callback(ppcaddr_t callback) noexcept {
+        const ppcaddr_t old = drc_connect_;
+        drc_connect_ = callback;
+        return old;
+    }
+
     // --- swaps and vsync ----------------------------------------------------
 
     [[nodiscard]] const SwapStatus& swap_status() const noexcept { return swap_; }
@@ -304,6 +393,8 @@ private:
     std::array<std::optional<DisplayList>, core_count> display_lists_{};
     std::array<EventCallback, event_type_count> callbacks_{};
     SwapStatus swap_;
+    std::array<ScanBuffer, scan_target_count> scan_buffers_{};
+    ppcaddr_t drc_connect_ = 0;
 
     /// The timestamps of the submissions carrying the swaps not yet flipped,
     /// oldest first.
@@ -328,6 +419,10 @@ void start_vsync(coreinit::Context& context, u64 now);
 
 /// Register the GX2 entry points under the `gx2` library.
 void register_gx2(Registry& registry, coreinit::Context& context);
+
+/// The display half: scan buffers, the outputs' switches and what they
+/// report. Called by `register_gx2`.
+void register_gx2_display(Registry& registry);
 
 } // namespace gx2
 } // namespace wiiu::hle

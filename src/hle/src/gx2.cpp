@@ -109,6 +109,8 @@ void Gpu::shutdown() noexcept {
         list.reset();
     }
     swap_ = {};
+    scan_buffers_ = {};
+    drc_connect_ = 0;
     pending_swaps_.clear();
     initialized_ = false;
 }
@@ -306,6 +308,8 @@ void Gpu::reset() {
     }
     callbacks_ = {};
     swap_ = {};
+    scan_buffers_ = {};
+    drc_connect_ = 0;
     pending_swaps_.clear();
     attributes_ = {};
     initialized_ = false;
@@ -764,6 +768,8 @@ void register_gx2(Registry& registry, coreinit::Context& context) {
 
     registry.add("gx2", "GX2SetEventCallback", gx2_set_event_callback);
     registry.add("gx2", "GX2GetEventCallback", gx2_get_event_callback);
+
+    register_gx2_display(registry);
 }
 
 } // namespace wiiu::hle::gx2

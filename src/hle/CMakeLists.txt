@@ -9,6 +9,7 @@ wiiu_add_library(hle
         src/coreinit_time.cpp
         src/filesystem.cpp
         src/gx2.cpp
+        src/gx2_display.cpp
         src/heap.cpp
         src/ios.cpp
         src/loader.cpp
