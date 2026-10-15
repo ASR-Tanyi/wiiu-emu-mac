@@ -257,7 +257,15 @@ bool parse_arguments(std::span<const std::string_view> argv, Arguments& args) {
 void apply_gpu_tooling(const Arguments& args) {
     if (args.gpu_validation) {
         setenv("MTL_DEBUG_LAYER", "1", 0);
-        setenv("MTL_SHADER_VALIDATION", "1", 0);
+        if (args.capture_frame == 0) {
+            setenv("MTL_SHADER_VALIDATION", "1", 0);
+        } else {
+            // Metal will not capture a process running shader validation, so
+            // asking for both gets the capture and API validation only.
+            WIIU_LOG_WARN(Gpu,
+                          "--capture-frame turns shader validation off: Metal cannot "
+                          "capture with it on (API validation stays on)");
+        }
     }
     if (args.gpu_hud) {
         setenv("MTL_HUD_ENABLED", "1", 0);

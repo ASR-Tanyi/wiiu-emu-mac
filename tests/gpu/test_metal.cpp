@@ -550,8 +550,13 @@ TEST_CASE("a screen image reaches the target the right way up", "[gpu][metal][pr
 // ---------------------------------------------------------------------------
 // 7.8 — capture
 // ---------------------------------------------------------------------------
+//
+// Hidden from the normal run, which has shader validation on: Metal refuses
+// to capture such a process ("Capturing Metal Shader Validation is not
+// supported"). tests/CMakeLists.txt runs it on its own as `gpu.capture`, with
+// shader validation off and API validation still on.
 
-TEST_CASE("a GPU capture is written where it was asked for", "[gpu][metal][tooling]") {
+TEST_CASE("a GPU capture is written where it was asked for", "[gpu][metal][tooling][.capture]") {
     const std::unique_ptr<GpuBackend> backend = live_backend();
     const std::filesystem::path path =
         std::filesystem::temp_directory_path() / "wiiu-emu-test-capture.gputrace";

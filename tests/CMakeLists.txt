@@ -104,6 +104,16 @@ wiiu_add_test(gpu
     SOURCES ${WIIU_GPU_TEST_SOURCES}
     DEPS wiiu::gpu)
 
+if(WIIU_PLATFORM_APPLE)
+    # Phase 7.8 — GPU capture cannot record a process running Metal's shader
+    # validation, which every other GPU test runs under. So the capture test
+    # is hidden from discovery and run here on its own with shader validation
+    # off; API validation stays on. The test binary sets its MTL_* variables
+    # without overwriting, so this one wins.
+    add_test(NAME gpu.capture COMMAND test_gpu "[capture]" --reporter console)
+    set_tests_properties(gpu.capture PROPERTIES ENVIRONMENT "MTL_SHADER_VALIDATION=0")
+endif()
+
 # Phase 1.8 — the JIT probe, run on every build rather than by hand.
 #
 # The probe source is compiled straight into the test: it belongs to the
