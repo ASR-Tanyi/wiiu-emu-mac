@@ -114,6 +114,14 @@ if(WIIU_PLATFORM_APPLE)
     set_tests_properties(gpu.capture PROPERTIES ENVIRONMENT "MTL_SHADER_VALIDATION=0")
 endif()
 
+wiiu_add_test(latte
+    SOURCES
+        latte/test_command_processor.cpp
+        latte/test_pm4.cpp
+        latte/test_registers.cpp
+    DEPS
+        wiiu::latte)
+
 # Phase 1.8 — the JIT probe, run on every build rather than by hand.
 #
 # The probe source is compiled straight into the test: it belongs to the

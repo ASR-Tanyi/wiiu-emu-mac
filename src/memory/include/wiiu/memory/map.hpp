@@ -103,6 +103,16 @@ inline constexpr ppcaddr_t kernel_heap_base = 0xFF200000;
 /// Physical address for a virtual one, if the region has physical backing.
 [[nodiscard]] bool to_physical(const Region& region, ppcaddr_t address, physaddr_t& out) noexcept;
 
+/// The virtual address a physical one is mapped at, if any region maps it.
+///
+/// The GPU speaks physical addresses -- GX2 writes them into PM4 for index
+/// buffers and nested command buffers (8.3) -- and the guest address space
+/// here is keyed by virtual address, so this is the way back. Where more than
+/// one region maps the same bytes, the first in `regions` wins; the bytes are
+/// the same either way.
+[[nodiscard]] bool
+to_virtual(std::span<const Region> regions, physaddr_t address, ppcaddr_t& out) noexcept;
+
 [[nodiscard]] std::string_view backing_name(Backing backing) noexcept;
 
 } // namespace wiiu::memory

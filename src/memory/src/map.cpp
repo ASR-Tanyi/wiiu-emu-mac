@@ -45,6 +45,21 @@ bool to_physical(const Region& region, ppcaddr_t address, physaddr_t& out) noexc
     return true;
 }
 
+bool to_virtual(std::span<const Region> regions, physaddr_t address, ppcaddr_t& out) noexcept {
+    for (const Region& region : regions) {
+        if (region.backing == Backing::None) {
+            continue;
+        }
+        // Unsigned subtraction: an address below the region's start wraps to
+        // something larger than its size and fails the same test.
+        if (address - region.physical < region.size) {
+            out = region.base + (address - region.physical);
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string_view backing_name(Backing backing) noexcept {
     switch (backing) {
         case Backing::Mem0:

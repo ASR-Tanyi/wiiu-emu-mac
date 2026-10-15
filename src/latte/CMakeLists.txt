@@ -1,0 +1,20 @@
+# wiiu::latte — the Latte GPU's own formats (Phase 8): PM4 command streams,
+# the register file, and later the shader microcode and surface tiling.
+#
+# Kept out of wiiu::gpu on purpose. That library is the backend interface, and
+# no second backend would want Latte's encodings in it (7.1); this is the
+# translator that turns them into calls on it. Platform-independent, so all of
+# it is tested on Linux too.
+
+wiiu_add_library(latte
+    SOURCES
+        src/command_processor.cpp
+        src/pm4.cpp
+        src/registers.cpp
+    HEADERS
+        include/wiiu/latte/command_processor.hpp
+        include/wiiu/latte/pm4.hpp
+        include/wiiu/latte/registers.hpp
+    DEPS
+        wiiu::common
+        wiiu::memory)

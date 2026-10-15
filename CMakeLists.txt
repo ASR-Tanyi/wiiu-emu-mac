@@ -141,6 +141,7 @@ add_subdirectory(src/cpu)                    # Phase 4
 add_subdirectory(src/loader)                 # Phase 5
 add_subdirectory(src/hle)                    # Phase 6
 add_subdirectory(src/gpu)                    # Phase 7-8
+add_subdirectory(src/latte)                  # Phase 8
 # add_subdirectory(src/audio)                # Phase 9
 # add_subdirectory(src/input)                # Phase 9
 add_subdirectory(src/frontend)               # Phase 1

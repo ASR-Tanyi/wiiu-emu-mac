@@ -78,6 +78,34 @@ TEST_CASE("virtual to physical translation", "[memory][map]") {
     CHECK_FALSE(to_physical(*mem1, mem1_base + mem1->size, physical));
 }
 
+TEST_CASE("physical to virtual is the way back", "[memory][map]") {
+    const auto regions = default_regions();
+
+    // Every backed region round-trips at its start, middle and last byte.
+    for (const Region& region : regions) {
+        if (region.backing == Backing::None) {
+            continue;
+        }
+        for (const u32 offset : {0U, region.size / 2, region.size - 1}) {
+            physaddr_t physical = 0;
+            REQUIRE(to_physical(region, region.base + offset, physical));
+            ppcaddr_t back = 0;
+            INFO(region.name << " + " << offset);
+            REQUIRE(to_virtual(regions, physical, back));
+            CHECK(back == region.base + offset);
+        }
+    }
+
+    // MEM1 at physical 0 is the GPU's favourite address and lives at
+    // 0xF4000000 virtual.
+    ppcaddr_t address = 0;
+    REQUIRE(to_virtual(regions, 0x00000100, address));
+    CHECK(address == mem1_base + 0x100);
+
+    // Physical memory nothing maps finds nothing, rather than a neighbour.
+    CHECK_FALSE(to_virtual(regions, 0xF0000000, address));
+}
+
 TEST_CASE("addresses outside every region find nothing", "[memory][map]") {
     const auto regions = default_regions();
     CHECK(find_region(regions, 0x00000000) == nullptr); // below everything
