@@ -1,6 +1,7 @@
 #include <wiiu/common/log.hpp>
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/gx2.hpp>
+#include <wiiu/hle/gx2_surface.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/pm4.hpp>
 #include <wiiu/memory/map.hpp>
@@ -805,6 +806,7 @@ void register_gx2(Registry& registry, coreinit::Context& context) {
     registry.add("gx2", "GX2GetEventCallback", gx2_get_event_callback);
 
     register_gx2_display(registry);
+    register_gx2_surface(registry);
 }
 
 } // namespace wiiu::hle::gx2
