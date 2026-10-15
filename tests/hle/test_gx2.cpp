@@ -381,3 +381,223 @@ TEST_CASE_METHOD(Gx2Fixture,
     advance_to(10'000 + latency());
     CHECK(call_long("GX2GetRetiredTimeStamp") == 1);
 }
+
+// --------------------------------------------------------------------------
+// Vsync, swaps and flips
+// --------------------------------------------------------------------------
+
+TEST_CASE("vsync falls on fixed ticks at 59.94 Hz", "[hle][gx2]") {
+    CHECK(gx2::vsync_tick(0) == 0);
+    CHECK(gx2::vsync_tick(1) == 1'036'973);
+    // 60000 vsyncs take exactly 1001 seconds of timebase: no drift.
+    CHECK(gx2::vsync_tick(60'000) == 1001ULL * 62'156'250);
+
+    CHECK(gx2::next_vsync_index(0) == 1);
+    for (u64 index = 1; index < 200; ++index) {
+        const u64 tick = gx2::vsync_tick(index);
+        CHECK(gx2::next_vsync_index(tick - 1) == index);
+        CHECK(gx2::next_vsync_index(tick) == index + 1);
+    }
+}
+
+namespace {
+
+/// A frame's worth of GX2: a register write, the swap, the flush.
+void frame(Gx2Fixture& fixture, u32 value) {
+    fixture.write_context(0x10, value);
+    fixture.call("GX2SwapScanBuffers", {});
+    fixture.call("GX2Flush", {});
+}
+
+} // namespace
+
+TEST_CASE_METHOD(Gx2Fixture, "GX2Init starts vsync", "[hle][gx2]") {
+    CHECK_FALSE(os.scheduler.has_timer(gx2::vsync_timer_id));
+    init();
+    CHECK(os.scheduler.has_timer(gx2::vsync_timer_id));
+
+    advance_to(gx2::vsync_tick(3));
+    CHECK(os.gpu.swap_status().last_vsync == gx2::vsync_tick(3));
+    CHECK(os.scheduler.has_timer(gx2::vsync_timer_id)); // and keeps going
+
+    call("GX2Shutdown", {});
+    CHECK_FALSE(os.scheduler.has_timer(gx2::vsync_timer_id));
+}
+
+TEST_CASE_METHOD(Gx2Fixture, "GX2WaitForVsync sleeps to the next vsync", "[hle][gx2]") {
+    init();
+    call("GX2WaitForVsync", {});
+    const Thread* const main = os.scheduler.find(kMain);
+    REQUIRE(main != nullptr);
+    CHECK(main->state == ThreadState::Sleeping);
+    CHECK(main->wake_time == gx2::vsync_tick(1));
+
+    advance_to(gx2::vsync_tick(1));
+    CHECK(main->state == ThreadState::Running);
+}
+
+TEST_CASE_METHOD(Gx2Fixture,
+                 "a swap flips at the first vsync after its submission retires",
+                 "[hle][gx2]") {
+    init();
+    frame(*this, 1);
+    CHECK(os.gpu.swap_status().swaps == 1);
+    CHECK(os.gpu.swap_status().flips == 0);
+
+    advance_to(gx2::vsync_tick(1));
+    CHECK(os.gpu.swap_status().flips == 1);
+    CHECK(os.gpu.swap_status().last_flip == gx2::vsync_tick(1));
+    CHECK(os.gpu.swap_status().pending() == 0);
+}
+
+TEST_CASE_METHOD(Gx2Fixture, "an unflushed swap does not flip", "[hle][gx2]") {
+    init();
+    write_context(0x10, 1);
+    call("GX2SwapScanBuffers", {});
+    advance_to(gx2::vsync_tick(2));
+    CHECK(os.gpu.swap_status().flips == 0);
+
+    // Flushed, it flips at the next vsync it is ready by.
+    call("GX2Flush", {});
+    advance_to(gx2::vsync_tick(3));
+    CHECK(os.gpu.swap_status().flips == 1);
+    CHECK(os.gpu.swap_status().last_flip == gx2::vsync_tick(3));
+}
+
+TEST_CASE_METHOD(Gx2Fixture,
+                 "a swap that retires after a vsync waits for the next, however late the "
+                 "clock is looked at",
+                 "[hle][gx2]") {
+    init();
+    // Something submitted early, due well before vsync 1: its timer is the
+    // first thing due, and must retire only what is due by *its* deadline.
+    write_context(0x11, 1);
+    call("GX2Flush", {});
+
+    // The swap's submission, due just past vsync 1.
+    state.timebase = gx2::vsync_tick(1) - latency() + 10;
+    frame(*this, 1);
+
+    // Serviced long after vsync 2: both GPU deadlines and both vsyncs are all
+    // due at once. The flip still lands on vsync 2, not on vsync 1.
+    advance_to(gx2::vsync_tick(2) + 500'000);
+    CHECK(os.gpu.swap_status().flips == 1);
+    CHECK(os.gpu.swap_status().last_flip == gx2::vsync_tick(2));
+}
+
+TEST_CASE_METHOD(Gx2Fixture, "the swap interval spaces flips out", "[hle][gx2]") {
+    init();
+    call("GX2SetSwapInterval", {2});
+    CHECK(call("GX2GetSwapInterval", {}) == 2);
+
+    frame(*this, 1);
+    frame(*this, 2);
+    for (u64 index = 1; index <= 4; ++index) {
+        advance_to(gx2::vsync_tick(index));
+    }
+    CHECK(os.gpu.swap_status().flips == 2);
+    CHECK(os.gpu.swap_status().last_flip == gx2::vsync_tick(3)); // 1, then 1 + 2
+
+    // Out of range is refused, and the interval kept.
+    call("GX2SetSwapInterval", {20});
+    CHECK(call("GX2GetSwapInterval", {}) == 2);
+}
+
+TEST_CASE_METHOD(Gx2Fixture, "GX2WaitForFlip waits only for a pending swap", "[hle][gx2]") {
+    init();
+    const Thread* const main = os.scheduler.find(kMain);
+    REQUIRE(main != nullptr);
+
+    call("GX2WaitForFlip", {}); // nothing pending
+    CHECK(main->state == ThreadState::Running);
+
+    frame(*this, 1);
+    call("GX2WaitForFlip", {});
+    CHECK(main->state == ThreadState::Blocked);
+
+    advance_to(gx2::vsync_tick(1));
+    CHECK(main->state == ThreadState::Running);
+    CHECK(os.gpu.swap_status().flips == 1);
+}
+
+TEST_CASE_METHOD(Gx2Fixture, "GX2GetSwapStatus reports the counts and times", "[hle][gx2]") {
+    init();
+    frame(*this, 1);
+    frame(*this, 2);
+    advance_to(gx2::vsync_tick(1));
+
+    REQUIRE(memory.fill(kOut, 24, 0xFF));
+    call("GX2GetSwapStatus", {kOut, kOut + 4, kOut + 8, kOut + 16});
+    CHECK(memory.read<u32>(kOut) == 2);
+    CHECK(memory.read<u32>(kOut + 4) == 1);
+    CHECK(memory.read<u64>(kOut + 8) == gx2::vsync_tick(1));
+    CHECK(memory.read<u64>(kOut + 16) == gx2::vsync_tick(1));
+
+    // Null pointers are skipped, not written through.
+    call("GX2GetSwapStatus", {0, 0, 0, 0});
+}
+
+TEST_CASE_METHOD(Gx2Fixture,
+                 "swapping too far ahead of the display waits for a flip",
+                 "[hle][gx2]") {
+    init();
+    const Thread* const main = os.scheduler.find(kMain);
+    REQUIRE(main != nullptr);
+
+    for (u32 i = 0; i < gx2::max_pending_swaps; ++i) {
+        write_context(0x10, i);
+        call("GX2SwapScanBuffers", {});
+        REQUIRE(main->state == ThreadState::Running);
+    }
+
+    // One more is one too many. It is flushed, so the swaps can retire, and
+    // the thread waits for the first of them to flip.
+    call("GX2SwapScanBuffers", {});
+    CHECK(main->state == ThreadState::Blocked);
+    CHECK(os.gpu.pending_commands().empty());
+
+    advance_to(gx2::vsync_tick(1));
+    CHECK(main->state == ThreadState::Running);
+    CHECK(os.gpu.swap_status().pending() == gx2::max_pending_swaps);
+}
+
+TEST_CASE_METHOD(Gx2Fixture,
+                 "a swap from another core or inside a display list is not counted",
+                 "[hle][gx2]") {
+    init();
+    call("GX2BeginDisplayListEx", {kList, 0x100, 1});
+    call("GX2SwapScanBuffers", {});
+    static_cast<void>(call("GX2EndDisplayList", {kList}));
+
+    state.core_id = 0;
+    call("GX2SwapScanBuffers", {});
+    CHECK(os.gpu.swap_status().swaps == 0);
+}
+
+TEST_CASE_METHOD(Gx2Fixture, "vsync and flip run the title's callbacks", "[hle][gx2]") {
+    constexpr ppcaddr_t kVsyncCallback = 0x02000100;
+    constexpr ppcaddr_t kFlipCallback = 0x02000200;
+    std::string error;
+    REQUIRE(os.heaps.create_default_heaps(memory, error)); // for the callbacks' stacks
+    init();
+    call("GX2SetEventCallback", {2, kVsyncCallback, 0x1111});
+    call("GX2SetEventCallback", {3, kFlipCallback, 0x2222});
+    frame(*this, 1);
+    advance_to(gx2::vsync_tick(1) - 1); // nothing yet
+
+    const auto callbacks_at = [this](ppcaddr_t entry) {
+        u32 count = 0;
+        for (const Thread* thread : os.scheduler.threads()) {
+            if (thread->context.pc == entry && thread->state != ThreadState::Exited) {
+                CHECK(thread->context.gpr[4] == (entry == kVsyncCallback ? 0x1111U : 0x2222U));
+                ++count;
+            }
+        }
+        return count;
+    };
+    CHECK(callbacks_at(kVsyncCallback) == 0);
+
+    advance_to(gx2::vsync_tick(1));
+    CHECK(callbacks_at(kVsyncCallback) == 1);
+    CHECK(callbacks_at(kFlipCallback) == 1);
+}

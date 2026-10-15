@@ -245,7 +245,10 @@ GX2 itself is HLE (`hle/gx2.hpp`): its calls append PM4 to a command buffer
 the emulator keeps host-side, or to a display list in the title's memory, and
 `GX2Flush` hands the buffer to that timeline. The timeline sits on the
 scheduler's timer list like an alarm, which is what retires it; nothing reads
-it from another thread. A host thread that encodes Metal work behind the
+it from another thread. Vsync is another timer on the same list — 59.94 Hz of
+guest timebase, not the host display's refresh — and a swap flips at the first
+vsync by which the submission carrying it has retired, so when a frame flips
+is decided by the title's own calls and nothing else. A host thread that encodes Metal work behind the
 timeline is ADR-004's later step, for when there is translation worth
 overlapping (8.11). R700 shader
 microcode is lowered to an internal IR and emitted as MSL — not through

@@ -22,11 +22,21 @@
 //   * **timestamps count submissions**, from 1. One retires when the guest's
 //     clock reaches its deadline (ADR-004), and a guest thread waiting for one
 //     sleeps until then: the idle skip (P2) gets there without emulating the
-//     wait, and the scheduler's timer list is what retires it.
+//     wait, and the scheduler's timer list is what retires it;
+//   * **vsync is a tick of the guest's clock**, 59.94 times a second of
+//     timebase, at fixed ticks counted from zero -- not the host display's,
+//     which would make every frame-paced title run differently on every
+//     machine. A **swap** is counted when `GX2SwapScanBuffers` is called and
+//     belongs to the submission that carries it; it **flips** at the first
+//     vsync by which that submission has retired and the swap interval has
+//     passed since the last flip. That is the order hardware does it in
+//     (Cemu and decaf agree on it), and it makes a flip's tick a pure function
+//     of the title's own calls.
 //
-// What is not here yet: the vsync and flip events (the callbacks are stored,
-// nothing raises them), the overrun callback a full display list asks for,
-// and the profiling and toss-stage modes `GX2Init` can ask for.
+// What is not here yet: what a flip shows (the scan buffers and the copy into
+// them), swap interval 0's flip-without-waiting (it waits for vsync like 1),
+// the overrun callback a full display list asks for, and the profiling and
+// toss-stage modes `GX2Init` can ask for.
 #pragma once
 
 #include <wiiu/common/types.hpp>
@@ -36,6 +46,7 @@
 #include <wiiu/memory/memory.hpp>
 
 #include <array>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <span>
@@ -56,6 +67,45 @@ namespace gx2 {
 /// each next deadline; below the IOS completion ids, and above every guest
 /// address an alarm is keyed by.
 inline constexpr u32 gpu_timer_id = 0xFFFD0000;
+
+/// The scheduler timer vsync runs on, re-armed every vsync from `GX2Init`.
+inline constexpr u32 vsync_timer_id = 0xFFFD0001;
+
+/// What a thread waiting for a flip blocks on. Outside guest memory, so it
+/// cannot be mistaken for a sync object the title allocated.
+inline constexpr u32 flip_wait_object = 0xFFFD0002;
+
+/// Vsync `index` falls on this tick: 59.94 Hz -- 60000/1001, the rate the
+/// Wii U scans out at, per Cemu -- against the timebase's 62.15625 MHz,
+/// which is 1036973.4375 ticks a frame, or 16591575/16. Exact, so no drift
+/// accumulates however long a title runs.
+[[nodiscard]] constexpr u64 vsync_tick(u64 index) noexcept {
+    return index * 16'591'575 / 16;
+}
+
+/// The first vsync strictly after `now`.
+[[nodiscard]] constexpr u64 next_vsync_index(u64 now) noexcept {
+    u64 index = (now * 16 / 16'591'575) + 1;
+    while (index > 1 && vsync_tick(index - 1) > now) {
+        --index;
+    }
+    while (vsync_tick(index) <= now) {
+        ++index;
+    }
+    return index;
+}
+
+/// The default swap interval: flip at most once a vsync.
+inline constexpr u32 default_swap_interval = 1;
+
+/// The largest swap interval accepted. Cemu's bound; nothing a title would
+/// mean asks for a third of a second between frames.
+inline constexpr u32 max_swap_interval = 19;
+
+/// How many swaps may be waiting for a flip before `GX2SwapScanBuffers`
+/// waits for one. Cemu's figure, and the place it waits -- after counting the
+/// new swap -- is the one it reports hardware using.
+inline constexpr u32 max_pending_swaps = 5;
 
 /// GX2 pads every buffer it submits to a multiple of this many words.
 inline constexpr u32 command_buffer_alignment_words = 8;
@@ -133,6 +183,21 @@ struct DisplayList {
 /// The cores a display list can be open on: one each, as on hardware.
 inline constexpr u32 core_count = 3;
 
+/// What `GX2GetSwapStatus` reports, and what decides the next flip.
+struct SwapStatus {
+    u32 interval = default_swap_interval;
+    u32 swaps = 0;      ///< `GX2SwapScanBuffers` calls
+    u32 flips = 0;      ///< flips performed
+    u64 last_flip = 0;  ///< the tick of the vsync the last flip happened at
+    u64 last_vsync = 0; ///< the tick of the last vsync
+
+    /// The index of the vsync the last flip happened at; meaningless until
+    /// there has been one.
+    u64 last_flip_vsync = 0;
+
+    [[nodiscard]] u32 pending() const noexcept { return swaps - flips; }
+};
+
 /// The GPU as GX2 sees it: the buffers being written, the timeline they go
 /// to, and the register file and command processor behind that.
 class Gpu {
@@ -187,6 +252,23 @@ public:
     /// The list `core` is writing, if any.
     [[nodiscard]] const DisplayList* display_list(u32 core) const noexcept;
 
+    // --- swaps and vsync ----------------------------------------------------
+
+    [[nodiscard]] const SwapStatus& swap_status() const noexcept { return swap_; }
+
+    /// `GX2SetSwapInterval`. Returns false, having logged why, for one out of
+    /// range, which is left as it was.
+    bool set_swap_interval(u32 interval);
+
+    /// `GX2SwapScanBuffers`: count a swap, carried by the submission with
+    /// timestamp `timestamp`.
+    void request_swap(u64 timestamp);
+
+    /// Vsync number `index`: retire what the GPU has done by its tick, then
+    /// flip the oldest swap if its submission has retired and the swap
+    /// interval allows. Returns whether it flipped.
+    bool vsync(u64 index);
+
     // --- events -------------------------------------------------------------
 
     void set_event_callback(u32 type, EventCallback callback) noexcept;
@@ -221,6 +303,11 @@ private:
     std::vector<u32> commands_;
     std::array<std::optional<DisplayList>, core_count> display_lists_{};
     std::array<EventCallback, event_type_count> callbacks_{};
+    SwapStatus swap_;
+
+    /// The timestamps of the submissions carrying the swaps not yet flipped,
+    /// oldest first.
+    std::deque<u64> pending_swaps_;
     InitAttributes attributes_{};
     bool initialized_ = false;
     u32 main_core_ = 1;
@@ -234,6 +321,10 @@ void pad_command_buffer(std::vector<u32>& words);
 /// something is in flight, cleared when nothing is. Called after every
 /// submission, and by the timer itself after it retires what was due.
 void arm_retirement(coreinit::Context& context);
+
+/// Arm the vsync timer at the first vsync after `now`. From then on it keeps
+/// itself armed, one vsync at a time, until `GX2Shutdown` or a reset.
+void start_vsync(coreinit::Context& context, u64 now);
 
 /// Register the GX2 entry points under the `gx2` library.
 void register_gx2(Registry& registry, coreinit::Context& context);

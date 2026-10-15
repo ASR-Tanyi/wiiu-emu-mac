@@ -5,7 +5,10 @@
 #include <wiiu/latte/pm4.hpp>
 #include <wiiu/memory/map.hpp>
 
+#include <fmt/format.h>
+
 #include <algorithm>
+#include <array>
 
 namespace wiiu::hle::gx2 {
 
@@ -105,6 +108,8 @@ void Gpu::shutdown() noexcept {
     for (auto& list : display_lists_) {
         list.reset();
     }
+    swap_ = {};
+    pending_swaps_.clear();
     initialized_ = false;
 }
 
@@ -246,6 +251,50 @@ EventCallback Gpu::event_callback(u32 type) const noexcept {
     return type < event_type_count ? callbacks_[type] : EventCallback{};
 }
 
+bool Gpu::set_swap_interval(u32 interval) {
+    if (interval > max_swap_interval) {
+        WIIU_LOG_WARN(Gx2,
+                      "GX2SetSwapInterval({}) is out of range (at most {}); keeping {}",
+                      interval,
+                      max_swap_interval,
+                      swap_.interval);
+        return false;
+    }
+    if (interval == 0) {
+        WIIU_LOG_DEBUG(Gx2, "swap interval 0 flips at vsync, like 1, until it is modelled");
+    }
+    swap_.interval = interval;
+    return true;
+}
+
+void Gpu::request_swap(u64 timestamp) {
+    ++swap_.swaps;
+    pending_swaps_.push_back(timestamp);
+}
+
+bool Gpu::vsync(u64 index) {
+    // Retired up to the vsync's own tick, not the moment the timer happened to
+    // be serviced: a swap whose submission retires a tick after the vsync
+    // waits for the next one, on every run.
+    const u64 tick = vsync_tick(index);
+    static_cast<void>(timeline_.retire_until(tick));
+    swap_.last_vsync = tick;
+
+    if (pending_swaps_.empty() || pending_swaps_.front() > timeline_.retired()) {
+        return false;
+    }
+    const u64 interval = std::max<u32>(swap_.interval, 1);
+    if (swap_.flips != 0 && index - swap_.last_flip_vsync < interval) {
+        return false;
+    }
+
+    pending_swaps_.pop_front();
+    ++swap_.flips;
+    swap_.last_flip = tick;
+    swap_.last_flip_vsync = index;
+    return true;
+}
+
 void Gpu::reset() {
     registers_->reset();
     timeline_ = latte::GpuTimeline{processor_, timeline_.latency()};
@@ -256,6 +305,8 @@ void Gpu::reset() {
         list.reset();
     }
     callbacks_ = {};
+    swap_ = {};
+    pending_swaps_.clear();
     attributes_ = {};
     initialized_ = false;
     main_core_ = 1;
@@ -273,10 +324,57 @@ void arm_retirement(coreinit::Context& context) {
         context.scheduler.clear_timer(gpu_timer_id);
         return;
     }
-    context.scheduler.set_timer(gpu_timer_id, *deadline, [&context](u64 now) {
-        static_cast<void>(context.gpu.timeline().retire_until(now));
+    // Retired up to its own deadline, not to whenever the timer is serviced:
+    // the next deadline re-arms it, and if that is due too the scheduler fires
+    // it again in the same pass, earliest first. So retirement interleaves
+    // with vsync in deadline order however late the clock is looked at, and
+    // a vsync never sees a submission retired that was due after it.
+    context.scheduler.set_timer(gpu_timer_id, *deadline, [&context, due = *deadline](u64) {
+        static_cast<void>(context.gpu.timeline().retire_until(due));
         arm_retirement(context);
     });
+}
+
+namespace {
+
+/// Run a title's GX2 event callback, `void (*)(GX2EventType, void *)`, on
+/// its own thread -- hardware runs them on GX2's AppIo thread, which is the
+/// same thing from the title's side.
+void raise_event(coreinit::Context& context, EventType type) {
+    const EventCallback callback = context.gpu.event_callback(static_cast<u32>(type));
+    if (callback.function == 0 || context.memory == nullptr) {
+        return;
+    }
+    const std::array<u32, 2> arguments{static_cast<u32>(type), callback.user_data};
+    static_cast<void>(coreinit::invoke_guest_callback(
+        context,
+        *context.memory,
+        fmt::format("GX2 {} callback", event_type_name(static_cast<u32>(type))),
+        callback.function,
+        arguments));
+}
+
+void on_vsync(coreinit::Context& context, u64 index) {
+    if (context.gpu.vsync(index)) {
+        static_cast<void>(context.scheduler.unblock_all(flip_wait_object));
+        raise_event(context, EventType::Flip);
+    }
+    // The vsync may have retired submissions itself.
+    arm_retirement(context);
+    raise_event(context, EventType::Vsync);
+}
+
+void arm_vsync(coreinit::Context& context, u64 index) {
+    context.scheduler.set_timer(vsync_timer_id, vsync_tick(index), [&context, index](u64) {
+        on_vsync(context, index);
+        arm_vsync(context, index + 1);
+    });
+}
+
+} // namespace
+
+void start_vsync(coreinit::Context& context, u64 now) {
+    arm_vsync(context, next_vsync_index(now));
 }
 
 // --------------------------------------------------------------------------
@@ -354,11 +452,17 @@ void gx2_init(Call& call, u32 attributes_address) {
     }
 
     context.gpu.initialize(call.memory, call.state.core_id, attributes);
+    start_vsync(context, call.state.timebase);
     WIIU_LOG_INFO(Gx2, "GX2Init on core {}", call.state.core_id);
 }
 
 void gx2_shutdown(Call&) {
-    gpu().shutdown();
+    coreinit::Context& context = active();
+    context.gpu.shutdown();
+    context.scheduler.clear_timer(vsync_timer_id);
+
+    // Nothing will flip again; a thread waiting for one would wait forever.
+    static_cast<void>(context.scheduler.unblock_all(flip_wait_object));
 }
 
 u32 gx2_get_main_core_id(Call&) {
@@ -526,11 +630,14 @@ void gx2_set_event_callback(Call&, u32 type, u32 function, u32 user_data) {
         WIIU_LOG_WARN(Gx2, "GX2SetEventCallback for event type {}, which does not exist", type);
         return;
     }
+    const bool raised =
+        type == static_cast<u32>(EventType::Vsync) || type == static_cast<u32>(EventType::Flip);
     WIIU_LOG_DEBUG(Gx2,
-                   "{} callback set to {:#010x} ({:#010x}); nothing raises it yet",
+                   "{} callback set to {:#010x} ({:#010x}){}",
                    event_type_name(type),
                    function,
-                   user_data);
+                   user_data,
+                   raised ? "" : "; nothing raises this event yet");
     gpu().set_event_callback(type, EventCallback{.function = function, .user_data = user_data});
 }
 
@@ -541,6 +648,86 @@ void gx2_get_event_callback(Call& call, u32 type, u32 out_function, u32 out_user
     }
     if (out_user_data != 0) {
         static_cast<void>(call.memory.try_write<u32>(out_user_data, callback.user_data));
+    }
+}
+
+/// Written untyped, like every call that may block: by the time a blocking
+/// call returns, `call.state` may hold another thread.
+void gx2_wait_for_vsync(Call& call) {
+    const u64 now = call.state.timebase;
+    active().scheduler.sleep(call.state, vsync_tick(next_vsync_index(now)) - now);
+}
+
+void gx2_wait_for_flip(Call& call) {
+    coreinit::Context& context = active();
+    if (context.gpu.swap_status().pending() == 0) {
+        return; // nothing waiting to flip: hardware returns at once too
+    }
+    context.scheduler.block(call.state, BlockReason::Event, flip_wait_object);
+}
+
+/// What `GX2SwapScanBuffers` leaves in the stream: a NOP carrying "SWAP", so
+/// the swap has a submission to belong to even when nothing was drawn, and so
+/// a PM4 capture shows where each frame ends.
+inline constexpr u32 swap_marker = 0x53574150;
+
+void gx2_swap_scan_buffers(Call& call) {
+    coreinit::Context& context = active();
+    Gpu& state = context.gpu;
+    const u32 core = call.state.core_id;
+
+    if (core != state.main_core() || state.display_list(core) != nullptr) {
+        // Cemu sees one title do this from another core and counts nothing,
+        // because nothing reaches the GPU from there either.
+        WIIU_LOG_WARN(Gx2,
+                      "GX2SwapScanBuffers on core {}{}; only core {}'s command buffer can carry "
+                      "a swap, so it is not counted",
+                      core,
+                      state.display_list(core) != nullptr ? " inside a display list" : "",
+                      state.main_core());
+        return;
+    }
+
+    const std::array<u32, 2> marker{
+        latte::pm4::type3_header(latte::pm4::Opcode::Nop, 1),
+        swap_marker,
+    };
+    static_cast<void>(emit(call, marker));
+
+    // Whatever submission the main buffer goes out as next carries it.
+    state.request_swap(state.timeline().submitted() + 1);
+
+    if (state.swap_status().pending() > max_pending_swaps) {
+        // Too far ahead of the display: wait for a flip. The buffer is flushed
+        // first -- a title that never flushes would otherwise be waiting for
+        // swaps that cannot retire, which is a hang rather than a pace.
+        static_cast<void>(flush_and_arm(call));
+        context.scheduler.block(call.state, BlockReason::Event, flip_wait_object);
+    }
+}
+
+u32 gx2_get_swap_interval(Call&) {
+    return gpu().swap_status().interval;
+}
+
+void gx2_set_swap_interval(Call&, u32 interval) {
+    static_cast<void>(gpu().set_swap_interval(interval));
+}
+
+void gx2_get_swap_status(
+    Call& call, u32 out_swaps, u32 out_flips, u32 out_last_flip, u32 out_last_vsync) {
+    const SwapStatus& status = gpu().swap_status();
+    if (out_swaps != 0) {
+        static_cast<void>(call.memory.try_write<u32>(out_swaps, status.swaps));
+    }
+    if (out_flips != 0) {
+        static_cast<void>(call.memory.try_write<u32>(out_flips, status.flips));
+    }
+    if (out_last_flip != 0) {
+        static_cast<void>(call.memory.try_write<u64>(out_last_flip, status.last_flip));
+    }
+    if (out_last_vsync != 0) {
+        static_cast<void>(call.memory.try_write<u64>(out_last_vsync, status.last_vsync));
     }
 }
 
@@ -567,6 +754,13 @@ void register_gx2(Registry& registry, coreinit::Context& context) {
     registry.add("gx2", "GX2CallDisplayList", gx2_call_display_list);
     registry.add("gx2", "GX2DirectCallDisplayList", gx2_direct_call_display_list);
     registry.add("gx2", "GX2CopyDisplayList", gx2_copy_display_list);
+
+    registry.add("gx2", "GX2WaitForVsync", gx2_wait_for_vsync);
+    registry.add("gx2", "GX2WaitForFlip", gx2_wait_for_flip);
+    registry.add("gx2", "GX2SwapScanBuffers", gx2_swap_scan_buffers);
+    registry.add("gx2", "GX2GetSwapInterval", gx2_get_swap_interval);
+    registry.add("gx2", "GX2SetSwapInterval", gx2_set_swap_interval);
+    registry.add("gx2", "GX2GetSwapStatus", gx2_get_swap_status);
 
     registry.add("gx2", "GX2SetEventCallback", gx2_set_event_callback);
     registry.add("gx2", "GX2GetEventCallback", gx2_get_event_callback);
