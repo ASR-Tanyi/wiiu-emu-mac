@@ -1,6 +1,7 @@
 #include <wiiu/latte/formats.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 
 namespace wiiu::latte {
@@ -52,6 +53,42 @@ std::optional<EncodedColor> encode_color(u32 surface_format,
         out.bytes[i] = unorm8(rgba[i]);
     }
     return out;
+}
+
+std::optional<EncodedDepthStencil> encode_depth_stencil(
+    u32 surface_format, f32 depth, u8 stencil, bool write_depth, bool write_stencil) noexcept {
+    const auto unorm = [depth](f64 scale) -> u32 {
+        if (std::isnan(depth)) {
+            return 0;
+        }
+        return static_cast<u32>(std::lround(std::clamp(static_cast<f64>(depth), 0.0, 1.0) * scale));
+    };
+    const auto little_endian = [](EncodedDepthStencil& out, u32 word) {
+        for (u32 i = 0; i < out.size; ++i) {
+            out.bytes[i] = static_cast<u8>(word >> (8 * i));
+        }
+    };
+
+    EncodedDepthStencil out;
+    switch (surface_format) {
+        case 0x005: // UNORM_R16: DEPTH_16
+            out.size = 2;
+            little_endian(out, unorm(65535.0));
+            out.write = {write_depth, write_depth, false, false};
+            return out;
+        case 0x011: // UNORM_R24_X8: DEPTH_8_24
+            out.size = 4;
+            little_endian(out, unorm(16777215.0) | (u32{stencil} << 24));
+            out.write = {write_depth, write_depth, write_depth, write_stencil};
+            return out;
+        case 0x80E: // FLOAT_R32: DEPTH_32_FLOAT
+            out.size = 4;
+            little_endian(out, std::bit_cast<u32>(depth));
+            out.write = {write_depth, write_depth, write_depth, write_depth};
+            return out;
+        default:
+            return std::nullopt;
+    }
 }
 
 } // namespace wiiu::latte

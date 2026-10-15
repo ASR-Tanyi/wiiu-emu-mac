@@ -79,6 +79,7 @@ void CommandProcessor::packet(const Packet& packet, u32 depth) {
         case Opcode::HleSwap:
         case Opcode::HleClearColor:
         case Opcode::HleCopyColorToScan:
+        case Opcode::HleClearDepthStencil:
             if (!hle_listener_) {
                 unhandled(packet, true);
                 return;

@@ -94,9 +94,10 @@ enum class Opcode : u8 {
     // the ring. Their payloads are GX2's business (8.1); the command processor
     // only hands them over. decaf and Cemu each have packets of their own for
     // the same jobs.
-    HleSwap = 0xF0,            ///< GX2SwapScanBuffers' place in the stream
-    HleClearColor = 0xF1,      ///< GX2ClearColor
-    HleCopyColorToScan = 0xF2, ///< GX2CopyColorBufferToScanBuffer
+    HleSwap = 0xF0,              ///< GX2SwapScanBuffers' place in the stream
+    HleClearColor = 0xF1,        ///< GX2ClearColor
+    HleCopyColorToScan = 0xF2,   ///< GX2CopyColorBufferToScanBuffer
+    HleClearDepthStencil = 0xF3, ///< GX2ClearDepthStencilEx
 };
 
 /// Whether an opcode is one of the emulator's own (`Hle*`).

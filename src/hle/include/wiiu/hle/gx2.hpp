@@ -34,7 +34,7 @@
 //     of the title's own calls.
 //
 // What a flip shows is the scan buffers (gx2_display.cpp), filled by the
-// scan-out copy (gx2_surface.cpp). The swap, the clear and that copy reach the
+// scan-out copy (gx2_surface.cpp). The swap, the clears and that copy reach the
 // GPU as the emulator's own packets (`pm4::Opcode::Hle*`), so each happens in
 // stream order when its submission retires -- from a display list as well as
 // the ring -- and the GPU, not the CPU, counts the swaps a copy lands

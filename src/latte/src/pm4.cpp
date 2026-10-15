@@ -22,6 +22,8 @@ std::string_view opcode_name(u8 opcode) noexcept {
             return "HLE_CLEAR_COLOR";
         case Opcode::HleCopyColorToScan:
             return "HLE_COPY_COLOR_TO_SCAN";
+        case Opcode::HleClearDepthStencil:
+            return "HLE_CLEAR_DEPTH_STENCIL";
         case Opcode::IndirectBufferEnd:
             return "INDIRECT_BUFFER_END";
         case Opcode::SetPredication:

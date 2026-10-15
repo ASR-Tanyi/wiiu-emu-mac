@@ -4,6 +4,7 @@
 #include <wiiu/hle/gx2_surface.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/color_buffer.hpp>
+#include <wiiu/latte/depth_buffer.hpp>
 #include <wiiu/latte/formats.hpp>
 #include <wiiu/latte/pm4.hpp>
 
@@ -173,34 +174,58 @@ latte::BankPipeSwizzle level_swizzle(const Surface& surface, u32 level) {
     return latte::split_swizzle(surface.swizzle & 0xFFFF);
 }
 
-std::array<u32, color_buffer_words> color_buffer_to_words(const ColorBuffer& buffer) {
-    std::array<u8, sizeof(ColorBuffer)> bytes{};
-    std::memcpy(bytes.data(), &buffer, sizeof(ColorBuffer));
-    std::array<u32, color_buffer_words> words{};
-    for (u32 i = 0; i < color_buffer_words; ++i) {
+namespace {
+
+/// A guest structure as packet words: each big-endian word of it, in host
+/// order, as the command buffer holds words. And back.
+template <typename T>
+[[nodiscard]] std::array<u32, sizeof(T) / 4> struct_to_words(const T& value) {
+    std::array<u8, sizeof(T)> bytes{};
+    std::memcpy(bytes.data(), &value, sizeof(T));
+    std::array<u32, sizeof(T) / 4> words{};
+    for (u32 i = 0; i < words.size(); ++i) {
         const u8* const at = bytes.data() + (i * 4);
         words[i] = (u32{at[0]} << 24) | (u32{at[1]} << 16) | (u32{at[2]} << 8) | u32{at[3]};
     }
     return words;
 }
 
-ColorBuffer color_buffer_from_words(std::span<const u32, color_buffer_words> words) {
-    std::array<u8, sizeof(ColorBuffer)> bytes{};
-    for (u32 i = 0; i < color_buffer_words; ++i) {
+template <typename T>
+[[nodiscard]] T struct_from_words(std::span<const u32, sizeof(T) / 4> words) {
+    std::array<u8, sizeof(T)> bytes{};
+    for (u32 i = 0; i < words.size(); ++i) {
         for (u32 b = 0; b < 4; ++b) {
             bytes[(i * 4) + b] = static_cast<u8>(words[i] >> (24 - (8 * b)));
         }
     }
-    ColorBuffer buffer{};
-    std::memcpy(&buffer, bytes.data(), sizeof(ColorBuffer));
-    return buffer;
+    T value{};
+    std::memcpy(&value, bytes.data(), sizeof(T));
+    return value;
+}
+
+} // namespace
+
+std::array<u32, color_buffer_words> color_buffer_to_words(const ColorBuffer& buffer) {
+    return struct_to_words(buffer);
+}
+
+ColorBuffer color_buffer_from_words(std::span<const u32, color_buffer_words> words) {
+    return struct_from_words<ColorBuffer>(words);
+}
+
+std::array<u32, depth_buffer_words> depth_buffer_to_words(const DepthBuffer& buffer) {
+    return struct_to_words(buffer);
+}
+
+DepthBuffer depth_buffer_from_words(std::span<const u32, depth_buffer_words> words) {
+    return struct_from_words<DepthBuffer>(words);
 }
 
 namespace {
 
-/// The level and slices a colour buffer's view names, laid out -- what both
-/// the clear and the copy start from. A view of no slices is taken as one,
-/// as decaf takes it.
+/// The level and slices a buffer's view names, laid out -- what the clears
+/// and the copy start from. A view of no slices is taken as one, as decaf
+/// takes it.
 struct ViewedLevel {
     latte::SurfaceDesc desc;
     latte::SurfaceLayout layout;
@@ -218,10 +243,8 @@ struct ViewedLevel {
                        s.image.value());
 }
 
-[[nodiscard]] std::optional<ViewedLevel> viewed_level(const ColorBuffer& buffer,
-                                                      std::string& problem) {
-    const Surface& s = buffer.surface;
-    const u32 level = buffer.view_mip;
+[[nodiscard]] std::optional<ViewedLevel>
+viewed_level(const Surface& s, u32 level, u32 first_slice, u32 slices, std::string& problem) {
     const std::optional<latte::SurfaceLayout> layout = surface_layout(s, level);
     if (!layout.has_value()) {
         problem = fmt::format("level {} of a {} cannot be laid out", level, describe(s));
@@ -236,8 +259,8 @@ struct ViewedLevel {
         .desc = surface_desc(s, level),
         .layout = *layout,
         .address = *address,
-        .first_slice = buffer.view_first_slice,
-        .slices = std::max<u32>(1, buffer.view_num_slices),
+        .first_slice = first_slice,
+        .slices = std::max<u32>(1, slices),
     };
     if (viewed.first_slice >= layout->depth) {
         problem = fmt::format(
@@ -261,13 +284,60 @@ struct ViewedLevel {
     }
 }
 
+/// Write one element's bytes -- those of them `write` names -- over every
+/// element of the viewed slices. In the thin modes a slice is one run of
+/// bytes, so walking the run element by element reaches every element of it,
+/// whatever the tiling; thick modes interleave four slices, and are refused.
+[[nodiscard]] std::string fill_viewed_slices(memory::Memory& memory,
+                                             const ViewedLevel& viewed,
+                                             std::span<const u8> element,
+                                             std::span<const bool> write,
+                                             std::string_view call,
+                                             const Surface& s) {
+    if (is_thick(viewed.layout.tile_mode)) {
+        return fmt::format("{}: a thick-tiled buffer ({}) is not cleared yet", call, describe(s));
+    }
+
+    const u64 slice_bytes = viewed.layout.slice_size;
+    const u64 start = viewed.address + (viewed.first_slice * slice_bytes);
+    const u64 bytes = viewed.slices * slice_bytes;
+    u8* const host = start + bytes <= 0x1'0000'0000ULL
+                         ? memory.translate(static_cast<ppcaddr_t>(start),
+                                            static_cast<u32>(bytes),
+                                            memory::Access::Write)
+                         : nullptr;
+    if (host == nullptr) {
+        return fmt::format("{}: {:#x} bytes at {:#010x} for a {} are not writable guest memory",
+                           call,
+                           bytes,
+                           start,
+                           describe(s));
+    }
+
+    const std::size_t size = element.size();
+    const bool whole = std::all_of(write.begin(), write.end(), [](bool b) { return b; });
+    for (u64 at = 0; at + size <= bytes; at += size) {
+        if (whole) {
+            std::memcpy(host + at, element.data(), size);
+            continue;
+        }
+        for (std::size_t i = 0; i < size; ++i) {
+            if (write[i]) {
+                host[at + i] = element[i];
+            }
+        }
+    }
+    return {};
+}
+
 } // namespace
 
 std::string clear_color_buffer(memory::Memory& memory,
                                const ColorBuffer& buffer,
                                const std::array<f32, 4>& rgba) {
     std::string problem;
-    const std::optional<ViewedLevel> viewed = viewed_level(buffer, problem);
+    const std::optional<ViewedLevel> viewed = viewed_level(
+        buffer.surface, buffer.view_mip, buffer.view_first_slice, buffer.view_num_slices, problem);
     if (!viewed.has_value()) {
         return "GX2ClearColor: " + problem;
     }
@@ -278,31 +348,45 @@ std::string clear_color_buffer(memory::Memory& memory,
         return fmt::format("GX2ClearColor: clearing format {:#x} is not supported yet",
                            s.format.value());
     }
-    if (is_thick(viewed->layout.tile_mode)) {
-        return fmt::format("GX2ClearColor: a thick-tiled colour buffer ({}) is not cleared yet",
-                           describe(s));
+    std::array<bool, 16> all{};
+    all.fill(true);
+    return fill_viewed_slices(memory,
+                              *viewed,
+                              std::span<const u8>(color->bytes.data(), color->size),
+                              std::span<const bool>(all.data(), color->size),
+                              "GX2ClearColor",
+                              s);
+}
+
+std::string clear_depth_stencil_buffer(
+    memory::Memory& memory, const DepthBuffer& buffer, f32 depth, u8 stencil, u32 flags) {
+    const bool write_depth = (flags & clear_depth) != 0;
+    const bool write_stencil = (flags & clear_stencil) != 0;
+    if (!write_depth && !write_stencil) {
+        return {};
     }
 
-    const u64 slice_bytes = viewed->layout.slice_size;
-    const u64 start = viewed->address + (viewed->first_slice * slice_bytes);
-    const u64 bytes = viewed->slices * slice_bytes;
-    u8* const host = start + bytes <= 0x1'0000'0000ULL
-                         ? memory.translate(static_cast<ppcaddr_t>(start),
-                                            static_cast<u32>(bytes),
-                                            memory::Access::Write)
-                         : nullptr;
-    if (host == nullptr) {
-        return fmt::format("GX2ClearColor: {:#x} bytes at {:#010x} for a {} are not writable "
-                           "guest memory",
-                           bytes,
-                           start,
-                           describe(s));
+    std::string problem;
+    const std::optional<ViewedLevel> viewed = viewed_level(
+        buffer.surface, buffer.view_mip, buffer.view_first_slice, buffer.view_num_slices, problem);
+    if (!viewed.has_value()) {
+        return "GX2ClearDepthStencilEx: " + problem;
     }
+    const Surface& s = buffer.surface;
 
-    for (u64 at = 0; at + color->size <= bytes; at += color->size) {
-        std::memcpy(host + at, color->bytes.data(), color->size);
+    const std::optional<latte::EncodedDepthStencil> element =
+        latte::encode_depth_stencil(s.format, depth, stencil, write_depth, write_stencil);
+    if (!element.has_value() || element->size * 8 != viewed->layout.bits_per_element) {
+        return fmt::format("GX2ClearDepthStencilEx: clearing depth format {:#x} is not "
+                           "supported yet",
+                           s.format.value());
     }
-    return {};
+    return fill_viewed_slices(memory,
+                              *viewed,
+                              std::span<const u8>(element->bytes.data(), element->size),
+                              std::span<const bool>(element->write.data(), element->size),
+                              "GX2ClearDepthStencilEx",
+                              s);
 }
 
 std::string copy_to_scan_frame(memory::Memory& memory,
@@ -310,7 +394,8 @@ std::string copy_to_scan_frame(memory::Memory& memory,
                                const ScanBuffer& scan,
                                ppcaddr_t frame) {
     std::string problem;
-    const std::optional<ViewedLevel> viewed = viewed_level(buffer, problem);
+    const std::optional<ViewedLevel> viewed = viewed_level(
+        buffer.surface, buffer.view_mip, buffer.view_first_slice, buffer.view_num_slices, problem);
     if (!viewed.has_value()) {
         return "GX2CopyColorBufferToScanBuffer: " + problem;
     }
@@ -584,6 +669,85 @@ std::optional<ColorBufferRegisters> color_buffer_registers(const ColorBuffer& bu
     };
 }
 
+std::optional<DepthBufferRegisters> depth_buffer_registers(const DepthBuffer& buffer) {
+    const Surface& surface = buffer.surface;
+    const std::optional<latte::SurfaceLayout> layout = surface_layout(surface, buffer.view_mip);
+    if (!layout.has_value()) {
+        WIIU_LOG_ERROR(Gx2,
+                       "GX2InitDepthBufferRegs: level {} of a {}x{} depth buffer, format {:#x}, "
+                       "cannot be laid out; its registers are left as they were",
+                       buffer.view_mip.value(),
+                       surface.width.value(),
+                       surface.height.value(),
+                       surface.format.value());
+        return std::nullopt;
+    }
+
+    latte::DbDepthSize size{.raw = 0};
+    size.pitch_tile_max = (layout->pitch / 8) - 1;
+    size.slice_tile_max = ((layout->pitch * layout->height) / 64) - 1;
+
+    latte::DbDepthView view{.raw = 0};
+    view.slice_start = buffer.view_first_slice;
+    view.slice_max = buffer.view_first_slice + buffer.view_num_slices - 1;
+
+    latte::DbHtileSurface htile{.raw = 0};
+    htile.htile_width = true;
+    htile.htile_height = true;
+    htile.full_cache = true;
+
+    latte::DbPrefetchLimit prefetch{.raw = 0};
+    prefetch.depth_height_tile_max = (surface.height / 8) - 1;
+
+    latte::DbPreloadControl preload{.raw = 0};
+    preload.max_x = (surface.width / 32) & 0xFF;
+    preload.max_y = (surface.height / 32) & 0xFF;
+
+    latte::DbDepthInfo info{.raw = 0};
+    info.read_size_512 = true;
+    info.array_mode =
+        layout->tile_mode == TileMode::LinearSpecial ? TileMode::LinearGeneral : layout->tile_mode;
+    info.tile_surface_enable = buffer.hi_z != 0;
+
+    // The polygon offset is scaled by the depth format's precision: minus
+    // the bits of a unorm depth, and the float formats' own figures.
+    latte::PaSuPolyOffsetDbFmtCntl poly{.raw = 0};
+    const std::optional<latte::DbFormat> format = latte::depth_format(surface.format);
+    info.format = format.value_or(latte::DbFormat::Invalid);
+    switch (format.value_or(latte::DbFormat::Invalid)) {
+        case latte::DbFormat::Depth16:
+            poly.neg_num_db_bits = 240; // -16
+            break;
+        case latte::DbFormat::Depth8_24:
+            poly.neg_num_db_bits = 232; // -24
+            break;
+        case latte::DbFormat::Depth32Float:
+        case latte::DbFormat::DepthX24_8_32Float:
+            poly.neg_num_db_bits = 233; // -23
+            poly.db_is_float = true;
+            break;
+        case latte::DbFormat::Depth8_24Float:
+            poly.neg_num_db_bits = 236; // -20
+            poly.db_is_float = true;
+            break;
+        default:
+            WIIU_LOG_WARN(Gx2,
+                          "GX2InitDepthBufferRegs: format {:#x} is not a depth format",
+                          surface.format.value());
+            break;
+    }
+
+    return DepthBufferRegisters{
+        .size = size.raw,
+        .view = view.raw,
+        .info = info.raw,
+        .htile_surface = htile.raw,
+        .prefetch_limit = prefetch.raw,
+        .preload_control = preload.raw,
+        .poly_offset_control = poly.raw,
+    };
+}
+
 namespace {
 
 /// `void GX2CalcSurfaceSizeAndAlignment(GX2Surface *surface)`.
@@ -658,6 +822,72 @@ void gx2_copy_color_buffer_to_scan_buffer(Call& call, u32 address, u32 target) {
     static_cast<void>(emit(call, packet));
 }
 
+/// `void GX2InitDepthBufferRegs(GX2DepthBuffer *buffer)`.
+void gx2_init_depth_buffer_regs(Call& call, u32 address) {
+    DepthBuffer buffer{};
+    if (!read_guest(call.memory, address, buffer)) {
+        WIIU_LOG_ERROR(Gx2, "GX2InitDepthBufferRegs: no depth buffer at {:#010x}", address);
+        return;
+    }
+    const std::optional<DepthBufferRegisters> registers = depth_buffer_registers(buffer);
+    if (!registers.has_value()) {
+        return;
+    }
+    buffer.db_depth_size = registers->size;
+    buffer.db_depth_view = registers->view;
+    buffer.db_depth_info = registers->info;
+    buffer.db_htile_surface = registers->htile_surface;
+    buffer.db_prefetch_limit = registers->prefetch_limit;
+    buffer.db_preload_control = registers->preload_control;
+    buffer.pa_poly_offset_control = registers->poly_offset_control;
+    static_cast<void>(write_guest(call.memory, address, buffer));
+}
+
+/// `void GX2ClearDepthStencilEx(GX2DepthBuffer *buffer, float depth, uint8_t
+/// stencil, GX2ClearFlags flags)`.
+///
+/// Two halves, as Cemu has them: the clear registers, written only where the
+/// flags ask (decaf writes both every time), and the clear itself.
+void gx2_clear_depth_stencil_ex(Call& call, u32 address, f32 depth, u32 stencil, u32 flags) {
+    DepthBuffer buffer{};
+    if (!read_guest(call.memory, address, buffer)) {
+        WIIU_LOG_ERROR(Gx2, "GX2ClearDepthStencilEx: no depth buffer at {:#010x}", address);
+        return;
+    }
+
+    const u32 stencil_value = stencil & 0xFF;
+    const u32 depth_value = std::bit_cast<u32>(depth);
+    const bool set_stencil = (flags & clear_set_stencil_register) != 0;
+    const bool set_depth = (flags & clear_set_depth_register) != 0;
+    constexpr u32 stencil_offset = (latte::reg::db_stencil_clear - 0x28000) / 4;
+    constexpr u32 depth_offset = (latte::reg::db_depth_clear - 0x28000) / 4;
+    using latte::pm4::Opcode;
+    using latte::pm4::type3_header;
+    if (set_stencil && set_depth) {
+        const std::array<u32, 4> packet{
+            type3_header(Opcode::SetContextReg, 3), stencil_offset, stencil_value, depth_value};
+        static_cast<void>(emit(call, packet));
+    } else if (set_stencil || set_depth) {
+        const std::array<u32, 3> packet{type3_header(Opcode::SetContextReg, 2),
+                                        set_depth ? depth_offset : stencil_offset,
+                                        set_depth ? depth_value : stencil_value};
+        static_cast<void>(emit(call, packet));
+    }
+
+    if ((flags & (clear_depth | clear_stencil)) == 0) {
+        return;
+    }
+    std::vector<u32> packet;
+    packet.reserve(1 + 3 + depth_buffer_words);
+    packet.push_back(type3_header(Opcode::HleClearDepthStencil, 3 + depth_buffer_words));
+    packet.push_back(flags);
+    packet.push_back(depth_value);
+    packet.push_back(stencil_value);
+    const std::array<u32, depth_buffer_words> words = depth_buffer_to_words(buffer);
+    packet.insert(packet.end(), words.begin(), words.end());
+    static_cast<void>(emit(call, packet));
+}
+
 } // namespace
 
 void register_gx2_surface(Registry& registry) {
@@ -665,6 +895,8 @@ void register_gx2_surface(Registry& registry) {
     registry.add("gx2", "GX2InitColorBufferRegs", gx2_init_color_buffer_regs);
     registry.add("gx2", "GX2ClearColor", gx2_clear_color);
     registry.add("gx2", "GX2CopyColorBufferToScanBuffer", gx2_copy_color_buffer_to_scan_buffer);
+    registry.add("gx2", "GX2InitDepthBufferRegs", gx2_init_depth_buffer_regs);
+    registry.add("gx2", "GX2ClearDepthStencilEx", gx2_clear_depth_stencil_ex);
 }
 
 } // namespace wiiu::hle::gx2

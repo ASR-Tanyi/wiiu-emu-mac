@@ -156,6 +156,40 @@ static_assert(offsetof(ColorBuffer, aa_buffer) == 0x80);
 static_assert(offsetof(ColorBuffer, cb_color_size) == 0x88);
 static_assert(offsetof(ColorBuffer, cmask_offset) == 0x98);
 
+/// `GX2DepthBuffer`. wut's offsets again, which decaf's agree with: the last
+/// seven words are the DB registers `GX2SetDepthBuffer` writes, and the
+/// polygon-offset control that goes with the format.
+struct DepthBuffer {
+    Surface surface;
+    u32be view_mip;
+    u32be view_first_slice;
+    u32be view_num_slices;
+    u32be hi_z; ///< hierarchical-Z buffer, or none
+    u32be hi_z_size;
+    f32be depth_clear;   ///< what `GX2SetClearDepthStencil` last set
+    u32be stencil_clear; ///< likewise
+    u32be db_depth_size;
+    u32be db_depth_view;
+    u32be db_depth_info;
+    u32be db_htile_surface;
+    u32be db_prefetch_limit;
+    u32be db_preload_control;
+    u32be pa_poly_offset_control;
+};
+
+static_assert(sizeof(DepthBuffer) == 0xAC);
+static_assert(offsetof(DepthBuffer, hi_z) == 0x80);
+static_assert(offsetof(DepthBuffer, depth_clear) == 0x88);
+static_assert(offsetof(DepthBuffer, db_depth_size) == 0x90);
+static_assert(offsetof(DepthBuffer, pa_poly_offset_control) == 0xA8);
+
+/// `GX2ClearFlags`: what a depth/stencil clear clears, and which clear
+/// registers it sets on the way. Cemu's four; decaf names only the first two.
+inline constexpr u32 clear_depth = 1U << 0;
+inline constexpr u32 clear_stencil = 1U << 1;
+inline constexpr u32 clear_set_depth_register = 1U << 2;
+inline constexpr u32 clear_set_stencil_register = 1U << 3;
+
 /// Level `level` of a surface as Latte's layout reads it: GX2's dimension,
 /// samples and use turned into width, height, slices and flags.
 [[nodiscard]] latte::SurfaceDesc surface_desc(const Surface& surface, u32 level);
@@ -208,12 +242,35 @@ struct ColorBufferRegisters {
 /// Nothing, having logged why, if the viewed level cannot be laid out.
 [[nodiscard]] std::optional<ColorBufferRegisters> color_buffer_registers(const ColorBuffer& buffer);
 
+/// The DB registers for a depth buffer, as `GX2InitDepthBufferRegs` packs
+/// them -- decaf's reading. Cemu fills in only the size, and on that the two
+/// agree; the size, view and info fields are checked against Linux's
+/// `r600d.h` (latte/depth_buffer.hpp).
+struct DepthBufferRegisters {
+    u32 size = 0;
+    u32 view = 0;
+    u32 info = 0;
+    u32 htile_surface = 0;
+    u32 prefetch_limit = 0;
+    u32 preload_control = 0;
+    u32 poly_offset_control = 0;
+};
+
+/// Nothing, having logged why, if the viewed level cannot be laid out.
+[[nodiscard]] std::optional<DepthBufferRegisters> depth_buffer_registers(const DepthBuffer& buffer);
+
 /// Words a `ColorBuffer` takes in a packet: the structure, field by field.
 inline constexpr u32 color_buffer_words = sizeof(ColorBuffer) / 4;
 
 [[nodiscard]] std::array<u32, color_buffer_words> color_buffer_to_words(const ColorBuffer& buffer);
 
 [[nodiscard]] ColorBuffer color_buffer_from_words(std::span<const u32, color_buffer_words> words);
+
+inline constexpr u32 depth_buffer_words = sizeof(DepthBuffer) / 4;
+
+[[nodiscard]] std::array<u32, depth_buffer_words> depth_buffer_to_words(const DepthBuffer& buffer);
+
+[[nodiscard]] DepthBuffer depth_buffer_from_words(std::span<const u32, depth_buffer_words> words);
 
 /// What `GX2ClearColor`'s packet does when it runs: every element of the
 /// viewed level and slices becomes the colour, encoded for the format
@@ -226,6 +283,14 @@ inline constexpr u32 color_buffer_words = sizeof(ColorBuffer) / 4;
 [[nodiscard]] std::string clear_color_buffer(memory::Memory& memory,
                                              const ColorBuffer& buffer,
                                              const std::array<f32, 4>& rgba);
+
+/// What `GX2ClearDepthStencilEx`'s packet does when it runs: depth, stencil
+/// or both -- as `flags` asks -- written into every element of the viewed
+/// level and slices (`latte::encode_depth_stencil`), a packed stencil left
+/// alone by a depth-only clear and the other way round. Returns what went
+/// wrong, or nothing.
+[[nodiscard]] std::string clear_depth_stencil_buffer(
+    memory::Memory& memory, const DepthBuffer& buffer, f32 depth, u8 stencil, u32 flags);
 
 /// What `GX2CopyColorBufferToScanBuffer`'s packet does when it runs: the
 /// viewed level and first slice, detiled (`latte::detile`) into `frame` of
@@ -243,8 +308,8 @@ inline constexpr u32 color_buffer_words = sizeof(ColorBuffer) / 4;
                                              ppcaddr_t frame);
 
 /// Register `GX2CalcSurfaceSizeAndAlignment`, `GX2InitColorBufferRegs`,
-/// `GX2ClearColor` and `GX2CopyColorBufferToScanBuffer`. Called by
-/// `register_gx2`.
+/// `GX2ClearColor`, `GX2CopyColorBufferToScanBuffer`, `GX2InitDepthBufferRegs`
+/// and `GX2ClearDepthStencilEx`. Called by `register_gx2`.
 void register_gx2_surface(Registry& registry);
 
 } // namespace gx2

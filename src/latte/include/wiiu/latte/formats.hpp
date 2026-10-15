@@ -92,4 +92,25 @@ struct EncodedColor {
 [[nodiscard]] std::optional<EncodedColor> encode_color(u32 surface_format,
                                                        const std::array<f32, 4>& rgba) noexcept;
 
+/// A depth and stencil clear as one element of a depth format: the bytes,
+/// and which of them to write -- a clear of depth alone leaves a packed
+/// stencil as it was, and the other way round.
+struct EncodedDepthStencil {
+    std::array<u8, 4> bytes{};
+    std::array<bool, 4> write{};
+    u32 size = 0;
+};
+
+/// What a depth/stencil clear stores in a depth buffer of this format, or
+/// nothing for a format this does not encode yet.
+///
+/// Elements are little-endian words, which is how the GPU stores them and how
+/// Cemu reads depth back as a texture: R16 is a 16-bit unorm; R24_X8 packs a
+/// 24-bit unorm depth under an 8-bit stencil; R32 is the float itself. The
+/// float D24_S8 and the 64-bit X8_X24 wait until something needs them. Unorm
+/// depth clamps to [0, 1] and rounds to nearest; float depth is written as
+/// given.
+[[nodiscard]] std::optional<EncodedDepthStencil> encode_depth_stencil(
+    u32 surface_format, f32 depth, u8 stencil, bool write_depth, bool write_stencil) noexcept;
+
 } // namespace wiiu::latte

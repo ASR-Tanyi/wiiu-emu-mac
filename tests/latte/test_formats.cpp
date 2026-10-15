@@ -105,3 +105,39 @@ TEST_CASE("an sRGB clear is encoded with the sRGB curve", "[latte][formats]") {
     CHECK_FALSE(encode_color(0x019, {0, 0, 0, 0}).has_value()); // UNORM_R10_G10_B10_A2
     CHECK_FALSE(encode_color(0x11A, {0, 0, 0, 0}).has_value()); // UINT_R8_G8_B8_A8
 }
+
+TEST_CASE("a depth clear is encoded as the depth format stores it", "[latte][formats]") {
+    // Little-endian words. R32: the float itself.
+    const auto r32 = encode_depth_stencil(0x80E, 1.0F, 0x5A, true, true);
+    REQUIRE(r32.has_value());
+    CHECK(r32->size == 4);
+    CHECK(r32->bytes == std::array<u8, 4>{0x00, 0x00, 0x80, 0x3F});
+    CHECK(r32->write == std::array<bool, 4>{true, true, true, true});
+
+    // R16: a 16-bit unorm; 0.5 is 32767.5, so 32768.
+    const auto r16 = encode_depth_stencil(0x005, 0.5F, 0, true, false);
+    REQUIRE(r16.has_value());
+    CHECK(r16->size == 2);
+    CHECK(r16->bytes[0] == 0x00);
+    CHECK(r16->bytes[1] == 0x80);
+
+    // R24_X8: 24 bits of depth under the stencil byte, and a clear of one
+    // leaves the other's bytes alone.
+    const auto both = encode_depth_stencil(0x011, 1.0F, 0x5A, true, true);
+    REQUIRE(both.has_value());
+    CHECK(both->bytes == std::array<u8, 4>{0xFF, 0xFF, 0xFF, 0x5A});
+    CHECK(both->write == std::array<bool, 4>{true, true, true, true});
+    CHECK(encode_depth_stencil(0x011, 0.0F, 7, true, false)->write ==
+          std::array<bool, 4>{true, true, true, false});
+    CHECK(encode_depth_stencil(0x011, 0.0F, 7, false, true)->write ==
+          std::array<bool, 4>{false, false, false, true});
+
+    // Unorm depth clamps; NaN is zero.
+    CHECK(encode_depth_stencil(0x005, 2.0F, 0, true, false)->bytes[1] == 0xFF);
+    CHECK(encode_depth_stencil(0x005, std::nanf(""), 0, true, false)->bytes[1] == 0x00);
+
+    // The float D24_S8 and the 64-bit X8_X24 are not encoded yet.
+    CHECK_FALSE(encode_depth_stencil(0x811, 1.0F, 0, true, true).has_value());
+    CHECK_FALSE(encode_depth_stencil(0x81C, 1.0F, 0, true, true).has_value());
+    CHECK_FALSE(encode_depth_stencil(0x01A, 1.0F, 0, true, true).has_value());
+}

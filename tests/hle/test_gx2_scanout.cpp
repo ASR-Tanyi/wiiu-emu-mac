@@ -7,7 +7,9 @@
 // else; the copy puts each pixel where the scan-out reads it, however the
 // colour buffer is tiled; neither touches memory before its packet runs; and
 // a copy lands in the frame the next swap shows, counted on the GPU's side,
-// so a copy inside a display list goes to the right frame too.
+// so a copy inside a display list goes to the right frame too. And the depth
+// buffer's clear, which WHB does beside the colour one every frame: depth,
+// stencil or both, a packed stencil left alone by a clear of depth.
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/cpu/state.hpp>
@@ -15,6 +17,7 @@
 #include <wiiu/hle/gx2.hpp>
 #include <wiiu/hle/gx2_surface.hpp>
 #include <wiiu/hle/registry.hpp>
+#include <wiiu/latte/depth_buffer.hpp>
 #include <wiiu/latte/surface.hpp>
 #include <wiiu/memory/map.hpp>
 
@@ -101,13 +104,15 @@ struct MemoryFixture {
 /// way: `element_offset`, with the layout worked out once.
 class Elements {
 public:
-    explicit Elements(const gx2::ColorBuffer& buffer)
-        : image_(buffer.surface.image), desc_(gx2::surface_desc(buffer.surface, 0)),
-          swizzle_(gx2::level_swizzle(buffer.surface, 0)) {
-        const auto layout = gx2::surface_layout(buffer.surface, 0);
+    explicit Elements(const gx2::Surface& surface)
+        : image_(surface.image), desc_(gx2::surface_desc(surface, 0)),
+          swizzle_(gx2::level_swizzle(surface, 0)) {
+        const auto layout = gx2::surface_layout(surface, 0);
         REQUIRE(layout.has_value());
         layout_ = *layout;
     }
+
+    explicit Elements(const gx2::ColorBuffer& buffer) : Elements(buffer.surface) {}
 
     [[nodiscard]] ppcaddr_t at(u32 x, u32 y, u32 slice = 0) const {
         return image_ + static_cast<u32>(latte::element_offset(
@@ -382,4 +387,116 @@ TEST_CASE_METHOD(ScanOutFixture,
     advance_to(gx2::vsync_tick(1));
     CHECK(pixel(kImage) == kBlue);              // the clear still happened
     CHECK(pixel(kTvScan) == Pixel{0, 0, 0, 0}); // the copy did not
+}
+
+// --------------------------------------------------------------------------
+// Depth and stencil
+// --------------------------------------------------------------------------
+
+namespace {
+
+constexpr ppcaddr_t kDepth = 0x10007000;      // the GX2DepthBuffer
+constexpr ppcaddr_t kDepthImage = 0x10500000; // its elements
+
+[[nodiscard]] gx2::DepthBuffer depth_buffer(u32 width, u32 height, u32 format, ppcaddr_t image) {
+    gx2::DepthBuffer buffer{};
+    buffer.surface.dim = 1;
+    buffer.surface.width = width;
+    buffer.surface.height = height;
+    buffer.surface.depth = 1;
+    buffer.surface.mip_levels = 1;
+    buffer.surface.format = format;
+    buffer.surface.use = gx2::surface_use_depth_buffer;
+    buffer.surface.tile_mode = gx2::tile_mode_default;
+    buffer.view_num_slices = 1;
+    REQUIRE(gx2::calc_surface_size_and_alignment(buffer.surface));
+    buffer.surface.image = image;
+    return buffer;
+}
+
+} // namespace
+
+TEST_CASE_METHOD(MemoryFixture,
+                 "a depth clear writes depth or stencil, and leaves the other",
+                 "[hle][gx2][scanout]") {
+    // R24_X8: depth in the low three bytes of each element, stencil above.
+    const gx2::DepthBuffer buffer = depth_buffer(256, 64, 0x011, kDepthImage);
+    REQUIRE(memory.fill(kDepthImage, buffer.surface.image_size, 0xAB));
+    const Elements elements(buffer.surface);
+
+    const auto count_not = [&](const Pixel& expected) {
+        u64 wrong = 0;
+        for (u32 y = 0; y < 64; ++y) {
+            for (u32 x = 0; x < 256; ++x) {
+                wrong += pixel(elements.at(x, y)) != expected ? 1U : 0U;
+            }
+        }
+        return wrong;
+    };
+
+    CHECK(gx2::clear_depth_stencil_buffer(memory, buffer, 1.0F, 0x12, gx2::clear_depth).empty());
+    CHECK(count_not(Pixel{0xFF, 0xFF, 0xFF, 0xAB}) == 0);
+
+    CHECK(gx2::clear_depth_stencil_buffer(memory, buffer, 0.0F, 0x12, gx2::clear_stencil).empty());
+    CHECK(count_not(Pixel{0xFF, 0xFF, 0xFF, 0x12}) == 0);
+
+    // Flags that clear nothing write nothing.
+    CHECK(gx2::clear_depth_stencil_buffer(memory, buffer, 0.0F, 0, 0).empty());
+    CHECK(count_not(Pixel{0xFF, 0xFF, 0xFF, 0x12}) == 0);
+}
+
+TEST_CASE_METHOD(MemoryFixture,
+                 "a float depth clear writes the float, and an unknown format says so",
+                 "[hle][gx2][scanout]") {
+    const gx2::DepthBuffer buffer = depth_buffer(128, 128, 0x80E, kDepthImage);
+    CHECK(gx2::clear_depth_stencil_buffer(
+              memory, buffer, 1.0F, 0, gx2::clear_depth | gx2::clear_stencil)
+              .empty());
+    const Elements elements(buffer.surface);
+    CHECK(pixel(elements.at(0, 0)) == Pixel{0x00, 0x00, 0x80, 0x3F});
+    CHECK(pixel(elements.at(127, 127)) == Pixel{0x00, 0x00, 0x80, 0x3F});
+
+    const gx2::DepthBuffer float24 = depth_buffer(128, 128, 0x811, kDepthImage);
+    const std::string problem =
+        gx2::clear_depth_stencil_buffer(memory, float24, 0.0F, 0, gx2::clear_depth);
+    CHECK(problem.find("not supported") != std::string::npos);
+    CHECK(pixel(elements.at(0, 0)) == Pixel{0x00, 0x00, 0x80, 0x3F});
+}
+
+TEST_CASE_METHOD(ScanOutFixture,
+                 "GX2ClearDepthStencilEx clears when its packet runs, and sets what it is told",
+                 "[hle][gx2][scanout]") {
+    const gx2::DepthBuffer buffer = depth_buffer(1280, 720, 0x80E, kDepthImage);
+    std::array<u8, sizeof(gx2::DepthBuffer)> bytes{};
+    std::memcpy(bytes.data(), &buffer, sizeof(buffer));
+    REQUIRE(memory.write_bytes(kDepth, bytes));
+
+    // WHB's: depth and stencil, and both clear registers.
+    const u32 flags = gx2::clear_depth | gx2::clear_stencil | gx2::clear_set_depth_register |
+                      gx2::clear_set_stencil_register;
+    call("GX2ClearDepthStencilEx", {kDepth, 0x5A, flags}, {1.0F});
+    call("GX2Flush", {});
+    CHECK(pixel(kDepthImage) == Pixel{0, 0, 0, 0}); // GPU work: not yet
+
+    advance_to(gx2::vsync_tick(1));
+    CHECK(pixel(kDepthImage) == Pixel{0x00, 0x00, 0x80, 0x3F});
+    CHECK(pixel(kDepthImage + buffer.surface.image_size - 4) == Pixel{0x00, 0x00, 0x80, 0x3F});
+    CHECK(os.gpu.registers().read(latte::reg::db_stencil_clear) == 0x5A);
+    CHECK(os.gpu.registers().read(latte::reg::db_depth_clear) == 0x3F800000);
+}
+
+TEST_CASE_METHOD(ScanOutFixture,
+                 "a depth clear that does not ask to set the clear registers leaves them",
+                 "[hle][gx2][scanout]") {
+    const gx2::DepthBuffer buffer = depth_buffer(256, 64, 0x80E, kDepthImage);
+    std::array<u8, sizeof(gx2::DepthBuffer)> bytes{};
+    std::memcpy(bytes.data(), &buffer, sizeof(buffer));
+    REQUIRE(memory.write_bytes(kDepth, bytes));
+
+    call("GX2ClearDepthStencilEx", {kDepth, 0x5A, gx2::clear_depth}, {0.5F});
+    call("GX2Flush", {});
+    advance_to(gx2::vsync_tick(1));
+    CHECK(pixel(kDepthImage) == Pixel{0x00, 0x00, 0x00, 0x3F}); // 0.5f
+    CHECK(os.gpu.registers().read(latte::reg::db_stencil_clear) == 0);
+    CHECK(os.gpu.registers().read(latte::reg::db_depth_clear) == 0);
 }

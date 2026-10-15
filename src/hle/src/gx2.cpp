@@ -348,6 +348,22 @@ void Gpu::run_hle(const latte::pm4::Packet& packet) {
             return;
         }
 
+        case Opcode::HleClearDepthStencil: {
+            if (payload.size() != 3 + depth_buffer_words || memory_ == nullptr) {
+                report(fmt::format("a depth clear packet of {} words, or no memory to clear in",
+                                   payload.size()));
+                return;
+            }
+            const DepthBuffer buffer =
+                depth_buffer_from_words(payload.subspan<3, depth_buffer_words>());
+            report(clear_depth_stencil_buffer(*memory_,
+                                              buffer,
+                                              std::bit_cast<f32>(payload[1]),
+                                              static_cast<u8>(payload[2]),
+                                              payload[0]));
+            return;
+        }
+
         case Opcode::HleCopyColorToScan: {
             if (payload.size() != 1 + color_buffer_words || memory_ == nullptr) {
                 report(fmt::format("a scan-out copy packet of {} words, or no memory to copy in",

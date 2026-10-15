@@ -15,10 +15,12 @@
 #include <wiiu/hle/gx2_surface.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/color_buffer.hpp>
+#include <wiiu/latte/depth_buffer.hpp>
 #include <wiiu/memory/map.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -426,4 +428,106 @@ TEST_CASE_METHOD(SurfaceFixture,
     call("GX2CalcSurfaceSizeAndAlignment", 0x00000100);
     call("GX2InitColorBufferRegs", 0x00000100);
     SUCCEED("neither call faulted the host");
+}
+
+// --------------------------------------------------------------------------
+// Depth buffers
+// --------------------------------------------------------------------------
+
+namespace {
+
+/// WHB's depth buffer: a 2D float depth surface, default tile mode.
+[[nodiscard]] gx2::DepthBuffer whb_depth_buffer(u32 format) {
+    gx2::DepthBuffer buffer{};
+    buffer.surface = surface(gx2::SurfaceDim::Texture2D, 1280, 720, format);
+    buffer.surface.use = gx2::surface_use_depth_buffer;
+    buffer.view_num_slices = 1;
+    buffer.depth_clear = 1.0F;
+    REQUIRE(gx2::calc_surface_size_and_alignment(buffer.surface));
+    return buffer;
+}
+
+} // namespace
+
+TEST_CASE("a depth buffer's registers describe the surface it was sized as",
+          "[hle][gx2][surface]") {
+    wiiu::log::set_all_levels(wiiu::log::Level::Off);
+
+    const gx2::DepthBuffer buffer = whb_depth_buffer(0x80E); // FLOAT_R32
+    CHECK(buffer.surface.tile_mode == static_cast<u32>(TileMode::Tiled2DThin1));
+    CHECK(buffer.surface.image_size == 3'686'400);
+    const auto registers = gx2::depth_buffer_registers(buffer);
+    REQUIRE(registers.has_value());
+
+    const latte::DbDepthSize size{.raw = registers->size};
+    CHECK(size.pitch_tile_max == 1280 / 8 - 1);
+    CHECK(size.slice_tile_max == 1280 * 720 / 64 - 1);
+    CHECK(registers->view == 0);
+
+    const latte::DbDepthInfo info{.raw = registers->info};
+    CHECK(info.format == latte::DbFormat::Depth32Float);
+    CHECK(info.read_size_512);
+    CHECK(info.array_mode == TileMode::Tiled2DThin1);
+    CHECK_FALSE(info.tile_surface_enable); // no hierarchical-Z buffer given
+
+    // decaf's: the hierarchical-Z tile size and full cache, the prefetch
+    // limit in rows of tiles, the preload window in 32-pixel units, and the
+    // polygon offset scaled to a float's 23 bits of mantissa.
+    CHECK(registers->htile_surface == 0xB);
+    CHECK(registers->prefetch_limit == 720 / 8 - 1);
+    const latte::DbPreloadControl preload{.raw = registers->preload_control};
+    CHECK(preload.max_x == 1280 / 32);
+    CHECK(preload.max_y == 720 / 32);
+    const latte::PaSuPolyOffsetDbFmtCntl poly{.raw = registers->poly_offset_control};
+    CHECK(poly.neg_num_db_bits == 233);
+    CHECK(poly.db_is_float);
+}
+
+TEST_CASE("each depth format has its own format and polygon offset", "[hle][gx2][surface]") {
+    wiiu::log::set_all_levels(wiiu::log::Level::Off);
+
+    struct Case {
+        u32 format;
+        latte::DbFormat db_format;
+        u32 neg_bits;
+        bool is_float;
+    };
+
+    const Case cases[] = {
+        {0x005, latte::DbFormat::Depth16, 240, false},
+        {0x011, latte::DbFormat::Depth8_24, 232, false},
+        {0x811, latte::DbFormat::Depth8_24Float, 236, true},
+    };
+    for (const Case& c : cases) {
+        INFO("format " << c.format);
+        gx2::DepthBuffer buffer = whb_depth_buffer(c.format);
+        buffer.hi_z = 0x10200000;
+        const auto registers = gx2::depth_buffer_registers(buffer);
+        REQUIRE(registers.has_value());
+        const latte::DbDepthInfo info{.raw = registers->info};
+        CHECK(info.format == c.db_format);
+        CHECK(info.tile_surface_enable);
+        const latte::PaSuPolyOffsetDbFmtCntl poly{.raw = registers->poly_offset_control};
+        CHECK(poly.neg_num_db_bits == c.neg_bits);
+        CHECK(poly.db_is_float == c.is_float);
+    }
+}
+
+TEST_CASE_METHOD(SurfaceFixture,
+                 "GX2InitDepthBufferRegs writes the title's structure",
+                 "[hle][gx2][surface]") {
+    const gx2::DepthBuffer buffer = whb_depth_buffer(0x80E);
+    std::array<u8, sizeof(gx2::DepthBuffer)> bytes{};
+    std::memcpy(bytes.data(), &buffer, sizeof(buffer));
+    REQUIRE(memory.write_bytes(kBuffer, bytes));
+
+    call("GX2InitDepthBufferRegs", kBuffer);
+    CHECK(word(0x88) == 0x3F800000);                  // depthClear, untouched
+    CHECK(word(0x90) == (159U | (14'399U << 10)));    // DB_DEPTH_SIZE
+    CHECK(word(0x94) == 0);                           // DB_DEPTH_VIEW
+    CHECK(word(0x98) == 0x0002000E);                  // DB_DEPTH_INFO
+    CHECK(word(0x9C) == 0xB);                         // DB_HTILE_SURFACE
+    CHECK(word(0xA0) == 89);                          // DB_PREFETCH_LIMIT
+    CHECK(word(0xA4) == ((40U << 16) | (22U << 24))); // DB_PRELOAD_CONTROL
+    CHECK(word(0xA8) == (233U | (1U << 8)));          // PA_SU_POLY_OFFSET_DB_FMT_CNTL
 }
