@@ -22,6 +22,7 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <vector>
@@ -126,18 +127,24 @@ struct IosFixture {
     }
 
     void write_main_calling(std::string_view function, u32 argument) {
+        write_main_program(function, {li(3, argument)});
+    }
+
+    /// OSSleepTicks takes an OSTime: 64 bits, so r3:r4, high half first.
+    void write_main_sleeping(u32 ticks) {
+        write_main_program("OSSleepTicks", {li(3, 0), li(4, ticks)});
+    }
+
+    void write_main_program(std::string_view function, std::initializer_list<u32> arguments) {
         const ppcaddr_t trampoline = registry.resolve("coreinit", function);
-        const std::array<u32, 9> program{
+        std::vector<u32> program{
             kEnc_mflr_r31,
             lis_r12(trampoline),
             ori_r12(trampoline),
             kEnc_mtctr_r12,
-            li(3, argument),
-            kEnc_bctrl,
-            kEnc_mtlr_r31,
-            li(3, 0),
-            kEnc_blr,
         };
+        program.insert(program.end(), arguments);
+        program.insert(program.end(), {kEnc_bctrl, kEnc_mtlr_r31, li(3, 0), kEnc_blr});
         ppcaddr_t address = kMainProgram;
         for (const u32 word : program) {
             REQUIRE(memory.try_write<u32>(address, word));
@@ -674,7 +681,7 @@ TEST_CASE_METHOD(IosFixture, "IOS_OpenAsync calls back with the handle", "[hle][
     CHECK(callback_count() == 0U);
     CHECK(os.scheduler.timer_count() == 1U);
 
-    write_main_calling("OSSleepTicks", 8000);
+    write_main_sleeping(8000);
     static_cast<void>(run_it());
 
     CHECK(callback_count() == 1U);
@@ -702,7 +709,7 @@ TEST_CASE_METHOD(IosFixture, "IOS_IoctlAsync calls back with the status", "[hle]
     CHECK(os.filesystem.open_file_count() == 1);
     CHECK(callback_count() == 0U);
 
-    write_main_calling("OSSleepTicks", 8000);
+    write_main_sleeping(8000);
     static_cast<void>(run_it());
 
     CHECK(callback_count() == 1U);
@@ -718,7 +725,7 @@ TEST_CASE_METHOD(IosFixture,
     CHECK(icall("IOS_OpenAsync", {kDevicePath, 1, kCallbackProgram, 0}) ==
           static_cast<s32>(IosError::Ok));
 
-    write_main_calling("OSSleepTicks", 8000);
+    write_main_sleeping(8000);
     static_cast<void>(run_it());
 
     // The call was accepted and the *result* is the failure, which is the
@@ -765,7 +772,7 @@ TEST_CASE_METHOD(IosFixture, "IPC and FS completions do not share ids", "[hle][i
     CHECK(os.scheduler.has_timer(coreinit::ios_async_id_base));
     CHECK(os.scheduler.has_timer(coreinit::async_id_base));
 
-    write_main_calling("OSSleepTicks", 8000);
+    write_main_sleeping(8000);
     static_cast<void>(run_it());
 
     CHECK(callback_count() == 2U);
@@ -778,7 +785,7 @@ TEST_CASE_METHOD(IosFixture, "IOS_CloseAsync closes before it replies", "[hle][i
           static_cast<s32>(IosError::Ok));
     CHECK(os.ios.open_count() == 0);
 
-    write_main_calling("OSSleepTicks", 8000);
+    write_main_sleeping(8000);
     static_cast<void>(run_it());
 
     CHECK(callback_count() == 1U);

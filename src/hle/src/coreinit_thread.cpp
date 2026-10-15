@@ -107,7 +107,9 @@ void os_yield_thread(Call& call) {
 }
 
 void os_sleep_ticks(Call& call) {
-    const u32 ticks = call.next_word();
+    // OSTime is 64-bit, so it arrives in r3:r4. Reading r3 alone takes the
+    // high half, which for every sleep shorter than about a minute is zero.
+    const u64 ticks = call.next_long();
     scheduler().sleep(call.state, ticks);
 }
 
@@ -814,6 +816,10 @@ void Context::reset() {
 
     // The title's buffers; the frontend's flip hook stays.
     screens.reset();
+
+    // The GPU's timer went with the scheduler's; what it would have retired
+    // goes with the title.
+    gpu.reset();
 }
 
 Message read_message(memory::Memory& memory, ppcaddr_t address) {

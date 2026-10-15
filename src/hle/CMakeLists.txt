@@ -8,6 +8,7 @@ wiiu_add_library(hle
         src/coreinit_thread.cpp
         src/coreinit_time.cpp
         src/filesystem.cpp
+        src/gx2.cpp
         src/heap.cpp
         src/ios.cpp
         src/loader.cpp
@@ -19,6 +20,7 @@ wiiu_add_library(hle
     HEADERS
         include/wiiu/hle/coreinit.hpp
         include/wiiu/hle/filesystem.hpp
+        include/wiiu/hle/gx2.hpp
         include/wiiu/hle/heap.hpp
         include/wiiu/hle/ios.hpp
         include/wiiu/hle/loader.hpp
@@ -31,5 +33,6 @@ wiiu_add_library(hle
     DEPS
         wiiu::common
         wiiu::cpu
+        wiiu::latte
         wiiu::loader
         wiiu::memory)

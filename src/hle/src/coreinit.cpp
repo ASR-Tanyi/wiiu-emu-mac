@@ -684,6 +684,7 @@ void register_all(Registry& registry, Context& context) {
     register_time(registry, context);
     register_ios(registry, context);
     register_screen(registry, context);
+    gx2::register_gx2(registry, context);
 
     registry.add("coreinit", "OSReport", os_report);
     registry.add("coreinit", "OSConsoleWrite", os_report);

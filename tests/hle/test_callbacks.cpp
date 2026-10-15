@@ -18,6 +18,7 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -141,18 +142,24 @@ struct CallbackFixture {
     /// A main program that calls one coreinit function with one argument and
     /// then returns, which is all most of these tests need it to do.
     void write_main_calling(std::string_view function, u32 argument) {
+        write_main_program(function, {li(3, argument)});
+    }
+
+    /// OSSleepTicks takes an OSTime: 64 bits, so r3:r4, high half first.
+    void write_main_sleeping(u32 ticks) {
+        write_main_program("OSSleepTicks", {li(3, 0), li(4, ticks)});
+    }
+
+    void write_main_program(std::string_view function, std::initializer_list<u32> arguments) {
         const ppcaddr_t trampoline = registry.resolve("coreinit", function);
-        const std::array<u32, 9> program{
+        std::vector<u32> program{
             kEnc_mflr_r31,
             lis_r12(trampoline),
             ori_r12(trampoline),
             kEnc_mtctr_r12,
-            li(3, argument),
-            kEnc_bctrl,
-            kEnc_mtlr_r31,
-            li(3, 0),
-            kEnc_blr,
         };
+        program.insert(program.end(), arguments);
+        program.insert(program.end(), {kEnc_bctrl, kEnc_mtlr_r31, li(3, 0), kEnc_blr});
         write_program(kMainProgram, program);
 
         std::string error;
@@ -204,7 +211,7 @@ TEST_CASE_METHOD(CallbackFixture, "a guest callback runs on its own thread", "[h
     CHECK(thread->stack_base != 0U);
 
     // The main thread has nothing to do; the callback does.
-    write_main_calling("OSSleepTicks", 4000);
+    write_main_sleeping(4000);
     const RunReport report = run_it();
 
     INFO("outcome: " << run_outcome_name(report.outcome));
@@ -223,7 +230,7 @@ TEST_CASE_METHOD(CallbackFixture, "callback stacks are recycled", "[hle][callbac
     REQUIRE(first != 0);
     const ppcaddr_t stack = os.scheduler.find(first)->stack_base;
 
-    write_main_calling("OSSleepTicks", 4000);
+    write_main_sleeping(4000);
     static_cast<void>(run_it());
     REQUIRE(callback_count() == 1U);
 
@@ -257,7 +264,7 @@ TEST_CASE_METHOD(CallbackFixture,
     // Every thread asleep means no instructions run, which without the skip
     // looks exactly like a deadlock -- and a sleeping thread can never wake,
     // because nothing is advancing the clock it is waiting on.
-    write_main_calling("OSSleepTicks", 20000);
+    write_main_sleeping(20000);
 
     const RunReport report = run_it();
     CHECK(report.outcome == RunOutcome::Returned);
@@ -280,7 +287,7 @@ TEST_CASE_METHOD(CallbackFixture, "a one-shot alarm fires once", "[hle][alarm]")
     static_cast<void>(call("OSSetAlarm", {kAlarm, 0, 0, 1000, kCallbackProgram}));
     CHECK(os.scheduler.has_timer(kAlarm));
 
-    write_main_calling("OSSleepTicks", 8000);
+    write_main_sleeping(8000);
     const RunReport report = run_it();
 
     INFO("outcome: " << run_outcome_name(report.outcome));
@@ -298,7 +305,7 @@ TEST_CASE_METHOD(CallbackFixture, "a periodic alarm keeps firing", "[hle][alarm]
     // arguments, so r5:r6 and r7:r8, with the callback in r9.
     static_cast<void>(call("OSSetPeriodicAlarm", {kAlarm, 0, 0, 1000, 0, 1000, kCallbackProgram}));
 
-    write_main_calling("OSSleepTicks", 5500);
+    write_main_sleeping(5500);
     const RunReport report = run_it();
     INFO("outcome: " << run_outcome_name(report.outcome) << ", fired "
                      << os.alarms[kAlarm].fire_count << " times, callback ran " << callback_count()
@@ -321,7 +328,7 @@ TEST_CASE_METHOD(CallbackFixture, "a cancelled alarm does not fire", "[hle][alar
     CHECK(call("OSCancelAlarm", {kAlarm}) == 1U);
     CHECK_FALSE(os.scheduler.has_timer(kAlarm));
 
-    write_main_calling("OSSleepTicks", 8000);
+    write_main_sleeping(8000);
     static_cast<void>(run_it());
     CHECK(callback_count() == 0U);
 
@@ -410,7 +417,7 @@ TEST_CASE_METHOD(CallbackFixture,
     CHECK(callback_count() == 0U);
     CHECK(os.scheduler.timer_count() == 1U);
 
-    write_main_calling("OSSleepTicks", 8000);
+    write_main_sleeping(8000);
     static_cast<void>(run_it());
 
     CHECK(callback_count() == 1U);
@@ -462,7 +469,7 @@ TEST_CASE_METHOD(CallbackFixture,
     CHECK(call("OSPeekMessage", {kQueue, kInbox}) == 0U);
     CHECK(os.scheduler.timer_count() == 1U);
 
-    write_main_calling("OSSleepTicks", 8000);
+    write_main_sleeping(8000);
     static_cast<void>(run_it());
 
     // No callback ran; the message arrived instead.
@@ -696,7 +703,7 @@ TEST_CASE_METHOD(CallbackFixture,
     CHECK(os.scheduler.timer_count() == 1U);
 
     // Once the completion has been delivered the block is free again.
-    write_main_calling("OSSleepTicks", 8000);
+    write_main_sleeping(8000);
     static_cast<void>(run_it());
     CHECK(os.busy_fs_blocks.empty());
     CHECK(call("FSReadFileAsync", {kClient, kBlock, kBuffer, 1, 16, 0, 0, kAsyncData}) == 0U);
@@ -740,7 +747,7 @@ TEST_CASE_METHOD(CallbackFixture,
     static_cast<void>(
         call("FSReadFileAsync", {kClient, kBlock, kBuffer, 1, 16, handle, 0, kAsyncData}));
 
-    write_main_calling("OSSleepTicks", 8000);
+    write_main_sleeping(8000);
     static_cast<void>(run_it());
 
     CHECK(callback_count() == 1U);

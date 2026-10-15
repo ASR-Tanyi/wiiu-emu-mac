@@ -6,6 +6,7 @@
 #pragma once
 
 #include <wiiu/hle/filesystem.hpp>
+#include <wiiu/hle/gx2.hpp>
 #include <wiiu/hle/heap.hpp>
 #include <wiiu/hle/ios.hpp>
 #include <wiiu/hle/recording.hpp>
@@ -266,6 +267,9 @@ struct Context {
 
     /// OSScreen's two framebuffers, and the frontend's hook on a flip (6.8).
     Screens screens;
+
+    /// GX2's command buffers and the GPU behind them (8.1).
+    gx2::Gpu gpu;
 
     std::map<u32, Alarm> alarms;
 
