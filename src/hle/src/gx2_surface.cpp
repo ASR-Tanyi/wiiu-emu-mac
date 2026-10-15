@@ -888,6 +888,111 @@ void gx2_clear_depth_stencil_ex(Call& call, u32 address, f32 depth, u32 stencil,
     static_cast<void>(emit(call, packet));
 }
 
+/// What a render target's base register holds: the level's physical
+/// address in 256-byte units, with the surface's bank and pipe swizzle in its
+/// low bits while the level is still macro-tiled -- decaf's and Cemu's
+/// arithmetic. Nothing, logged, for a level with no memory the GPU can see.
+[[nodiscard]] std::optional<u32> base_register(const memory::Memory& memory,
+                                               const Surface& surface,
+                                               u32 level,
+                                               std::string_view what) {
+    const std::optional<ppcaddr_t> address = level_address(surface, level);
+    if (!address.has_value()) {
+        WIIU_LOG_ERROR(Gx2, "{}: the surface has no memory for level {}", what, level);
+        return std::nullopt;
+    }
+    std::optional<physaddr_t> physical = physical_address(memory, *address, what);
+    if (!physical.has_value()) {
+        return std::nullopt;
+    }
+    if (is_macro_tiled(surface.tile_mode) && level < ((surface.swizzle >> 16) & 0xFF)) {
+        *physical ^= surface.swizzle & 0xFFFF;
+    }
+    return *physical >> 8;
+}
+
+/// `void GX2SetColorBuffer(GX2ColorBuffer *buffer, GX2RenderTarget target)`.
+///
+/// The registers `GX2InitColorBufferRegs` worked out, as the title's
+/// structure holds them now, and the base address -- decaf's seven, one
+/// packet each. Cemu leaves out CMASK and FMASK and writes the base as a
+/// byte address for its own renderer; on hardware it is in 256-byte units,
+/// which is what Linux writes too.
+void gx2_set_color_buffer(Call& call, u32 address, u32 target) {
+    if (target >= latte::reg::render_target_count) {
+        WIIU_LOG_WARN(Gx2, "GX2SetColorBuffer: render target {} does not exist", target);
+        return;
+    }
+    ColorBuffer buffer{};
+    if (!read_guest(call.memory, address, buffer)) {
+        WIIU_LOG_ERROR(Gx2, "GX2SetColorBuffer: no colour buffer at {:#010x}", address);
+        return;
+    }
+    const u32 base =
+        base_register(call.memory, buffer.surface, buffer.view_mip, "GX2SetColorBuffer")
+            .value_or(0);
+
+    u32 tile = 0;
+    u32 frag = 0;
+    if (buffer.surface.aa != 0 && buffer.aa_buffer != 0) {
+        if (const auto aa = physical_address(call.memory, buffer.aa_buffer, "GX2SetColorBuffer")) {
+            frag = *aa >> 8;
+            tile = (*aa + buffer.cmask_offset) >> 8;
+        }
+    }
+
+    const u32 at = target * 4;
+    const std::array<std::pair<u32, u32>, 7> registers{{
+        {latte::reg::cb_color0_base + at, base},
+        {latte::reg::cb_color0_size + at, buffer.cb_color_size},
+        {latte::reg::cb_color0_info + at, buffer.cb_color_info},
+        {latte::reg::cb_color0_tile + at, tile},
+        {latte::reg::cb_color0_frag + at, frag},
+        {latte::reg::cb_color0_view + at, buffer.cb_color_view},
+        {latte::reg::cb_color0_mask + at, buffer.cb_color_mask},
+    }};
+    for (const auto& [register_address, value] : registers) {
+        const std::array<u32, 1> values{value};
+        static_cast<void>(emit_context_registers(call, register_address, values));
+    }
+}
+
+/// `void GX2SetDepthBuffer(GX2DepthBuffer *buffer)`: decaf's registers and
+/// order. Cemu's own notes call its version a hack for its renderer.
+void gx2_set_depth_buffer(Call& call, u32 address) {
+    DepthBuffer buffer{};
+    if (!read_guest(call.memory, address, buffer)) {
+        WIIU_LOG_ERROR(Gx2, "GX2SetDepthBuffer: no depth buffer at {:#010x}", address);
+        return;
+    }
+    const u32 base =
+        base_register(call.memory, buffer.surface, buffer.view_mip, "GX2SetDepthBuffer")
+            .value_or(0);
+    u32 hi_z = 0;
+    if (buffer.hi_z != 0) {
+        if (const auto physical = physical_address(call.memory, buffer.hi_z, "GX2SetDepthBuffer")) {
+            hi_z = *physical >> 8;
+        }
+    }
+
+    const std::array<u32, 2> size_view{buffer.db_depth_size, buffer.db_depth_view};
+    const std::array<u32, 3> base_info{base, buffer.db_depth_info, hi_z};
+    const std::array<u32, 1> htile{buffer.db_htile_surface};
+    const std::array<u32, 1> prefetch{buffer.db_prefetch_limit};
+    const std::array<u32, 1> preload{buffer.db_preload_control};
+    const std::array<u32, 1> poly{buffer.pa_poly_offset_control};
+    const std::array<u32, 2> clear{buffer.stencil_clear,
+                                   std::bit_cast<u32>(buffer.depth_clear.value())};
+    static_cast<void>(emit_context_registers(call, latte::reg::db_depth_size, size_view));
+    static_cast<void>(emit_context_registers(call, latte::reg::db_depth_base, base_info));
+    static_cast<void>(emit_context_registers(call, latte::reg::db_htile_surface, htile));
+    static_cast<void>(emit_context_registers(call, latte::reg::db_prefetch_limit, prefetch));
+    static_cast<void>(emit_context_registers(call, latte::reg::db_preload_control, preload));
+    static_cast<void>(
+        emit_context_registers(call, latte::reg::pa_su_poly_offset_db_fmt_cntl, poly));
+    static_cast<void>(emit_context_registers(call, latte::reg::db_stencil_clear, clear));
+}
+
 } // namespace
 
 void register_gx2_surface(Registry& registry) {
@@ -897,6 +1002,8 @@ void register_gx2_surface(Registry& registry) {
     registry.add("gx2", "GX2CopyColorBufferToScanBuffer", gx2_copy_color_buffer_to_scan_buffer);
     registry.add("gx2", "GX2InitDepthBufferRegs", gx2_init_depth_buffer_regs);
     registry.add("gx2", "GX2ClearDepthStencilEx", gx2_clear_depth_stencil_ex);
+    registry.add("gx2", "GX2SetColorBuffer", gx2_set_color_buffer);
+    registry.add("gx2", "GX2SetDepthBuffer", gx2_set_depth_buffer);
 }
 
 } // namespace wiiu::hle::gx2

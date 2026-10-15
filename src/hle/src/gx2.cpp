@@ -1,6 +1,7 @@
 #include <wiiu/common/log.hpp>
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/gx2.hpp>
+#include <wiiu/hle/gx2_state.hpp>
 #include <wiiu/hle/gx2_surface.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/pm4.hpp>
@@ -516,9 +517,9 @@ namespace {
     return active().gpu;
 }
 
-/// The physical address GX2 writes into PM4 for a buffer in the title's
-/// memory, or nothing -- logged -- if it has none.
-[[nodiscard]] std::optional<physaddr_t>
+} // namespace
+
+std::optional<physaddr_t>
 physical_address(const memory::Memory& memory, ppcaddr_t address, std::string_view what) {
     const memory::Region* const region = memory.region_of(address);
     physaddr_t physical = 0;
@@ -529,7 +530,15 @@ physical_address(const memory::Memory& memory, ppcaddr_t address, std::string_vi
     return physical;
 }
 
-} // namespace
+bool emit_context_registers(Call& call, u32 address, std::span<const u32> values) {
+    std::vector<u32> packet;
+    packet.reserve(2 + values.size());
+    packet.push_back(latte::pm4::type3_header(latte::pm4::Opcode::SetContextReg,
+                                              static_cast<u32>(1 + values.size())));
+    packet.push_back((address - context_register_base) / 4);
+    packet.insert(packet.end(), values.begin(), values.end());
+    return emit(call, packet);
+}
 
 // Every handler that writes PM4 goes through here: a write can fill the main
 // buffer and submit it, and a submission nobody arms the timer for would sit
@@ -898,6 +907,7 @@ void register_gx2(Registry& registry, coreinit::Context& context) {
 
     register_gx2_display(registry);
     register_gx2_surface(registry);
+    register_gx2_state(registry);
 }
 
 } // namespace wiiu::hle::gx2

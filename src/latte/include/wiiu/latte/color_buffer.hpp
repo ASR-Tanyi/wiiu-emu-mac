@@ -95,6 +95,21 @@ union CbColorView {
     BitField<13, 11, u32> slice_max;
 };
 
+namespace reg {
+/// Render target 0's registers, byte addresses; target n's are 4n further
+/// on. Linux's `r600d.h` and decaf's and Cemu's tables agree.
+inline constexpr u32 cb_color0_base = 0x28040; ///< address >> 8, swizzle in the low bits
+inline constexpr u32 cb_color0_size = 0x28060;
+inline constexpr u32 cb_color0_view = 0x28080;
+inline constexpr u32 cb_color0_info = 0x280A0;
+inline constexpr u32 cb_color0_tile = 0x280C0; ///< CMASK, for a multisampled target
+inline constexpr u32 cb_color0_frag = 0x280E0; ///< FMASK, likewise
+inline constexpr u32 cb_color0_mask = 0x28100;
+
+/// Render targets: CB_COLOR0 to CB_COLOR7.
+inline constexpr u32 render_target_count = 8;
+} // namespace reg
+
 /// Whether a colour format can be a render target at all: the CB_FORMAT
 /// values the colour block has, which are the data formats' numbers for the
 /// same layouts -- everything from 8 to 32_32_32_32_FLOAT but the gaps at 4

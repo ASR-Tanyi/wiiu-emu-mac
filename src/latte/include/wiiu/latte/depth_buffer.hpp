@@ -111,9 +111,21 @@ union PaSuPolyOffsetDbFmtCntl {
 };
 
 namespace reg {
+/// The depth buffer's registers, byte addresses. Linux's register list for
+/// R600 (`reg_srcs/r600`, and `r600d.h`) has every one of them where decaf
+/// and Cemu do.
+inline constexpr u32 db_depth_size = 0x28000;
+inline constexpr u32 db_depth_view = 0x28004;
+inline constexpr u32 db_depth_base = 0x2800C; ///< address >> 8, swizzle in the low bits
+inline constexpr u32 db_depth_info = 0x28010;
+inline constexpr u32 db_htile_data_base = 0x28014;
+inline constexpr u32 db_htile_surface = 0x28D24;
+inline constexpr u32 db_preload_control = 0x28D30;
+inline constexpr u32 db_prefetch_limit = 0x28D34;
+inline constexpr u32 pa_su_poly_offset_db_fmt_cntl = 0x28DF8;
+
 /// The values a depth clear writes, as `GX2ClearDepthStencilEx` asks:
-/// stencil in the low byte, depth as a float's bits. Byte addresses; decaf's
-/// and Cemu's tables agree.
+/// stencil in the low byte, depth as a float's bits.
 inline constexpr u32 db_stencil_clear = 0x28028;
 inline constexpr u32 db_depth_clear = 0x2802C;
 } // namespace reg

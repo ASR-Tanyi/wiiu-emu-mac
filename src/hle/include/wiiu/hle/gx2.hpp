@@ -458,6 +458,19 @@ void start_vsync(coreinit::Context& context, u64 now);
 /// anything. What every GX2 call that sends the GPU something goes through.
 bool emit(Call& call, std::span<const u32> words);
 
+/// Where the context registers start: SET_CONTEXT_REG addresses them in
+/// words from here.
+inline constexpr u32 context_register_base = 0x28000;
+
+/// `SET_CONTEXT_REG` for consecutive registers from the byte address
+/// `address`, through `emit`.
+bool emit_context_registers(Call& call, u32 address, std::span<const u32> values);
+
+/// The physical address GX2 writes into PM4 for something in the title's
+/// memory, or nothing -- logged, naming `what` -- if the GPU cannot see it.
+[[nodiscard]] std::optional<physaddr_t>
+physical_address(const memory::Memory& memory, ppcaddr_t address, std::string_view what);
+
 /// Register the GX2 entry points under the `gx2` library.
 void register_gx2(Registry& registry, coreinit::Context& context);
 

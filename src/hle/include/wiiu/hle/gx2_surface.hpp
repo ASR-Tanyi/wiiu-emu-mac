@@ -308,8 +308,9 @@ inline constexpr u32 depth_buffer_words = sizeof(DepthBuffer) / 4;
                                              ppcaddr_t frame);
 
 /// Register `GX2CalcSurfaceSizeAndAlignment`, `GX2InitColorBufferRegs`,
-/// `GX2ClearColor`, `GX2CopyColorBufferToScanBuffer`, `GX2InitDepthBufferRegs`
-/// and `GX2ClearDepthStencilEx`. Called by `register_gx2`.
+/// `GX2ClearColor`, `GX2CopyColorBufferToScanBuffer`, `GX2InitDepthBufferRegs`,
+/// `GX2ClearDepthStencilEx`, `GX2SetColorBuffer` and `GX2SetDepthBuffer`.
+/// Called by `register_gx2`.
 void register_gx2_surface(Registry& registry);
 
 } // namespace gx2

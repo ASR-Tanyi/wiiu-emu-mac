@@ -23,6 +23,7 @@ wiiu_add_library(latte
         include/wiiu/latte/registers.hpp
         include/wiiu/latte/surface.hpp
         include/wiiu/latte/timeline.hpp
+        include/wiiu/latte/viewport.hpp
     DEPS
         wiiu::common
         wiiu::memory
