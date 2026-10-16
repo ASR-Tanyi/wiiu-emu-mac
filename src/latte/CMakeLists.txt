@@ -9,6 +9,7 @@
 wiiu_add_library(latte
     SOURCES
         src/command_processor.cpp
+        src/control_flow.cpp
         src/formats.cpp
         src/pm4.cpp
         src/registers.cpp
@@ -17,6 +18,7 @@ wiiu_add_library(latte
     HEADERS
         include/wiiu/latte/color_buffer.hpp
         include/wiiu/latte/command_processor.hpp
+        include/wiiu/latte/control_flow.hpp
         include/wiiu/latte/depth_buffer.hpp
         include/wiiu/latte/draw.hpp
         include/wiiu/latte/formats.hpp

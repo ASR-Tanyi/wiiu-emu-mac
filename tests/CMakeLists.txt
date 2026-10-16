@@ -117,6 +117,7 @@ endif()
 wiiu_add_test(latte
     SOURCES
         latte/test_command_processor.cpp
+        latte/test_control_flow.cpp
         latte/test_depth_buffer.cpp
         latte/test_formats.cpp
         latte/test_pm4.cpp

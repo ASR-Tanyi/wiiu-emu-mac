@@ -15,6 +15,7 @@
 #include <wiiu/hle/gx2_fetch_shader.hpp>
 #include <wiiu/hle/gx2_shader.hpp>
 #include <wiiu/hle/registry.hpp>
+#include <wiiu/latte/control_flow.hpp>
 #include <wiiu/latte/microcode.hpp>
 #include <wiiu/latte/shader_state.hpp>
 #include <wiiu/memory/map.hpp>
@@ -202,6 +203,21 @@ TEST_CASE("sixteen fetches to a clause", "[hle][gx2][fetch]") {
     // The seventeenth fetch is the last.
     const latte::VtxWord1 last{.raw = program.words[(32 / 4) + (16 * 4) + 1]};
     CHECK(last.semantic_id == 16U);
+
+    // And the decompiler's first stage reads it back: two clauses, inside
+    // the program, then the RETURN.
+    latte::ControlFlow flow;
+    std::string error;
+    REQUIRE(
+        latte::decode_control_flow(program.words, latte::ProgramShape::FetchShader, flow, error));
+    REQUIRE(flow.clauses.size() == 2);
+    CHECK(flow.clauses[0].count == 16);
+    CHECK(flow.clauses[1].offset_bytes() == 32 + (16 * 16));
+    CHECK(flow.clauses[1].offset_bytes() + flow.clauses[1].size_bytes() ==
+          program.words.size() * 4);
+    CHECK(latte::disassemble(flow) == "00 VTX_TC: ADDR(4) CNT(16) NO_BARRIER\n"
+                                      "01 VTX_TC: ADDR(36) CNT(1) NO_BARRIER\n"
+                                      "02 RETURN\n");
 }
 
 TEST_CASE("instance divisors become step rates", "[hle][gx2][fetch]") {

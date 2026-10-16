@@ -7,9 +7,13 @@
 // program first, two words an instruction, then the clauses it points at,
 // four words a fetch.
 //
-// Only what the fetch shader needs is here so far: the common form of a
-// control-flow instruction, and a vertex fetch. The field positions are
-// decaf's and Cemu's, which agree on every one of them.
+// So far: the three forms of a control-flow instruction -- the common one,
+// the ALU clause's and the export's -- and a vertex fetch. The field
+// positions are decaf's and Cemu's, which agree on every one of them; the
+// instruction numbers are decaf's, which follow AMD's R700 ISA, and Cemu's
+// agree on every one it has. A word's top two CF_INST bits are its form:
+// 0 the common one, 1 an export, 2 or 3 an ALU clause, whose CF_INST is the
+// word's top four bits rather than seven.
 #pragma once
 
 #include <wiiu/common/bitfield.hpp>
@@ -17,13 +21,81 @@
 
 namespace wiiu::latte {
 
-/// CF_INST: what a control-flow instruction does. The ones GX2 writes.
+/// Which form a control-flow instruction is: CF_INST's top two bits.
+enum class CfInstType : u32 {
+    Normal = 0,
+    Export = 1,
+    Alu = 2,
+    AluExtended = 3, ///< an ALU clause whose CF_INST has bit 2 set
+};
+
+/// CF_INST, for the common form.
 enum class CfInst : u32 {
     Nop = 0x00,
+    Tex = 0x01,
     Vtx = 0x02,
-    VtxTc = 0x03,  ///< a vertex fetch clause, through the texture cache
+    VtxTc = 0x03, ///< a vertex fetch clause, through the texture cache
+    LoopStart = 0x04,
+    LoopEnd = 0x05,
+    LoopStartDx10 = 0x06,
+    LoopStartNoAl = 0x07,
+    LoopContinue = 0x08,
+    LoopBreak = 0x09,
+    Jump = 0x0A,
+    Push = 0x0B,
+    PushElse = 0x0C,
+    Else = 0x0D,
+    Pop = 0x0E,
+    PopJump = 0x0F,
+    PopPush = 0x10,
+    PopPushElse = 0x11,
+    Call = 0x12,
     CallFs = 0x13, ///< the vertex shader calling its fetch shader
     Return = 0x14,
+    EmitVertex = 0x15,
+    EmitCutVertex = 0x16,
+    CutVertex = 0x17,
+    Kill = 0x18,
+    EndProgram = 0x19,
+    WaitAck = 0x1A,
+    TexAck = 0x1B,
+    VtxAck = 0x1C,
+    VtxTcAck = 0x1D, ///< the last R700 has; 0x1E on are Evergreen's
+};
+
+/// CF_INST, for an export. The memory exports' TYPE is a `MemExportType`.
+enum class ExportInst : u32 {
+    MemStream0 = 0x20,
+    MemStream1 = 0x21,
+    MemStream2 = 0x22,
+    MemStream3 = 0x23,
+    MemScratch = 0x24,
+    MemReduction = 0x25,
+    MemRing = 0x26,
+    Export = 0x27,     ///< EXP
+    ExportDone = 0x28, ///< EXP_DONE: the last export of its type
+    MemExport = 0x3A,
+};
+
+/// CF_INST, for an ALU clause: four bits, at the top of the word.
+enum class AluCfInst : u32 {
+    Alu = 0x8,
+    AluPushBefore = 0x9,
+    AluPopAfter = 0xA,
+    AluPop2After = 0xB,
+    AluExtended = 0xC, ///< reserved on R700; Evergreen's ALU_EXT
+    AluContinue = 0xD,
+    AluBreak = 0xE,
+    AluElseAfter = 0xF,
+};
+
+/// COND: when a control-flow instruction runs. CF_BOOL and CF_NOT_BOOL
+/// test the bool constant CF_CONST names.
+enum class CfCond : u32 {
+    Active = 0,
+    AlwaysFalse = 1,
+    Bool = 2,
+    NotBool = 3,
 };
 
 /// A control-flow instruction's first word: where its clause starts, in
@@ -46,8 +118,100 @@ union CfWord1 {
     BitField<21, 1, bool> end_of_program;
     BitField<22, 1, bool> valid_pixel_mode;
     BitField<23, 7, CfInst> cf_inst;
+    BitField<28, 2, CfInstType> cf_inst_type;
     BitField<30, 1, bool> whole_quad_mode;
     BitField<31, 1, bool> barrier;
+};
+
+/// KCACHE_MODE: how many sets of sixteen uniforms an ALU clause's constant
+/// cache locks from a uniform block -- none, one or two -- or two counted
+/// from the loop index.
+enum class KcacheMode : u32 {
+    Nop = 0,
+    Lock1 = 1,
+    Lock2 = 2,
+    LockLoopIndex = 3,
+};
+
+/// An ALU clause's first word: where it starts, in 64-bit words, and the
+/// uniform blocks (banks) its two constant caches read.
+union CfAluWord0 {
+    u32 raw;
+    BitField<0, 22, u32> addr;
+    BitField<22, 4, u32> kcache_bank0;
+    BitField<26, 4, u32> kcache_bank1;
+    BitField<30, 2, KcacheMode> kcache_mode0;
+};
+
+/// The second: the caches' first sets of sixteen, and the clause's length
+/// in 64-bit slots -- instructions and literals both -- less one.
+union CfAluWord1 {
+    u32 raw;
+    BitField<0, 2, KcacheMode> kcache_mode1;
+    BitField<2, 8, u32> kcache_addr0;
+    BitField<10, 8, u32> kcache_addr1;
+    BitField<18, 7, u32> count;
+    BitField<25, 1, bool> alt_const;
+    BitField<26, 4, AluCfInst> cf_inst;
+    BitField<30, 1, bool> whole_quad_mode;
+    BitField<31, 1, bool> barrier;
+};
+
+/// An export's TYPE, for EXP and EXP_DONE.
+enum class ExportType : u32 {
+    Pixel = 0,
+    Position = 1,
+    Parameter = 2,
+};
+
+/// And for the memory exports.
+enum class MemExportType : u32 {
+    Write = 0,
+    WriteIndexed = 1,
+    Read = 2,
+    ReadIndexed = 3,
+};
+
+/// The array base a position export counts from: POS0 is 60.
+inline constexpr u32 export_position_base = 60;
+
+/// An export's first word: where it goes, and which register it sends.
+union CfExportWord0 {
+    u32 raw;
+    BitField<0, 13, u32> array_base;
+    BitField<13, 2, u32> type; ///< an `ExportType`, or a `MemExportType`
+    BitField<15, 7, u32> rw_gpr;
+    BitField<22, 1, bool> rw_rel;
+    BitField<23, 7, u32> index_gpr;
+    BitField<30, 2, u32> elem_size;
+};
+
+/// The second: BURST_COUNT + 1 registers, from RW_GPR on, to as many array
+/// entries from ARRAY_BASE on.
+union CfExportWord1 {
+    u32 raw;
+    BitField<17, 4, u32> burst_count;
+    BitField<21, 1, bool> end_of_program;
+    BitField<22, 1, bool> valid_pixel_mode;
+    BitField<23, 7, ExportInst> cf_inst;
+    BitField<30, 1, bool> whole_quad_mode;
+    BitField<31, 1, bool> barrier;
+};
+
+/// Its low half, for EXP and EXP_DONE: which component goes where.
+union CfExportWord1Swizzle {
+    u32 raw;
+    BitField<0, 3, u32> sel_x; ///< a `Sel`
+    BitField<3, 3, u32> sel_y;
+    BitField<6, 3, u32> sel_z;
+    BitField<9, 3, u32> sel_w;
+};
+
+/// And for the memory exports: how many elements, and which components.
+union CfExportWord1Buffer {
+    u32 raw;
+    BitField<0, 12, u32> array_size;
+    BitField<12, 4, u32> comp_mask;
 };
 
 /// VTX_INST: a plain fetch into a register, or a semantic fetch, whose
