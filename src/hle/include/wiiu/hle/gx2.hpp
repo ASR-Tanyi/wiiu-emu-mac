@@ -466,6 +466,11 @@ inline constexpr u32 context_register_base = 0x28000;
 /// `address`, through `emit`.
 bool emit_context_registers(Call& call, u32 address, std::span<const u32> values);
 
+/// Call a display list in the title's memory, `bytes` long, with
+/// `INDIRECT_BUFFER_PRIV` through `emit` -- `GX2CallDisplayList`. False,
+/// having logged why naming `what`, if the GPU cannot see it.
+bool emit_display_list_call(Call& call, ppcaddr_t list, u32 bytes, std::string_view what);
+
 /// The physical address GX2 writes into PM4 for something in the title's
 /// memory, or nothing -- logged, naming `what` -- if the GPU cannot see it.
 [[nodiscard]] std::optional<physaddr_t>

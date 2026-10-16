@@ -22,8 +22,15 @@
 //     under ADR-004 packets run when their submission *retires*, so that is
 //     the moment the guest can see them, on the guest's own clock.
 //
+//   * **Shadowing.** `CONTEXT_CONTROL` turns state shadowing on and off, and
+//     the `LOAD_*` packets name, per register window, a block of guest
+//     memory: they load registers from it, and while shadowing is on every
+//     `SET_*` into that window is written there as well. That is how GX2's
+//     context states work -- each is such a block, and switching to one is
+//     loading it (see below).
+//
 // Everything else is either **deferred** -- recognised, counted, and not yet
-// acted on: cache flushes, waits on memory, context shadowing -- or
+// acted on: cache flushes, waits on memory -- or
 // **unknown**, and logged once by number. Neither stops the stream: the packet framing is still
 // right, so the packets after it are still worth reading. A stream that cannot be framed does stop,
 // because then nothing after it is.
@@ -37,6 +44,7 @@
 #include <array>
 #include <functional>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -91,6 +99,63 @@ struct DrawCommand {
 /// unit wider than the write is taken as the whole write.
 [[nodiscard]] std::array<u8, 8> encode_write(u64 value, u32 size, u32 endian_swap) noexcept;
 
+/// `CONTEXT_CONTROL`'s two words, LOAD_CONTROL and SHADOW_ENABLE: one bit
+/// per register window, and bit 31, which both are written with. decaf's
+/// field names; the one value Cemu knows, 0x80000077, is these bits for the
+/// six windows a GX2 context state holds.
+///
+/// The model is decaf's: a `LOAD_*` packet for a window whose load bit is
+/// set loads its ranges and makes its address that window's **shadow
+/// base**; one whose bit is clear does nothing. A `SET_*` into a window whose
+/// shadow bit is set, once it has a base, is written there too -- at the
+/// base plus the register's offset into its window, so the block is an image
+/// of the window. Cemu instead keeps an address per register, packing the
+/// ranges one after another. The registers come out the same either way for
+/// everything GX2 does, and only the GPU reads the block back, so either is
+/// self-consistent. Shadow memory is big-endian, as Cemu keeps it and as
+/// GX2 keeps the rest of what the GPU reads (decaf stores host order).
+/// Type 0 writes are not shadowed.
+namespace context_control {
+inline constexpr u32 config = 1U << 0;
+inline constexpr u32 context = 1U << 1;
+inline constexpr u32 alu_const = 1U << 2;
+inline constexpr u32 bool_const = 1U << 3;
+inline constexpr u32 loop_const = 1U << 4;
+inline constexpr u32 resource = 1U << 5;
+inline constexpr u32 sampler = 1U << 6;
+inline constexpr u32 ctl_const = 1U << 7;
+inline constexpr u32 ordinal = 1U << 31;
+
+/// The bit for `window`.
+[[nodiscard]] constexpr u32 bit(Window window) noexcept {
+    switch (window) {
+        case Window::Config:
+            return config;
+        case Window::Context:
+            return context;
+        case Window::AluConst:
+            return alu_const;
+        case Window::Resource:
+            return resource;
+        case Window::Sampler:
+            return sampler;
+        case Window::CtlConst:
+            return ctl_const;
+        case Window::LoopConst:
+            return loop_const;
+        case Window::BoolConst:
+            return bool_const;
+    }
+    return 0;
+}
+} // namespace context_control
+
+/// The window a `LOAD_*` opcode loads, or nothing for any other opcode.
+[[nodiscard]] std::optional<Window> load_window(pm4::Opcode opcode) noexcept;
+
+/// The windows, for walking them all.
+inline constexpr u32 window_count = 8;
+
 struct CommandProcessorStats {
     u64 packets = 0;
     u64 draws = 0;
@@ -107,6 +172,12 @@ struct CommandProcessorStats {
 
     /// Values written into guest memory by `MEM_WRITE` and `EVENT_WRITE_EOP`.
     u64 memory_writes = 0;
+
+    /// Registers loaded from guest memory by the `LOAD_*` packets.
+    u64 registers_loaded = 0;
+
+    /// Registers a `SET_*` also wrote to a shadow block.
+    u64 registers_shadowed = 0;
 
     /// `EVENT_WRITE_EOP`s that asked for an interrupt.
     u64 interrupts = 0;
@@ -161,6 +232,23 @@ public:
     /// for 8.2 and beyond, ordered by what titles actually send.
     [[nodiscard]] const std::map<u8, u64>& unhandled() const noexcept { return unhandled_; }
 
+    /// `CONTEXT_CONTROL`'s words as last set. Both zero -- no loading, no
+    /// shadowing -- until a stream sets them.
+    [[nodiscard]] u32 load_control() const noexcept { return load_control_; }
+
+    [[nodiscard]] u32 shadow_enable() const noexcept { return shadow_enable_; }
+
+    /// Where `window` is shadowed, as a physical address: the last `LOAD_*`
+    /// for it that its load bit let through. Nothing before one has.
+    [[nodiscard]] std::optional<physaddr_t> shadow_base(Window window) const noexcept {
+        return shadow_bases_[static_cast<u32>(window)];
+    }
+
+    /// The GPU's own state back to how it starts: no shadowing, no shadow
+    /// blocks, one instance, 16-bit indices. Listeners, memory and counters
+    /// stay; the register file is its owner's to reset.
+    void reset_state() noexcept;
+
     /// Nested buffers deeper than this are refused. GX2 display lists call
     /// one level down; a cycle in guest memory would otherwise recurse until
     /// the host stack ran out.
@@ -171,6 +259,17 @@ private:
 
     void packet(const pm4::Packet& packet, u32 depth);
     void set_window(const pm4::Packet& packet, Window window);
+    void context_control(const pm4::Packet& packet);
+    void load(const pm4::Packet& packet, Window window);
+
+    /// Copy registers just written to `window` at `offset` into its shadow
+    /// block, if it is being shadowed.
+    void shadow(const pm4::Packet& packet, Window window, u32 offset, std::span<const u32> values);
+
+    /// Guest memory at a physical address, `bytes` long, or null -- having
+    /// said why, naming the packet -- if that is not memory the GPU can use.
+    [[nodiscard]] u8*
+    guest_bytes(const pm4::Packet& packet, physaddr_t physical, u32 bytes, memory::Access access);
     void draw(const pm4::Packet& packet);
     void indirect(const pm4::Packet& packet, u32 depth);
     void mem_write(const pm4::Packet& packet);
@@ -193,6 +292,9 @@ private:
 
     u32 instances_ = 1;
     u32 index_type_ = 0;
+    u32 load_control_ = 0;
+    u32 shadow_enable_ = 0;
+    std::array<std::optional<physaddr_t>, window_count> shadow_bases_{};
 
     CommandProcessorStats stats_;
     std::string last_error_;

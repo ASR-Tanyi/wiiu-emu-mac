@@ -32,6 +32,37 @@ std::array<u8, 8> encode_write(u64 value, u32 size, u32 endian_swap) noexcept {
     return bytes;
 }
 
+std::optional<Window> load_window(Opcode opcode) noexcept {
+    switch (opcode) {
+        case Opcode::LoadConfigReg:
+            return Window::Config;
+        case Opcode::LoadContextReg:
+            return Window::Context;
+        case Opcode::LoadAluConst:
+            return Window::AluConst;
+        case Opcode::LoadBoolConst:
+            return Window::BoolConst;
+        case Opcode::LoadLoopConst:
+            return Window::LoopConst;
+        case Opcode::LoadResource:
+            return Window::Resource;
+        case Opcode::LoadSampler:
+            return Window::Sampler;
+        case Opcode::LoadCtlConst:
+            return Window::CtlConst;
+        default:
+            return std::nullopt;
+    }
+}
+
+void CommandProcessor::reset_state() noexcept {
+    instances_ = 1;
+    index_type_ = 0;
+    load_control_ = 0;
+    shadow_enable_ = 0;
+    shadow_bases_ = {};
+}
+
 bool CommandProcessor::execute(std::span<const u32> words) {
     return execute_at_depth(words, 0);
 }
@@ -113,6 +144,21 @@ void CommandProcessor::packet(const Packet& packet, u32 depth) {
             set_window(packet, Window::BoolConst);
             return;
 
+        case Opcode::ContextControl:
+            context_control(packet);
+            return;
+
+        case Opcode::LoadConfigReg:
+        case Opcode::LoadContextReg:
+        case Opcode::LoadAluConst:
+        case Opcode::LoadBoolConst:
+        case Opcode::LoadLoopConst:
+        case Opcode::LoadResource:
+        case Opcode::LoadSampler:
+        case Opcode::LoadCtlConst:
+            load(packet, *load_window(static_cast<Opcode>(packet.header.opcode)));
+            return;
+
         case Opcode::IndexType:
             index_type_ = packet.payload[0];
             return;
@@ -140,9 +186,8 @@ void CommandProcessor::packet(const Packet& packet, u32 depth) {
 
         // Recognised and not acted on yet: cache flushes and invalidations
         // (which matter once there is a texture cache, 8.13), waits on guest
-        // memory, the context shadowing CONTEXT_CONTROL turns on, occlusion
-        // queries and the other EVENT_WRITEs, and stream-out bookkeeping.
-        case Opcode::ContextControl:
+        // memory, occlusion queries and the other EVENT_WRITEs, and
+        // stream-out bookkeeping.
         case Opcode::SurfaceSync:
         case Opcode::EventWrite:
         case Opcode::WaitRegMem:
@@ -180,9 +225,133 @@ void CommandProcessor::set_window(const Packet& packet, Window window) {
     // The first word is the register offset, in words, from the window's
     // base; the rest are values for consecutive registers.
     std::string error;
-    if (!registers_->write_window(window, packet.payload[0], packet.payload.subspan(1), error)) {
+    const u32 offset = packet.payload[0];
+    const std::span<const u32> values = packet.payload.subspan(1);
+    if (!registers_->write_window(window, offset, values, error)) {
         fail(fmt::format("{} at word {}", error, packet.offset));
+        return;
     }
+    shadow(packet, window, offset, values);
+}
+
+void CommandProcessor::context_control(const Packet& packet) {
+    // LOAD_CONTROL, SHADOW_ENABLE
+    if (packet.payload.size() < 2) {
+        fail(fmt::format(
+            "CONTEXT_CONTROL at word {} is {} words, not 2", packet.offset, packet.payload.size()));
+        return;
+    }
+    load_control_ = packet.payload[0];
+    shadow_enable_ = packet.payload[1];
+}
+
+u8* CommandProcessor::guest_bytes(const Packet& packet,
+                                  physaddr_t physical,
+                                  u32 bytes,
+                                  memory::Access access) {
+    ppcaddr_t address = 0;
+    u8* host = nullptr;
+    if (memory_ != nullptr && memory::to_virtual(memory_->regions(), physical, address)) {
+        host = memory_->translate(address, bytes, access);
+    }
+    if (host == nullptr) {
+        fail(fmt::format("{} at word {} {} {} bytes at physical {:#010x}, which is not {} memory",
+                         pm4::opcode_name(packet.header.opcode),
+                         packet.offset,
+                         access == memory::Access::Write ? "writes" : "reads",
+                         bytes,
+                         physical,
+                         access == memory::Access::Write ? "writable" : "readable"));
+    }
+    return host;
+}
+
+void CommandProcessor::load(const Packet& packet, Window window) {
+    // address low, address high, then (offset, count) pairs: `count`
+    // registers from `offset` words into the window, read from the same
+    // offset into the block. The high word's low byte would be address bits
+    // 32-39, which the Wii U never needs; GX2 sets bit 31 on the config load
+    // (Cemu reads it as wait-for-idle), which needs nothing here.
+    const std::span<const u32> payload = packet.payload;
+    if (payload.size() < 2 || (payload.size() % 2) != 0) {
+        fail(fmt::format("{} at word {} is {} words, not an address and (offset, count) pairs",
+                         pm4::opcode_name(packet.header.opcode),
+                         packet.offset,
+                         payload.size()));
+        return;
+    }
+    if ((load_control_ & context_control::bit(window)) == 0) {
+        return; // not enabled: neither loaded nor made the shadow base
+    }
+    if ((payload[1] & 0xFF) != 0) {
+        fail(fmt::format("{} at word {} loads from physical {:#04x}{:08x}, which nothing maps",
+                         pm4::opcode_name(packet.header.opcode),
+                         packet.offset,
+                         payload[1] & 0xFF,
+                         payload[0]));
+        return;
+    }
+
+    const physaddr_t base = payload[0];
+    shadow_bases_[static_cast<u32>(window)] = base;
+
+    std::vector<u32> values;
+    for (std::size_t pair = 2; pair < payload.size(); pair += 2) {
+        const u32 offset = payload[pair];
+        const u32 count = payload[pair + 1];
+        if (count == 0) {
+            continue; // GX2's way of naming a block without loading it
+        }
+        // Checked against the window before the address is worked out from
+        // it, so a corrupt offset cannot wrap the arithmetic.
+        if (static_cast<u64>(offset) + count > window_range(window).words()) {
+            fail(fmt::format("{} at word {} loads {} registers at offset {:#x}, past the {} "
+                             "window",
+                             pm4::opcode_name(packet.header.opcode),
+                             packet.offset,
+                             count,
+                             offset,
+                             window_name(window)));
+            return;
+        }
+        const u8* const host =
+            guest_bytes(packet, base + (offset * 4), count * 4, memory::Access::Read);
+        if (host == nullptr) {
+            return;
+        }
+        values.resize(count);
+        std::memcpy(values.data(), host, values.size() * sizeof(u32));
+        for (u32& value : values) {
+            value = swap_bytes(value);
+        }
+        std::string error;
+        if (!registers_->write_window(window, offset, values, error)) {
+            fail(fmt::format("{} at word {}", error, packet.offset));
+            return;
+        }
+        stats_.registers_loaded += count;
+    }
+}
+
+void CommandProcessor::shadow(const Packet& packet,
+                              Window window,
+                              u32 offset,
+                              std::span<const u32> values) {
+    const std::optional<physaddr_t> base = shadow_bases_[static_cast<u32>(window)];
+    if ((shadow_enable_ & context_control::bit(window)) == 0 || !base.has_value() ||
+        values.empty()) {
+        return;
+    }
+    u8* const host = guest_bytes(
+        packet, *base + (offset * 4), static_cast<u32>(values.size() * 4), memory::Access::Write);
+    if (host == nullptr) {
+        return;
+    }
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        const u32 big = swap_bytes(values[index]);
+        std::memcpy(host + (index * 4), &big, sizeof(big));
+    }
+    stats_.registers_shadowed += values.size();
 }
 
 void CommandProcessor::draw(const Packet& packet) {

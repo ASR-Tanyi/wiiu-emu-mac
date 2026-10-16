@@ -41,6 +41,8 @@ enum class PacketType : u8 {
 /// Type 3 opcodes. The numbers are the R600 family's (Linux's `r600d.h`
 /// agrees with decaf's Latte tables); only the ones anything here will name
 /// are listed, and an unlisted one still decodes and still has a number.
+/// Linux never sends the `LOAD_*` family, so for those it is decaf's and
+/// Cemu's tables that agree.
 enum class Opcode : u8 {
     Nop = 0x10,
     IndirectBufferEnd = 0x17,
@@ -75,6 +77,14 @@ enum class Opcode : u8 {
     EventWrite = 0x46,
     EventWriteEop = 0x47,
     OneRegWrite = 0x57,
+    LoadConfigReg = 0x60,
+    LoadContextReg = 0x61,
+    LoadAluConst = 0x62,
+    LoadBoolConst = 0x63,
+    LoadLoopConst = 0x64,
+    LoadResource = 0x65,
+    LoadSampler = 0x66,
+    LoadCtlConst = 0x67,
     SetConfigReg = 0x68,
     SetContextReg = 0x69,
     SetAluConst = 0x6A,

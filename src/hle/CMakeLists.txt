@@ -9,6 +9,7 @@ wiiu_add_library(hle
         src/coreinit_time.cpp
         src/filesystem.cpp
         src/gx2.cpp
+        src/gx2_context.cpp
         src/gx2_display.cpp
         src/gx2_state.cpp
         src/gx2_surface.cpp
@@ -24,6 +25,7 @@ wiiu_add_library(hle
         include/wiiu/hle/coreinit.hpp
         include/wiiu/hle/filesystem.hpp
         include/wiiu/hle/gx2.hpp
+        include/wiiu/hle/gx2_context.hpp
         include/wiiu/hle/gx2_state.hpp
         include/wiiu/hle/gx2_surface.hpp
         include/wiiu/hle/heap.hpp

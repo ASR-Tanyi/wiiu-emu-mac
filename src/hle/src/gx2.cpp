@@ -1,6 +1,7 @@
 #include <wiiu/common/log.hpp>
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/gx2.hpp>
+#include <wiiu/hle/gx2_context.hpp>
 #include <wiiu/hle/gx2_state.hpp>
 #include <wiiu/hle/gx2_surface.hpp>
 #include <wiiu/hle/registry.hpp>
@@ -305,6 +306,7 @@ bool Gpu::vsync(u64 index) {
 
 void Gpu::reset() {
     registers_->reset();
+    processor_.reset_state();
     timeline_ = latte::GpuTimeline{processor_, timeline_.latency()};
     processor_.set_memory(nullptr);
     memory_ = nullptr;
@@ -540,6 +542,20 @@ bool emit_context_registers(Call& call, u32 address, std::span<const u32> values
     return emit(call, packet);
 }
 
+bool emit_display_list_call(Call& call, ppcaddr_t list, u32 bytes, std::string_view what) {
+    const std::optional<physaddr_t> physical = physical_address(call.memory, list, what);
+    if (!physical.has_value()) {
+        return false;
+    }
+    const std::array<u32, 4> packet{
+        latte::pm4::type3_header(latte::pm4::Opcode::IndirectBufferPriv, 3),
+        *physical,
+        0,
+        bytes / 4,
+    };
+    return emit(call, packet);
+}
+
 // Every handler that writes PM4 goes through here: a write can fill the main
 // buffer and submit it, and a submission nobody arms the timer for would sit
 // until the next flush.
@@ -708,18 +724,7 @@ u32 gx2_get_current_display_list(Call& call, u32 out_list, u32 out_size) {
 }
 
 void gx2_call_display_list(Call& call, u32 list, u32 bytes) {
-    const std::optional<physaddr_t> physical =
-        physical_address(call.memory, list, "GX2CallDisplayList's list");
-    if (!physical.has_value()) {
-        return;
-    }
-    const std::array<u32, 4> packet{
-        latte::pm4::type3_header(latte::pm4::Opcode::IndirectBufferPriv, 3),
-        *physical,
-        0,
-        bytes / 4,
-    };
-    static_cast<void>(emit(call, packet));
+    static_cast<void>(emit_display_list_call(call, list, bytes, "GX2CallDisplayList's list"));
 }
 
 void gx2_direct_call_display_list(Call& call, u32 list, u32 bytes) {
@@ -908,6 +913,7 @@ void register_gx2(Registry& registry, coreinit::Context& context) {
     register_gx2_display(registry);
     register_gx2_surface(registry);
     register_gx2_state(registry);
+    register_gx2_context(registry);
 }
 
 } // namespace wiiu::hle::gx2

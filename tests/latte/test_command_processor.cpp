@@ -12,7 +12,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <initializer_list>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -453,4 +455,217 @@ TEST_CASE_METHOD(Fixture,
     CHECK(pm4::opcode_name(static_cast<u8>(Opcode::HleSwap)) == "HLE_SWAP");
     CHECK(pm4::is_hle_opcode(static_cast<u8>(Opcode::HleCopyColorToScan)));
     CHECK_FALSE(pm4::is_hle_opcode(static_cast<u8>(Opcode::SurfaceBaseUpdate)));
+}
+
+// ---------------------------------------------------------------------------
+// State shadowing: CONTEXT_CONTROL and the LOAD_* packets
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// What GX2 turns shadowing on with: the six windows a context state holds.
+constexpr u32 kShadowSix = 0x80000077;
+
+/// A context register to use: PA_CL_VPORT_XSCALE_0, as an offset into the
+/// context window.
+constexpr u32 kXScale = (0x2843C - 0x28000) / 4;
+
+[[nodiscard]] std::vector<u32> context_control(u32 load, u32 shadow) {
+    return {type3_header(Opcode::ContextControl, 2), load, shadow};
+}
+
+[[nodiscard]] std::vector<u32>
+load_packet(Opcode opcode, physaddr_t base, const std::vector<std::pair<u32, u32>>& ranges) {
+    std::vector<u32> words{
+        type3_header(opcode, static_cast<u32>(2 + (ranges.size() * 2))), base, 0};
+    for (const auto& [offset, count] : ranges) {
+        words.push_back(offset);
+        words.push_back(count);
+    }
+    return words;
+}
+
+[[nodiscard]] std::vector<u32> set_context(u32 offset, const std::vector<u32>& values) {
+    std::vector<u32> words{type3_header(Opcode::SetContextReg, static_cast<u32>(1 + values.size())),
+                           offset};
+    words.insert(words.end(), values.begin(), values.end());
+    return words;
+}
+
+[[nodiscard]] std::vector<u32> join(std::initializer_list<std::vector<u32>> parts) {
+    std::vector<u32> words;
+    for (const std::vector<u32>& part : parts) {
+        words.insert(words.end(), part.begin(), part.end());
+    }
+    return words;
+}
+
+[[nodiscard]] u32 context_reg(const RegisterFile& registers, u32 offset) {
+    return registers.read(0x28000 + (offset * 4));
+}
+
+} // namespace
+
+TEST_CASE_METHOD(MemoryFixture,
+                 "LOAD_CONTEXT_REG loads registers from guest memory, by offset",
+                 "[latte][cp][shadow]") {
+    // The block is an image of the window: register n is at word n.
+    put(kMem1 + 0x8000 + (0x10 * 4), {0x11111111, 0x22222222, 0x33333333, 0x44444444});
+    put(kMem1 + 0x8000 + (kXScale * 4), {0x3F800000});
+    const std::vector<u32> stream = join({
+        context_control(context_control::context | context_control::ordinal, 0),
+        load_packet(Opcode::LoadContextReg, 0x8000, {{0x10, 3}, {kXScale, 1}}),
+    });
+    REQUIRE(processor.execute(stream));
+    CHECK(processor.stats().errors == 0);
+    CHECK(context_reg(*registers, 0x10) == 0x11111111);
+    CHECK(context_reg(*registers, 0x12) == 0x33333333);
+    CHECK(context_reg(*registers, 0x13) == 0); // past the range
+    CHECK(context_reg(*registers, kXScale) == 0x3F800000);
+    CHECK(processor.stats().registers_loaded == 4);
+    CHECK(processor.shadow_base(Window::Context) == std::optional<physaddr_t>{0x8000});
+    CHECK_FALSE(processor.shadow_base(Window::Config).has_value());
+    CHECK(processor.stats().deferred == 0); // CONTEXT_CONTROL is acted on now
+}
+
+TEST_CASE_METHOD(MemoryFixture,
+                 "a LOAD for a window loading is not enabled for does nothing",
+                 "[latte][cp][shadow]") {
+    put(kMem1 + 0x8000, {0x12345678});
+    // Nothing enabled yet, then only the config window.
+    const std::vector<u32> stream = join({
+        load_packet(Opcode::LoadContextReg, 0x8000, {{0, 1}}),
+        context_control(context_control::config | context_control::ordinal, 0),
+        load_packet(Opcode::LoadContextReg, 0x8000, {{0, 1}}),
+    });
+    REQUIRE(processor.execute(stream));
+    CHECK(context_reg(*registers, 0) == 0);
+    CHECK_FALSE(processor.shadow_base(Window::Context).has_value());
+    CHECK(processor.stats().registers_loaded == 0);
+    CHECK(processor.stats().errors == 0);
+}
+
+TEST_CASE_METHOD(MemoryFixture,
+                 "while shadowing is on, SET_* is written into the block too",
+                 "[latte][cp][shadow]") {
+    const std::vector<u32> stream = join({
+        context_control(kShadowSix, kShadowSix),
+        load_packet(Opcode::LoadContextReg, 0x8000, {{0, 0}}), // named, nothing loaded
+        set_context(kXScale, {0x44200000, 0x44200001}),
+        set_context(0x3FF, {0x5A5A5A5A}),                     // the window's last register
+        {type3_header(Opcode::SetConfigReg, 2), 0x100, 0x77}, // config: no block named
+    });
+    REQUIRE(processor.execute(stream));
+    CHECK(processor.stats().errors == 0);
+    CHECK(context_reg(*registers, kXScale) == 0x44200000);
+    // Big-endian, at the register's offset into the window.
+    CHECK(memory.read<u32>(kMem1 + 0x8000 + (kXScale * 4)) == 0x44200000);
+    CHECK(memory.read<u32>(kMem1 + 0x8000 + (kXScale * 4) + 4) == 0x44200001);
+    CHECK(memory.read<u32>(kMem1 + 0x8000 + (0x3FF * 4)) == 0x5A5A5A5A);
+    CHECK(processor.stats().registers_shadowed == 3);
+
+    // Off again: the register changes, the block does not.
+    const std::vector<u32> off = join({
+        context_control(0x80000000, 0x80000000),
+        set_context(kXScale, {0x1}),
+    });
+    REQUIRE(processor.execute(off));
+    CHECK(context_reg(*registers, kXScale) == 0x1);
+    CHECK(memory.read<u32>(kMem1 + 0x8000 + (kXScale * 4)) == 0x44200000);
+    CHECK(processor.stats().registers_shadowed == 3);
+}
+
+TEST_CASE_METHOD(MemoryFixture,
+                 "two blocks: loading one brings back what was written while it was named",
+                 "[latte][cp][shadow]") {
+    // How GX2 uses it: name a block, write state, name another, write other
+    // state -- then load either, and its state is back.
+    const std::vector<u32> setup = join({
+        context_control(kShadowSix, kShadowSix),
+        load_packet(Opcode::LoadContextReg, 0x8000, {{0, 0}}),
+        set_context(kXScale, {0xA}),
+        load_packet(Opcode::LoadContextReg, 0xA000, {{0, 0}}),
+        set_context(kXScale, {0xB}),
+    });
+    REQUIRE(processor.execute(setup));
+    CHECK(context_reg(*registers, kXScale) == 0xB);
+
+    REQUIRE(processor.execute(load_packet(Opcode::LoadContextReg, 0x8000, {{kXScale, 1}})));
+    CHECK(context_reg(*registers, kXScale) == 0xA);
+
+    // A write now goes to the first block, which is the one named last.
+    REQUIRE(processor.execute(set_context(kXScale, {0xC})));
+    REQUIRE(processor.execute(load_packet(Opcode::LoadContextReg, 0xA000, {{kXScale, 1}})));
+    CHECK(context_reg(*registers, kXScale) == 0xB);
+    REQUIRE(processor.execute(load_packet(Opcode::LoadContextReg, 0x8000, {{kXScale, 1}})));
+    CHECK(context_reg(*registers, kXScale) == 0xC);
+    CHECK(processor.stats().errors == 0);
+}
+
+TEST_CASE_METHOD(MemoryFixture, "every LOAD opcode loads its own window", "[latte][cp][shadow]") {
+    put(kMem1 + 0x8000 + (5 * 4), {0xC0FFEE});
+    const std::array<std::pair<Opcode, Window>, 8> loads{{
+        {Opcode::LoadConfigReg, Window::Config},
+        {Opcode::LoadContextReg, Window::Context},
+        {Opcode::LoadAluConst, Window::AluConst},
+        {Opcode::LoadBoolConst, Window::BoolConst},
+        {Opcode::LoadLoopConst, Window::LoopConst},
+        {Opcode::LoadResource, Window::Resource},
+        {Opcode::LoadSampler, Window::Sampler},
+        {Opcode::LoadCtlConst, Window::CtlConst},
+    }};
+    REQUIRE(processor.execute(context_control(0x800000FF, 0)));
+    for (const auto& [opcode, window] : loads) {
+        CHECK(load_window(opcode) == std::optional<Window>{window});
+        REQUIRE(processor.execute(load_packet(opcode, 0x8000, {{5, 1}})));
+        CHECK(registers->read(window_range(window).base + (5 * 4)) == 0xC0FFEE);
+    }
+    CHECK_FALSE(load_window(Opcode::SetContextReg).has_value());
+    CHECK(processor.stats().registers_loaded == 8);
+    CHECK(processor.stats().errors == 0);
+}
+
+TEST_CASE_METHOD(MemoryFixture,
+                 "a LOAD that is malformed, past its window or unmapped is an error",
+                 "[latte][cp][shadow]") {
+    REQUIRE(processor.execute(context_control(kShadowSix, kShadowSix)));
+
+    // An address and half a pair.
+    const std::vector<u32> half{type3_header(Opcode::LoadContextReg, 3), 0x8000, 0, 0x10};
+    REQUIRE(processor.execute(half));
+    CHECK(processor.stats().errors == 1);
+
+    // The context window is 0x400 registers.
+    REQUIRE(processor.execute(load_packet(Opcode::LoadContextReg, 0x8000, {{0x3FF, 2}})));
+    CHECK(processor.stats().errors == 2);
+    CHECK(processor.stats().registers_loaded == 0);
+
+    // Physical memory that nothing maps.
+    REQUIRE(processor.execute(load_packet(Opcode::LoadContextReg, 0xFFFF0000, {{0, 1}})));
+    CHECK(processor.stats().errors == 3);
+    CHECK(processor.last_error().find("0xffff0000") != std::string::npos);
+
+    // Named there, a shadowed write has nowhere to go: the register is still
+    // written, and the shadow write is the error.
+    REQUIRE(processor.execute(load_packet(Opcode::LoadContextReg, 0xFFFF0000, {{0, 0}})));
+    REQUIRE(processor.execute(set_context(kXScale, {0x9})));
+    CHECK(context_reg(*registers, kXScale) == 0x9);
+    CHECK(processor.stats().errors == 4);
+    CHECK(processor.stats().registers_shadowed == 0);
+}
+
+TEST_CASE_METHOD(MemoryFixture,
+                 "resetting the GPU's state forgets the blocks",
+                 "[latte][cp][shadow]") {
+    REQUIRE(processor.execute(join({
+        context_control(kShadowSix, kShadowSix),
+        load_packet(Opcode::LoadContextReg, 0x8000, {{0, 0}}),
+    })));
+    CHECK(processor.load_control() == kShadowSix);
+    processor.reset_state();
+    CHECK(processor.load_control() == 0);
+    CHECK(processor.shadow_enable() == 0);
+    CHECK_FALSE(processor.shadow_base(Window::Context).has_value());
+    REQUIRE(processor.execute(set_context(kXScale, {0x9})));
+    CHECK(memory.read<u32>(kMem1 + 0x8000 + (kXScale * 4)) == 0);
 }

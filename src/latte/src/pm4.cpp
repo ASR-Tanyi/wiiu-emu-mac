@@ -88,6 +88,22 @@ std::string_view opcode_name(u8 opcode) noexcept {
             return "EVENT_WRITE_EOP";
         case Opcode::OneRegWrite:
             return "ONE_REG_WRITE";
+        case Opcode::LoadConfigReg:
+            return "LOAD_CONFIG_REG";
+        case Opcode::LoadContextReg:
+            return "LOAD_CONTEXT_REG";
+        case Opcode::LoadAluConst:
+            return "LOAD_ALU_CONST";
+        case Opcode::LoadBoolConst:
+            return "LOAD_BOOL_CONST";
+        case Opcode::LoadLoopConst:
+            return "LOAD_LOOP_CONST";
+        case Opcode::LoadResource:
+            return "LOAD_RESOURCE";
+        case Opcode::LoadSampler:
+            return "LOAD_SAMPLER";
+        case Opcode::LoadCtlConst:
+            return "LOAD_CTL_CONST";
         case Opcode::SetConfigReg:
             return "SET_CONFIG_REG";
         case Opcode::SetContextReg:
