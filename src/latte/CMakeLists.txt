@@ -21,6 +21,7 @@ wiiu_add_library(latte
         include/wiiu/latte/formats.hpp
         include/wiiu/latte/pm4.hpp
         include/wiiu/latte/registers.hpp
+        include/wiiu/latte/render_state.hpp
         include/wiiu/latte/surface.hpp
         include/wiiu/latte/timeline.hpp
         include/wiiu/latte/viewport.hpp

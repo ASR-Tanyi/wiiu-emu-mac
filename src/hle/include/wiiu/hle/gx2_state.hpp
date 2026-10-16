@@ -7,7 +7,16 @@
 // reads them at the draw.
 //
 // So far: the viewport and the scissor, which every title sets for its
-// render targets before drawing anything.
+// render targets before drawing anything; and the depth, stencil and
+// rasterizer state -- the depth test, the stencil test and its masks,
+// culling and polygon mode, polygon offset, point and line sizes, clipping,
+// and the primitive restart index. Each comes as GX2 has it: the call that
+// sets the state, and for most an `Init…Reg` that computes it into the
+// title's structure and a `Set…Reg` that writes that. The `Get…Reg` calls
+// that read a structure back are not here yet.
+//
+// Where decaf and Cemu compute a value differently it is named, with the
+// one taken; the field layouts are latte/render_state.hpp's.
 #pragma once
 
 #include <wiiu/common/endian.hpp>
@@ -61,7 +70,120 @@ viewport_registers(f32 x, f32 y, f32 width, f32 height, f32 near_z, f32 far_z) n
 /// Cemu's reading. decaf neither clamps nor sets the bit.
 [[nodiscard]] ScissorReg scissor_registers(u32 x, u32 y, u32 width, u32 height) noexcept;
 
-/// Register the viewport and scissor calls. Called by `register_gx2`.
+// --- depth and stencil -----------------------------------------------------
+
+/// `GX2DepthStencilControlReg`, `GX2StencilMaskReg`.
+struct DepthStencilControlReg {
+    u32be db_depth_control;
+};
+
+struct StencilMaskReg {
+    u32be front; ///< DB_STENCILREFMASK
+    u32be back;  ///< DB_STENCILREFMASK_BF
+};
+
+static_assert(sizeof(DepthStencilControlReg) == 0x4);
+static_assert(sizeof(StencilMaskReg) == 0x8);
+
+/// `GX2SetDepthStencilControl`'s thirteen arguments: GX2's comparison and
+/// stencil-operation values, which are Latte's.
+struct DepthStencil {
+    bool depth_test = false;
+    bool depth_write = false;
+    u32 depth_compare = 0;
+    bool stencil_test = false;
+    bool backface_stencil = false;
+    u32 front_compare = 0;
+    u32 front_depth_pass = 0;
+    u32 front_depth_fail = 0;
+    u32 front_stencil_fail = 0;
+    u32 back_compare = 0;
+    u32 back_depth_pass = 0;
+    u32 back_depth_fail = 0;
+    u32 back_stencil_fail = 0;
+};
+
+/// DB_DEPTH_CONTROL for it. decaf and Cemu pack it the same way; so does
+/// `GX2SetDepthOnlyControl`, which is this with the stencil fields zero.
+[[nodiscard]] u32 depth_stencil_control(const DepthStencil& state) noexcept;
+
+[[nodiscard]] StencilMaskReg stencil_mask_registers(u32 front_compare_mask,
+                                                    u32 front_write_mask,
+                                                    u32 front_ref,
+                                                    u32 back_compare_mask,
+                                                    u32 back_write_mask,
+                                                    u32 back_ref) noexcept;
+
+// --- the rasterizer --------------------------------------------------------
+
+/// `GX2PolygonControlReg`, `GX2PolygonOffsetReg`, `GX2PointSizeReg`,
+/// `GX2PointLimitsReg`, `GX2LineWidthReg`.
+struct PolygonControlReg {
+    u32be pa_su_sc_mode_cntl;
+};
+
+struct PolygonOffsetReg {
+    f32be front_scale; ///< times 16, as the register takes it
+    f32be front_offset;
+    f32be back_scale; ///< likewise
+    f32be back_offset;
+    f32be clamp;
+};
+
+struct PointSizeReg {
+    u32be pa_su_point_size;
+};
+
+struct PointLimitsReg {
+    u32be pa_su_point_minmax;
+};
+
+struct LineWidthReg {
+    u32be pa_su_line_cntl;
+};
+
+static_assert(sizeof(PolygonControlReg) == 0x4);
+static_assert(sizeof(PolygonOffsetReg) == 0x14);
+static_assert(sizeof(PointSizeReg) == 0x4);
+static_assert(sizeof(PointLimitsReg) == 0x4);
+static_assert(sizeof(LineWidthReg) == 0x4);
+
+/// `GX2SetPolygonControl`'s nine arguments.
+struct PolygonControl {
+    u32 front_face = 0; ///< GX2FrontFace: 0 counter-clockwise, 1 clockwise
+    bool cull_front = false;
+    bool cull_back = false;
+    u32 poly_mode = 0;  ///< a BOOL that GX2 passes straight through
+    u32 front_mode = 0; ///< GX2PolygonMode
+    u32 back_mode = 0;
+    bool offset_front = false;
+    bool offset_back = false;
+    bool offset_para = false;
+};
+
+/// PA_SU_SC_MODE_CNTL for it, as decaf and Cemu pack it.
+[[nodiscard]] u32 polygon_control(const PolygonControl& state) noexcept;
+
+/// The scales times 16, everything else as given; decaf and Cemu agree.
+[[nodiscard]] PolygonOffsetReg polygon_offset_registers(
+    f32 front_offset, f32 front_scale, f32 back_offset, f32 back_scale, f32 clamp) noexcept;
+
+/// A size in the units PA_SU_POINT_SIZE, PA_SU_POINT_MINMAX and
+/// PA_SU_LINE_CNTL take: times 8, truncated, held to 16 bits -- Cemu's
+/// clamp; decaf lets the value wrap. Negative and NaN sizes are zero.
+[[nodiscard]] u32 size_eighths(f32 size) noexcept;
+
+[[nodiscard]] u32 point_size_register(f32 width, f32 height) noexcept;
+[[nodiscard]] u32 point_limits_register(f32 min_size, f32 max_size) noexcept;
+[[nodiscard]] u32 line_width_register(f32 width) noexcept;
+
+/// PA_CL_CLIP_CNTL for `GX2SetRasterizerClipControlEx`: the rasterizer
+/// killed if it is off, near and far clipping off together, half-Z as the
+/// DX clip space. Cemu also sets DX_LINEAR_ATTR_CLIP_ENA every time, and so
+/// does this; decaf leaves it clear.
+[[nodiscard]] u32 clip_control_register(bool rasterizer, bool z_clip, bool half_z) noexcept;
+
+/// Register the state calls. Called by `register_gx2`.
 void register_gx2_state(Registry& registry);
 
 } // namespace gx2

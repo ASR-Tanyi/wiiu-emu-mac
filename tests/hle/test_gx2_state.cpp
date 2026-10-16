@@ -14,6 +14,7 @@
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/color_buffer.hpp>
 #include <wiiu/latte/depth_buffer.hpp>
+#include <wiiu/latte/render_state.hpp>
 #include <wiiu/latte/viewport.hpp>
 #include <wiiu/memory/map.hpp>
 
@@ -102,6 +103,7 @@ constexpr ppcaddr_t kReg = 0x10004000;
 constexpr ppcaddr_t kBuffer = 0x10005000;
 constexpr ppcaddr_t kImage = 0x10100000;
 constexpr ppcaddr_t kHiZ = 0x10600000;
+constexpr ppcaddr_t kStack = 0x10008000;
 
 struct StateFixture {
     memory::Memory memory;
@@ -121,17 +123,28 @@ struct StateFixture {
         call("GX2Init", {0});
     }
 
+    /// Call a GX2 function as a title would: the first eight integer
+    /// arguments in r3-r10, the rest in the caller's parameter area at
+    /// 8(r1).
     void call(std::string_view name, std::vector<u32> arguments, std::vector<f32> floats = {}) {
         Function* const function = registry.find("gx2", name);
         REQUIRE(function != nullptr);
+        const u32 saved_sp = state.gpr[1];
+        state.gpr[1] = kStack;
         for (std::size_t i = 0; i < arguments.size(); ++i) {
-            state.gpr[3 + i] = arguments[i];
+            if (i < 8) {
+                state.gpr[3 + i] = arguments[i];
+            } else {
+                REQUIRE(memory.try_write<u32>(kStack + 8 + static_cast<u32>((i - 8) * 4),
+                                              arguments[i]));
+            }
         }
         for (std::size_t i = 0; i < floats.size(); ++i) {
             state.fpr[1 + i].ps0 = static_cast<f64>(floats[i]);
         }
         Call context{.state = state, .memory = memory};
         function->handler(context);
+        state.gpr[1] = saved_sp;
     }
 
     /// Flush, and let the submission retire.
@@ -287,4 +300,179 @@ TEST_CASE_METHOD(StateFixture, "a render target past the eighth is refused", "[h
     call("GX2SetColorBuffer", {kBuffer, 8});
     run_gpu();
     CHECK(os.gpu.processor().stats().packets == 0);
+}
+
+// --------------------------------------------------------------------------
+// Depth, stencil and the rasterizer
+// --------------------------------------------------------------------------
+
+TEST_CASE("depth and stencil control pack where Linux's r600d.h puts the fields",
+          "[hle][gx2][state]") {
+    // Depth alone: Z_ENABLE bit 1, Z_WRITE_ENABLE bit 2, ZFUNC bits 4-6.
+    CHECK(gx2::depth_stencil_control(
+              {.depth_test = true, .depth_write = true, .depth_compare = 1}) == 0x16);
+
+    // Every stencil field a different value, so a swapped pair shows.
+    const gx2::DepthStencil all{.depth_test = true,
+                                .depth_write = false,
+                                .depth_compare = 6,
+                                .stencil_test = true,
+                                .backface_stencil = true,
+                                .front_compare = 3,
+                                .front_depth_pass = 2,
+                                .front_depth_fail = 4,
+                                .front_stencil_fail = 1,
+                                .back_compare = 5,
+                                .back_depth_pass = 7,
+                                .back_depth_fail = 3,
+                                .back_stencil_fail = 6};
+    const u32 expected = (1U << 0) | (1U << 1) | (6U << 4) | (1U << 7) | (3U << 8) | (1U << 11) |
+                         (2U << 14) | (4U << 17) | (5U << 20) | (6U << 23) | (7U << 26) |
+                         (3U << 29);
+    CHECK(gx2::depth_stencil_control(all) == expected);
+    const latte::DbDepthControl decoded{.raw = expected};
+    CHECK(decoded.stencil_zfail_bf == latte::StencilOp::IncrementClamp);
+    CHECK(decoded.z_func == latte::CompareFunction::GreaterEqual);
+
+    // Masks and references: a byte each, ref low.
+    const gx2::StencilMaskReg masks = gx2::stencil_mask_registers(0xFF, 0x0F, 0x1FF, 0xF0, 0x3C, 2);
+    CHECK(masks.front == (0xFFU | (0xFFU << 8) | (0x0FU << 16)));
+    CHECK(masks.back == (0x02U | (0xF0U << 8) | (0x3CU << 16)));
+}
+
+TEST_CASE("polygon control, offset, sizes and clipping pack as decaf and Cemu do",
+          "[hle][gx2][state]") {
+    const u32 polygon = gx2::polygon_control({.front_face = 1,
+                                              .cull_front = false,
+                                              .cull_back = true,
+                                              .poly_mode = 1,
+                                              .front_mode = 2,
+                                              .back_mode = 1,
+                                              .offset_front = true,
+                                              .offset_back = false,
+                                              .offset_para = true});
+    CHECK(polygon ==
+          ((1U << 1) | (1U << 2) | (1U << 3) | (2U << 5) | (1U << 8) | (1U << 11) | (1U << 13)));
+
+    const gx2::PolygonOffsetReg offset = gx2::polygon_offset_registers(1, 2, 3, 4, 5);
+    CHECK(offset.front_scale == 32.0F); // scales times 16
+    CHECK(offset.front_offset == 1.0F);
+    CHECK(offset.back_scale == 64.0F);
+    CHECK(offset.back_offset == 3.0F);
+    CHECK(offset.clamp == 5.0F);
+
+    CHECK(gx2::size_eighths(1.0F) == 8);
+    CHECK(gx2::size_eighths(0.1F) == 0); // 0.8, truncated
+    CHECK(gx2::size_eighths(2.06F) == 16);
+    CHECK(gx2::size_eighths(-1.0F) == 0);
+    CHECK(gx2::size_eighths(std::bit_cast<f32>(0x7FC00000U)) == 0); // NaN
+    CHECK(gx2::size_eighths(10000.0F) == 0xFFFF);                   // Cemu's clamp
+    CHECK(gx2::point_size_register(2, 1) == ((16U << 16) | 8U));    // width high, height low
+    CHECK(gx2::point_limits_register(1, 4) == ((32U << 16) | 8U));  // max high, min low
+    CHECK(gx2::line_width_register(1.5F) == 12);
+
+    // Everything on: only Cemu's linear attribute clipping bit.
+    CHECK(gx2::clip_control_register(true, true, false) == (1U << 24));
+    // Everything off, half Z: the rasterizer killed, near and far clipping off.
+    CHECK(gx2::clip_control_register(false, false, true) ==
+          ((1U << 19) | (1U << 22) | (1U << 24) | (1U << 26) | (1U << 27)));
+}
+
+TEST_CASE_METHOD(StateFixture,
+                 "GX2SetDepthStencilControl reads its last five arguments from the stack",
+                 "[hle][gx2][state]") {
+    call("GX2SetDepthStencilControl", {1, 0, 6, 1, 1, 3, 2, 4, 1, 5, 7, 3, 6});
+    run_gpu();
+    CHECK(reg(latte::reg::db_depth_control) ==
+          gx2::depth_stencil_control({.depth_test = true,
+                                      .depth_write = false,
+                                      .depth_compare = 6,
+                                      .stencil_test = true,
+                                      .backface_stencil = true,
+                                      .front_compare = 3,
+                                      .front_depth_pass = 2,
+                                      .front_depth_fail = 4,
+                                      .front_stencil_fail = 1,
+                                      .back_compare = 5,
+                                      .back_depth_pass = 7,
+                                      .back_depth_fail = 3,
+                                      .back_stencil_fail = 6}));
+
+    // The Init/Set halves: fourteen arguments, six of them on the stack.
+    call("GX2InitDepthStencilControlReg", {kReg, 1, 1, 1, 0, 0, 0, 0, 0, 0, 7, 2, 2, 2});
+    CHECK(memory.read<u32>(kReg) == (0x16U | (7U << 20) | (2U << 23) | (2U << 26) | (2U << 29)));
+    call("GX2SetDepthStencilControlReg", {kReg});
+    run_gpu();
+    CHECK(reg(latte::reg::db_depth_control) == memory.read<u32>(kReg));
+
+    call("GX2SetDepthOnlyControl", {1, 0, 3});
+    run_gpu();
+    CHECK(reg(latte::reg::db_depth_control) == ((1U << 1) | (3U << 4)));
+
+    call("GX2SetStencilMask", {0xFF, 0x0F, 1, 0xF0, 0x3C, 2});
+    run_gpu();
+    CHECK(reg(latte::reg::db_stencilrefmask) == (0x01U | (0xFFU << 8) | (0x0FU << 16)));
+    CHECK(reg(latte::reg::db_stencilrefmask_bf) == (0x02U | (0xF0U << 8) | (0x3CU << 16)));
+}
+
+TEST_CASE_METHOD(StateFixture, "the rasterizer calls reach their registers", "[hle][gx2][state]") {
+    // Nine arguments: the polygon-offset-para flag is on the stack.
+    call("GX2SetPolygonControl", {1, 0, 1, 1, 2, 1, 1, 0, 1});
+    call("GX2SetPolygonOffset", {}, {1, 2, 3, 4, 5});
+    call("GX2SetPointSize", {}, {2, 1});
+    call("GX2SetPointLimits", {}, {1, 4});
+    call("GX2SetLineWidth", {}, {1.5F});
+    call("GX2SetRasterizerClipControlEx", {0, 0, 1});
+    call("GX2SetPrimitiveRestartIndex", {0xFFFF});
+    run_gpu();
+
+    CHECK(reg(latte::reg::pa_su_sc_mode_cntl) ==
+          ((1U << 1) | (1U << 2) | (1U << 3) | (2U << 5) | (1U << 8) | (1U << 11) | (1U << 13)));
+    CHECK(reg(latte::reg::pa_su_poly_offset_front_scale) == bits(32.0F));
+    CHECK(reg(latte::reg::pa_su_poly_offset_front_scale + 4) == bits(1.0F));  // front offset
+    CHECK(reg(latte::reg::pa_su_poly_offset_front_scale + 8) == bits(64.0F)); // back scale
+    CHECK(reg(latte::reg::pa_su_poly_offset_front_scale + 12) == bits(3.0F)); // back offset
+    CHECK(reg(latte::reg::pa_su_poly_offset_clamp) == bits(5.0F));
+    CHECK(reg(latte::reg::pa_su_point_size) == ((16U << 16) | 8U));
+    CHECK(reg(latte::reg::pa_su_point_minmax) == ((32U << 16) | 8U));
+    CHECK(reg(latte::reg::pa_su_line_cntl) == 12);
+    CHECK(reg(latte::reg::pa_cl_clip_cntl) ==
+          ((1U << 19) | (1U << 22) | (1U << 24) | (1U << 26) | (1U << 27)));
+    CHECK(reg(latte::reg::vgt_multi_prim_ib_reset_indx) == 0xFFFF);
+
+    call("GX2SetCullOnlyControl", {0, 1, 0});
+    call("GX2SetRasterizerClipControl", {1, 1});
+    run_gpu();
+    CHECK(reg(latte::reg::pa_su_sc_mode_cntl) == 1U); // cull front, nothing else
+    CHECK(reg(latte::reg::pa_cl_clip_cntl) == (1U << 24));
+}
+
+TEST_CASE_METHOD(StateFixture,
+                 "each Init/Set pair writes what the one call does",
+                 "[hle][gx2][state]") {
+    call("GX2InitPolygonControlReg", {kReg, 1, 1, 0, 0, 0, 0, 0, 0, 1});
+    call("GX2SetPolygonControlReg", {kReg});
+    call("GX2InitPolygonOffsetReg", {kReg + 0x10}, {0.5F, 0.25F, 0, 0, 1});
+    call("GX2SetPolygonOffsetReg", {kReg + 0x10});
+    call("GX2InitStencilMaskReg", {kReg + 0x40, 1, 2, 3, 4, 5, 6});
+    call("GX2SetStencilMaskReg", {kReg + 0x40});
+    call("GX2InitPointSizeReg", {kReg + 0x50}, {3, 3});
+    call("GX2SetPointSizeReg", {kReg + 0x50});
+    call("GX2InitPointLimitsReg", {kReg + 0x54}, {0.5F, 8});
+    call("GX2SetPointLimitsReg", {kReg + 0x54});
+    call("GX2InitLineWidthReg", {kReg + 0x58}, {2});
+    call("GX2SetLineWidthReg", {kReg + 0x58});
+    run_gpu();
+
+    CHECK(memory.read<u32>(kReg) == ((1U << 0) | (1U << 2) | (1U << 13)));
+    CHECK(reg(latte::reg::pa_su_sc_mode_cntl) == memory.read<u32>(kReg));
+    CHECK(memory.read<u32>(kReg + 0x10) == bits(4.0F)); // front scale first
+    CHECK(reg(latte::reg::pa_su_poly_offset_front_scale) == bits(4.0F));
+    CHECK(reg(latte::reg::pa_su_poly_offset_front_scale + 4) == bits(0.5F));
+    CHECK(reg(latte::reg::pa_su_poly_offset_clamp) == bits(1.0F));
+    CHECK(reg(latte::reg::db_stencilrefmask) == (3U | (1U << 8) | (2U << 16)));
+    CHECK(reg(latte::reg::db_stencilrefmask_bf) == (6U | (4U << 8) | (5U << 16)));
+    CHECK(reg(latte::reg::pa_su_point_size) == ((24U << 16) | 24U));
+    CHECK(reg(latte::reg::pa_su_point_minmax) == ((64U << 16) | 4U));
+    CHECK(reg(latte::reg::pa_su_line_cntl) == 16);
 }

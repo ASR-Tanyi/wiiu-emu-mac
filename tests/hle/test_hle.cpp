@@ -8,6 +8,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <bit>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -160,6 +161,75 @@ TEST_CASE("a 64-bit argument takes an odd-aligned register pair", "[hle][registr
         CHECK(call.next_long() == 0x1111111122222222ULL);
         CHECK(call.next_word() == 0x33U);
         CHECK(call.next_long() == 0x4444444455555555ULL);
+    }
+}
+
+// Past r10 and f8, arguments are in the caller's parameter area at 8(r1).
+// Each layout is what powerpc-linux-gnu-gcc -m32 -O2 emits for the call.
+TEST_CASE("arguments past the registers are read from the caller's stack", "[hle][registry]") {
+    memory::Memory memory;
+    std::string error;
+    REQUIRE(memory.initialize(error));
+    constexpr ppcaddr_t sp = 0x10100000;
+
+    SECTION("f(int x13): the ninth to thirteenth at 8(r1) to 24(r1)") {
+        cpu::CoreState state;
+        for (u32 r = 3; r <= 10; ++r) {
+            state.gpr[r] = r - 2;
+        }
+        state.gpr[1] = sp;
+        for (u32 i = 0; i < 5; ++i) {
+            REQUIRE(memory.try_write<u32>(sp + 8 + (i * 4), 9 + i));
+        }
+        Call call{.state = state, .memory = memory};
+        for (u32 expected = 1; expected <= 13; ++expected) {
+            CHECK(call.next_word() == expected);
+        }
+    }
+
+    SECTION("f(int x9, long long, int): the long is 8-aligned, at 16(r1)") {
+        cpu::CoreState state;
+        state.gpr[1] = sp;
+        REQUIRE(memory.try_write<u32>(sp + 8, 9));
+        REQUIRE(memory.try_write<u32>(sp + 12, 0xDEADBEEF)); // the gap
+        REQUIRE(memory.try_write<u64>(sp + 16, 0x1122334455667788ULL));
+        REQUIRE(memory.try_write<u32>(sp + 24, 13));
+        Call call{.state = state, .memory = memory};
+        for (u32 i = 0; i < 8; ++i) {
+            static_cast<void>(call.next_word());
+        }
+        CHECK(call.next_word() == 9U);
+        CHECK(call.next_long() == 0x1122334455667788ULL);
+        CHECK(call.next_word() == 13U);
+    }
+
+    SECTION("a long long with only r10 left goes to the stack, and so does what follows") {
+        cpu::CoreState state;
+        state.gpr[1] = sp;
+        state.gpr[10] = 0xDEADBEEF; // skipped, and not used afterwards either
+        REQUIRE(memory.try_write<u64>(sp + 8, 0x0102030405060708ULL));
+        REQUIRE(memory.try_write<u32>(sp + 16, 42));
+        Call call{.state = state, .memory = memory};
+        for (u32 i = 0; i < 7; ++i) {
+            static_cast<void>(call.next_word());
+        }
+        CHECK(call.next_long() == 0x0102030405060708ULL);
+        CHECK(call.next_word() == 42U);
+    }
+
+    SECTION("floats past f8 take a word each; doubles eight bytes") {
+        cpu::CoreState state;
+        state.gpr[1] = sp;
+        REQUIRE(memory.try_write<u32>(sp + 8, std::bit_cast<u32>(2.5F)));
+        REQUIRE(memory.try_write<u32>(sp + 12, std::bit_cast<u32>(-1.0F)));
+        REQUIRE(memory.try_write<u64>(sp + 16, std::bit_cast<u64>(0.125)));
+        Call call{.state = state, .memory = memory};
+        for (u32 i = 0; i < 8; ++i) {
+            static_cast<void>(call.next_single());
+        }
+        CHECK(call.next_single() == 2.5F);
+        CHECK(call.next_single() == -1.0F);
+        CHECK(call.next_double() == 0.125);
     }
 }
 

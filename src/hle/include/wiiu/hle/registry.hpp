@@ -24,6 +24,7 @@
 #include <wiiu/memory/memory.hpp>
 
 #include <array>
+#include <bit>
 #include <deque>
 #include <functional>
 #include <map>
@@ -43,7 +44,20 @@ struct Call {
     u32 next_gpr = 3;
     u32 next_fpr = 1;
 
-    [[nodiscard]] u32 next_word() noexcept { return next_gpr <= 10 ? state.gpr[next_gpr++] : 0; }
+    /// Bytes consumed of the caller's parameter area, where arguments go once
+    /// their registers run out: from 8 bytes above the stack pointer (past
+    /// the back chain and the LR save word), in order -- a word for an int
+    /// or a float, eight bytes 8-aligned for a 64-bit value or a double.
+    /// (Checked against powerpc-linux-gnu-gcc -m32 for 13 ints, a long long
+    /// after the registers are full, and floats and doubles past f8.) A
+    /// handler is called from the title's `bl`, with no frame of its own in
+    /// between, so r1 is still the caller's. GX2's state calls take up to
+    /// fourteen arguments.
+    u32 stack_offset = 0;
+
+    [[nodiscard]] u32 next_word() noexcept {
+        return next_gpr <= 10 ? state.gpr[next_gpr++] : stack_word();
+    }
 
     /// A 64-bit argument occupies a register pair starting at an *odd*
     /// register: r3:r4, r5:r6, r7:r8, r9:r10. So `f(long long)` uses r3:r4
@@ -56,13 +70,43 @@ struct Call {
         if ((next_gpr % 2) == 0) {
             ++next_gpr;
         }
-        const u64 high = next_word();
-        const u64 low = next_word();
-        return (high << 32) | low;
+        if (next_gpr <= 9) {
+            const u64 high = state.gpr[next_gpr];
+            const u64 low = state.gpr[next_gpr + 1];
+            next_gpr += 2;
+            return (high << 32) | low;
+        }
+        // No pair left: this and everything after it is on the stack, even
+        // if r10 was free.
+        next_gpr = 11;
+        return stack_long();
     }
 
     [[nodiscard]] f64 next_double() noexcept {
-        return next_fpr <= 8 ? state.fpr[next_fpr++].ps0 : 0.0;
+        return next_fpr <= 8 ? state.fpr[next_fpr++].ps0 : std::bit_cast<f64>(stack_long());
+    }
+
+    /// A `float` parameter: in an FPR as a double, or on the stack as a
+    /// single in a word of its own.
+    [[nodiscard]] f32 next_single() noexcept {
+        return next_fpr <= 8 ? static_cast<f32>(state.fpr[next_fpr++].ps0)
+                             : std::bit_cast<f32>(stack_word());
+    }
+
+    /// The next word of the parameter area. Zero if it cannot be read, as a
+    /// register past r10 used to be.
+    [[nodiscard]] u32 stack_word() noexcept {
+        u32 value = 0;
+        static_cast<void>(memory.try_read<u32>(state.gpr[1] + 8 + stack_offset, value));
+        stack_offset += 4;
+        return value;
+    }
+
+    [[nodiscard]] u64 stack_long() noexcept {
+        stack_offset = (stack_offset + 7) & ~7U;
+        const u64 high = stack_word();
+        const u64 low = stack_word();
+        return (high << 32) | low;
     }
 
     /// A null-terminated guest string, bounded so a missing terminator cannot
@@ -108,7 +152,7 @@ struct Argument<bool> {
 
 template <>
 struct Argument<f32> {
-    static f32 read(Call& call) { return static_cast<f32>(call.next_double()); }
+    static f32 read(Call& call) { return call.next_single(); }
 };
 
 template <>
