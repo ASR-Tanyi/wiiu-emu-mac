@@ -18,6 +18,7 @@ wiiu_add_library(latte
         include/wiiu/latte/color_buffer.hpp
         include/wiiu/latte/command_processor.hpp
         include/wiiu/latte/depth_buffer.hpp
+        include/wiiu/latte/draw.hpp
         include/wiiu/latte/formats.hpp
         include/wiiu/latte/microcode.hpp
         include/wiiu/latte/pm4.hpp
