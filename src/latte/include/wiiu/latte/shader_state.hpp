@@ -70,7 +70,8 @@ inline constexpr u32 spi_vs_out_id_0 = 0x28614; ///< ten of them
 inline constexpr u32 pa_cl_vs_out_cntl = 0x2881C;
 
 /// The pixel shader's inputs, and what it exports.
-inline constexpr u32 spi_ps_in_control_0 = 0x286CC; ///< and _1 after it
+inline constexpr u32 spi_ps_in_control_0 = 0x286CC;
+inline constexpr u32 spi_ps_in_control_1 = 0x286D0;
 inline constexpr u32 spi_ps_input_cntl_0 = 0x28644; ///< thirty-two of them
 inline constexpr u32 spi_input_z = 0x286D8;
 inline constexpr u32 cb_shader_mask = 0x2823C;
@@ -87,5 +88,63 @@ inline constexpr u32 sq_alu_constant0_256 = 0x31000;
 /// DB_SHADER_CONTROL's DUAL_EXPORT_ENABLE, which GX2 sets on every pixel
 /// shader it binds (decaf).
 inline constexpr u32 db_shader_dual_export_enable = 1U << 9;
+
+/// A semantic that names nothing: what SQ_VTX_SEMANTIC_CLEAR leaves in a
+/// vertex semantic, and what SPI_VS_OUT_ID holds for an unused parameter.
+inline constexpr u32 semantic_unused = 0xFF;
+
+/// SPI_VS_OUT_ID_0 to _9 hold a byte each for the vertex shader's forty
+/// parameter exports: the semantic the pixel shader matches it by.
+inline constexpr u32 spi_vs_out_id_count = 10;
+inline constexpr u32 vs_parameter_count = spi_vs_out_id_count * 4;
+
+/// SPI_PS_IN_CONTROL_0: how many inputs the pixel shader has, and whether
+/// one of them is the pixel's position. Linux's `r600d.h` has every field.
+union SpiPsInControl0 {
+    u32 raw;
+    BitField<0, 6, u32> num_interp;
+    BitField<8, 1, bool> position_ena;
+    BitField<9, 1, bool> position_centroid;
+    BitField<10, 5, u32> position_addr;
+    BitField<15, 4, u32> param_gen; ///< point-sprite coordinates
+    BitField<19, 7, u32> param_gen_addr;
+    BitField<26, 2, u32> baryc_sample_cntl;
+    BitField<28, 1, bool> persp_gradient_ena;
+    BitField<29, 1, bool> linear_gradient_ena;
+    BitField<30, 1, bool> position_sample;
+    BitField<31, 1, bool> baryc_at_sample_ena;
+};
+
+/// SPI_PS_IN_CONTROL_1: the front-face bit and the rest. Linux's `r600d.h`.
+union SpiPsInControl1 {
+    u32 raw;
+    BitField<0, 1, bool> gen_index_pix;
+    BitField<1, 7, u32> gen_index_pix_addr;
+    BitField<8, 1, bool> front_face_ena;
+    BitField<9, 2, u32> front_face_chan;
+    BitField<11, 1, bool> front_face_all_bits;
+    BitField<12, 5, u32> front_face_addr;
+    BitField<17, 7, u32> fog_addr;
+    BitField<24, 1, bool> fixed_pt_position_ena;
+    BitField<25, 5, u32> fixed_pt_position_addr;
+};
+
+/// SPI_PS_INPUT_CNTL_n: pixel shader input n -- the semantic it takes from
+/// the vertex shader, the value it has when no vertex output has that
+/// semantic, and how it is interpolated. decaf's and Cemu's fields, which
+/// agree.
+union SpiPsInputCntl {
+    u32 raw;
+    BitField<0, 8, u32> semantic;
+    BitField<8, 2, u32> default_val; ///< 0000, 0001, 1110 or 1111, as XYZW
+    BitField<10, 1, bool> flat_shade;
+    BitField<11, 1, bool> sel_centroid;
+    BitField<12, 1, bool> sel_linear; ///< without perspective correction
+    BitField<13, 4, u32> cyl_wrap;
+    BitField<17, 1, bool> pt_sprite_tex;
+    BitField<18, 1, bool> sel_sample;
+};
+
+inline constexpr u32 spi_ps_input_cntl_count = 32;
 
 } // namespace wiiu::latte

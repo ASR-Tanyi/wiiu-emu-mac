@@ -13,6 +13,7 @@ wiiu_add_library(latte
         src/formats.cpp
         src/pm4.cpp
         src/registers.cpp
+        src/shader_ir.cpp
         src/shader_program.cpp
         src/surface.cpp
         src/timeline.cpp
@@ -28,6 +29,7 @@ wiiu_add_library(latte
         include/wiiu/latte/registers.hpp
         include/wiiu/latte/render_state.hpp
         include/wiiu/latte/resources.hpp
+        include/wiiu/latte/shader_ir.hpp
         include/wiiu/latte/shader_program.hpp
         include/wiiu/latte/shader_state.hpp
         include/wiiu/latte/surface.hpp

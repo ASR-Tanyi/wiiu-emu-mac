@@ -11,10 +11,13 @@
 #include <wiiu/cpu/state.hpp>
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/gx2.hpp>
+#include <wiiu/hle/gx2_fetch_shader.hpp>
 #include <wiiu/hle/gx2_shader.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/command_processor.hpp>
 #include <wiiu/latte/pm4.hpp>
+#include <wiiu/latte/shader_ir.hpp>
+#include <wiiu/latte/shader_program.hpp>
 #include <wiiu/latte/shader_state.hpp>
 #include <wiiu/memory/map.hpp>
 
@@ -180,6 +183,84 @@ TEST_CASE("a geometry shader sets its copy shader as the VS stage", "[hle][gx2][
     CHECK(ran[reg::spi_vs_out_id_0] == 0x100);
     CHECK(ran[reg::spi_vs_out_config] == 2);
     CHECK(ran[reg::sq_gsvs_ring_itemsize] == 0x0010);
+}
+
+TEST_CASE("decaf's example triangle, from GX2's registers to the intermediate form",
+          "[hle][gx2][shader]") {
+    // tools/latte-assembler/resources/example_shader.vsh and .psh: their
+    // header comments are the shader structures' register values, and the
+    // fetch shader is GX2's own for the two attributes the vertex shader
+    // names -- aColour at location 0 and aPosition at 1, both four floats.
+    gx2::VertexShader vs{};
+    vs.sq_pgm_resources_vs = 3U | (1U << 8);
+    vs.num_spi_vs_out_id = 1;
+    vs.spi_vs_out_id[0] = 0; // SEMANTIC_0 = 0
+    vs.sq_vtx_semantic_clear = 0xFFFFFFFC;
+    vs.num_sq_vtx_semantic = 2;
+    vs.sq_vtx_semantic[0] = 0;
+    vs.sq_vtx_semantic[1] = 1;
+    vs.vgt_vertex_reuse_block_cntl = 14;
+    vs.vgt_hos_reuse_depth = 16;
+    gx2::PixelShader ps{};
+    ps.sq_pgm_resources_ps = 1;
+    ps.spi_ps_in_control_0 = 1; // NUM_INTERP
+    ps.num_spi_ps_input_cntl = 1;
+    ps.spi_ps_input_cntls[0] = 0 | (1U << 8); // semantic 0, default 0001
+    ps.cb_shader_mask = 0xF;                  // one colour output, as a compiled shader has
+    std::vector<u32> words;
+    gx2::append_vertex_shader(words, vs, gx2::Program{.address = 0x1000, .size = 24});
+    gx2::append_pixel_shader(words, ps, gx2::Program{.address = 0x2000, .size = 8});
+    const Ran ran{words};
+
+    gx2::AttribStream colour{};
+    colour.location = 0;
+    colour.buffer = 0;
+    colour.format = 0x813; // GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32
+    colour.mask = 0x00010203;
+    colour.endian_swap = 3;
+    gx2::AttribStream position = colour;
+    position.location = 1;
+    position.buffer = 1;
+    const std::array attribs{colour, position};
+    const gx2::FetchShaderProgram fetch = gx2::generate_fetch_shader(attribs);
+
+    constexpr u32 xyzw = 0x688;
+    const std::vector<u32> vertex_words{0,
+                                        0x13U << 23,
+                                        60U | (1U << 13) | (2U << 15),
+                                        xyzw | (0x28U << 23) | (1U << 31),
+                                        (2U << 13) | (1U << 15),
+                                        xyzw | (0x28U << 23) | (1U << 21)};
+    const std::vector<u32> pixel_words{0, xyzw | (0x28U << 23) | (1U << 31) | (1U << 21)};
+
+    std::string error;
+    latte::ShaderProgram vertex_program;
+    latte::ShaderProgram fetch_program;
+    latte::ShaderProgram pixel_program;
+    REQUIRE(
+        latte::decode_program(vertex_words, latte::ProgramShape::Shader, vertex_program, error));
+    REQUIRE(
+        latte::decode_program(fetch.words, latte::ProgramShape::FetchShader, fetch_program, error));
+    REQUIRE(latte::decode_program(pixel_words, latte::ProgramShape::Shader, pixel_program, error));
+
+    latte::ir::Shader vertex;
+    latte::ir::Shader pixel;
+    INFO(error);
+    REQUIRE(latte::ir::build_vertex_shader(
+        vertex_program, &fetch_program, *ran.registers, vertex, error));
+    REQUIRE(latte::ir::build_pixel_shader(pixel_program, *ran.registers, pixel, error));
+    CHECK(latte::ir::describe(vertex) ==
+          "vertex shader\n"
+          "  attribute R1.xyzw <- semantic 0: buffer 0 + 0, 16 bytes as FMT 0x23 scaled, endian "
+          "swap 2, per vertex\n"
+          "  attribute R2.xyzw <- semantic 1: buffer 1 + 0, 16 bytes as FMT 0x23 scaled, endian "
+          "swap 2, per vertex\n"
+          "  fetch attributes\n"
+          "  position <- R2.xyzw\n"
+          "  parameter 0 (semantic 0) <- R1.xyzw\n");
+    CHECK(latte::ir::describe(pixel) == "pixel shader\n"
+                                        "  input R0 <- parameter 0 (semantic 0), perspective\n"
+                                        "  colour 0 (target 0) <- R0.xyzw\n");
 }
 
 TEST_CASE("GX2Invalidate's SURFACE_SYNC", "[hle][gx2][shader]") {
