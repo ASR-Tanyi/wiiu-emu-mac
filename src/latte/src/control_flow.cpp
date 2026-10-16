@@ -469,11 +469,14 @@ void alu_text(Out out, const CfInstruction& inst) {
     kcache(out, 1, word1.kcache_mode1, word0.kcache_bank1, word1.kcache_addr1);
 }
 
-void lines(std::string& out, const std::vector<CfInstruction>& list) {
+void lines(std::string& out, const std::vector<CfInstruction>& list, const ClauseLines& after) {
     std::string indent;
     for (const CfInstruction& inst : list) {
         fmt::format_to(
             std::back_inserter(out), "{}{:02} {}\n", indent, inst.index, disassemble(inst));
+        if (after) {
+            after(out, inst, indent);
+        }
         if (inst.is(CfInst::LoopStart) || inst.is(CfInst::LoopStartDx10) ||
             inst.is(CfInst::LoopStartNoAl)) {
             indent += "  ";
@@ -544,15 +547,15 @@ std::string disassemble(const CfInstruction& instruction) {
     return text;
 }
 
-std::string disassemble(const ControlFlow& flow) {
+std::string disassemble(const ControlFlow& flow, const ClauseLines& after) {
     std::string out;
-    lines(out, flow.main);
+    lines(out, flow.main, after);
     if (!flow.main.empty() && flow.main.back().ends_program()) {
         out += "END_OF_PROGRAM\n";
     }
     for (const Subroutine& subroutine : flow.subroutines) {
         fmt::format_to(std::back_inserter(out), "\nSUBROUTINE {:02}\n", subroutine.address);
-        lines(out, subroutine.instructions);
+        lines(out, subroutine.instructions, after);
     }
     return out;
 }

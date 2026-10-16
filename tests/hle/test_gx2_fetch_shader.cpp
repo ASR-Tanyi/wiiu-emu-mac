@@ -17,6 +17,7 @@
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/control_flow.hpp>
 #include <wiiu/latte/microcode.hpp>
+#include <wiiu/latte/shader_program.hpp>
 #include <wiiu/latte/shader_state.hpp>
 #include <wiiu/memory/map.hpp>
 
@@ -218,6 +219,21 @@ TEST_CASE("sixteen fetches to a clause", "[hle][gx2][fetch]") {
     CHECK(latte::disassemble(flow) == "00 VTX_TC: ADDR(4) CNT(16) NO_BARRIER\n"
                                       "01 VTX_TC: ADDR(36) CNT(1) NO_BARRIER\n"
                                       "02 RETURN\n");
+
+    // The next stage reads the fetches: seventeen, each into its semantic.
+    latte::ShaderProgram decoded;
+    REQUIRE(latte::decode_program(program.words, latte::ProgramShape::FetchShader, decoded, error));
+    REQUIRE(decoded.clauses.size() == 2);
+    std::vector<latte::VertexFetch> fetches = decoded.clauses[0].vertex_fetches;
+    fetches.insert(fetches.end(),
+                   decoded.clauses[1].vertex_fetches.begin(),
+                   decoded.clauses[1].vertex_fetches.end());
+    REQUIRE(fetches.size() == 17);
+    for (u32 i = 0; i < 17; ++i) {
+        CHECK(fetches[i].is_semantic());
+        CHECK(fetches[i].fetch1().semantic_id == i);
+        CHECK(fetches[i].fetch2().offset == 4 * i);
+    }
 }
 
 TEST_CASE("instance divisors become step rates", "[hle][gx2][fetch]") {
@@ -398,4 +414,42 @@ TEST_CASE_METHOD(FetchFixture,
     REQUIRE(gx2::read_guest(memory, kShader, shader));
     CHECK(shader.size == 0U);
     CHECK(shader.data == 0U);
+}
+
+TEST_CASE("the fetch shader matches ones that ship with games", "[hle][gx2][fetch]") {
+    // Cemu's notes on fetch shaders shipped with games (Breath of the Wild),
+    // in FetchShader.cpp: the start of three programs. The second is a whole
+    // one-attribute shader -- the control flow and its one fetch -- and the
+    // first and third begin with the first of two and of four. Each is
+    // matched by GX2InitFetchShaderEx's program for one attribute of the
+    // format and components the fetch reads: 16_16_16_16 float into XYZW,
+    // 32_32 float into XY01, 32_32_32 float into XYZ1.
+    struct Shipped {
+        u32 format;
+        u32 mask;
+        std::array<u32, 3> fetch;
+    };
+
+    const std::array shipped{
+        Shipped{0x80F, kSelXyzw, {0x1C00A001, 0x280D1000, 0x00090000}},
+        Shipped{0x80D, 0x00010405, {0x1C00A001, 0x27961000, 0x000A0000}},
+        Shipped{0x811, kSelXyz1, {0x2C00A001, 0x2C151000, 0x000A0000}},
+    };
+    for (const Shipped& game : shipped) {
+        const std::array attribs{attrib(0, 0, 0, game.format, game.mask)};
+        const gx2::FetchShaderProgram program = gx2::generate_fetch_shader(attribs);
+        REQUIRE(program.words.size() == 8);
+        CHECK(program.words[4] == game.fetch[0]);
+        CHECK(program.words[5] == game.fetch[1]);
+        CHECK(program.words[6] == game.fetch[2]);
+    }
+
+    // And the whole of the one-attribute program, control flow included.
+    const std::array attribs{attrib(0, 0, 0, 0x80D, 0x00010405)};
+    const gx2::FetchShaderProgram program = gx2::generate_fetch_shader(attribs);
+    const std::array<u32, 7> botw{
+        0x00000002, 0x01800000, 0x00000000, 0x8A000000, 0x1C00A001, 0x27961000, 0x000A0000};
+    for (std::size_t i = 0; i < botw.size(); ++i) {
+        CHECK(program.words[i] == botw[i]);
+    }
 }

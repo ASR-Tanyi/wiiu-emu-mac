@@ -11,11 +11,11 @@
 // This is the decompiler's first stage: it walks the control flow from the
 // entry point, follows CALLs into their subroutines, and lists every clause
 // the program runs and where it is -- the shape the later stages fill in.
-// Clause contents are not read here. What it refuses, with a message that
-// says where: running off the end of the program before the end, an
-// instruction R700 does not have, a jump or a clause outside the program,
-// and a subroutine that never returns. That is everything the later stages
-// can rely on not having to check again.
+// Clause contents are read by the next stage, shader_program.hpp. What it
+// refuses, with a message that says where: running off the end of the
+// program before the end, an instruction R700 does not have, a jump or a
+// clause outside the program, and a subroutine that never returns. That is
+// everything the later stages can rely on not having to check again.
 //
 // `disassemble` prints it in AMD's assembly syntax, decaf's spelling of it
 // (its disassembler and latte-assembler), so a program can be read, and
@@ -25,6 +25,7 @@
 #include <wiiu/common/types.hpp>
 #include <wiiu/latte/microcode.hpp>
 
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -120,9 +121,15 @@ struct ControlFlow {
 /// by name alone.
 [[nodiscard]] std::string disassemble(const CfInstruction& instruction);
 
+/// What goes beneath an instruction's line -- its clause's contents, when
+/// they are decoded -- given the indent the line was printed at.
+using ClauseLines = std::function<void(
+    std::string& out, const CfInstruction& instruction, std::string_view indent)>;
+
 /// The whole program: one numbered line an instruction, loops indented, the
-/// main program ending in END_OF_PROGRAM, then each subroutine.
-[[nodiscard]] std::string disassemble(const ControlFlow& flow);
+/// main program ending in END_OF_PROGRAM, then each subroutine. `after`, if
+/// given, adds lines beneath each instruction (shader_program.hpp's).
+[[nodiscard]] std::string disassemble(const ControlFlow& flow, const ClauseLines& after = {});
 
 /// CF_INST's name, as AMD and decaf spell it.
 [[nodiscard]] std::string_view cf_inst_name(const CfInstruction& instruction) noexcept;
