@@ -128,12 +128,12 @@ TEST_CASE_METHOD(Gx2Fixture, "GX2Init remembers the core it was called on", "[hl
 }
 
 TEST_CASE_METHOD(Gx2Fixture, "a flush submits and returns at once", "[hle][gx2]") {
-    init();
+    init(); // which submits GX2's start-up state: timestamp 1
     write_context(0x10, 7);
-    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 0);
+    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 1);
 
     call("GX2Flush", {});
-    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 1);
+    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 2);
     CHECK(call_long("GX2GetRetiredTimeStamp") == 0);
     CHECK(context(0x10) == 0); // not before its deadline
     CHECK(os.gpu.pending_commands().empty());
@@ -143,7 +143,7 @@ TEST_CASE_METHOD(Gx2Fixture, "a flush submits and returns at once", "[hle][gx2]"
     advance_to(10'000 + latency() - 1);
     CHECK(call_long("GX2GetRetiredTimeStamp") == 0);
     advance_to(10'000 + latency());
-    CHECK(call_long("GX2GetRetiredTimeStamp") == 1);
+    CHECK(call_long("GX2GetRetiredTimeStamp") == 2);
     CHECK(context(0x10) == 7);
 
     // Nothing left in flight, so nothing left armed.
@@ -163,9 +163,33 @@ TEST_CASE_METHOD(Gx2Fixture, "a flush pads to eight words", "[hle][gx2]") {
 
 TEST_CASE_METHOD(Gx2Fixture, "an empty flush submits nothing", "[hle][gx2]") {
     init();
+    advance_to(10'000 + latency()); // GX2Init's submission retires
     call("GX2Flush", {});
-    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 0);
+    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 1);
     CHECK_FALSE(os.scheduler.has_timer(gx2::gpu_timer_id));
+}
+
+TEST_CASE_METHOD(Gx2Fixture, "GX2Init submits GX2's start-up state", "[hle][gx2]") {
+    init();
+    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 1);
+    CHECK(os.gpu.pending_commands().empty());
+    advance_to(10'000 + latency());
+    CHECK(call_long("GX2GetRetiredTimeStamp") == 1);
+
+    // A few of what it set: the viewport transform on, every channel
+    // written, depth tested less-than, primitive restart at 0xFFFFFFFF --
+    // and shadowing off.
+    const latte::RegisterFile& registers = os.gpu.registers();
+    CHECK(registers.read(0x28818) == 0x43F);      // PA_CL_VTE_CNTL
+    CHECK(registers.read(0x28238) == 0xFFFFFFFF); // CB_TARGET_MASK
+    // DB_DEPTH_CONTROL: depth on and written, less-than; stencil off, its
+    // functions always and replace.
+    CHECK(registers.read(0x28800) == (0x16U | (7U << 8) | (2U << 11) | (2U << 14) | (2U << 17) |
+                                      (7U << 20) | (2U << 23) | (2U << 26) | (2U << 29)));
+    CHECK(registers.read(0x2840C) == 0xFFFFFFFF); // VGT_MULTI_PRIM_IB_RESET_INDX
+    CHECK(os.gpu.processor().shadow_enable() == 0x80000000);
+    CHECK(os.gpu.processor().stats().errors == 0);
+    CHECK(os.gpu.processor().stats().unknown == 0);
 }
 
 TEST_CASE_METHOD(Gx2Fixture, "waiting for a retired timestamp returns at once", "[hle][gx2]") {
@@ -187,7 +211,7 @@ TEST_CASE_METHOD(Gx2Fixture,
     call("GX2Flush", {});
     const u64 deadline = 10'000 + latency();
 
-    CHECK(wait(1) == 1);
+    CHECK(wait(2) == 1);
     const Thread* const main = os.scheduler.find(kMain);
     REQUIRE(main != nullptr);
     CHECK(main->state == ThreadState::Sleeping);
@@ -198,7 +222,7 @@ TEST_CASE_METHOD(Gx2Fixture,
     CHECK(os.scheduler.idle_skip_ticks(state) == latency());
     advance_to(deadline);
     CHECK(main->state == ThreadState::Running);
-    CHECK(os.gpu.timeline().retired() == 1);
+    CHECK(os.gpu.timeline().retired() == 2);
     CHECK(context(0x10) == 5);
 }
 
@@ -212,7 +236,7 @@ TEST_CASE_METHOD(Gx2Fixture, "GX2DrawDone flushes and waits", "[hle][gx2]") {
     init();
     write_context(0x10, 9);
     CHECK(call("GX2DrawDone", {}) == 1);
-    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 1);
+    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 2);
 
     const Thread* const main = os.scheduler.find(kMain);
     CHECK(main->state == ThreadState::Sleeping);
@@ -272,12 +296,12 @@ TEST_CASE_METHOD(Gx2Fixture,
 
     write_context(0x10, 1);
     call("GX2DirectCallDisplayList", {kList, bytes});
-    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 2);
+    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 3); // after GX2Init's and the flush
     CHECK(os.gpu.pending_commands().empty());
 
     // Both retire; the list's write lands last.
     advance_to(10'000 + latency());
-    CHECK(call_long("GX2GetRetiredTimeStamp") == 2);
+    CHECK(call_long("GX2GetRetiredTimeStamp") == 3);
     CHECK(context(0x10) == 2);
 }
 
@@ -367,20 +391,20 @@ TEST_CASE_METHOD(Gx2Fixture,
     init();
     const std::vector<u32> filler(gx2::max_command_buffer_words - 2, latte::pm4::type2_filler);
     REQUIRE(os.gpu.write(state.core_id, filler, state.timebase));
-    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 0);
+    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 1); // GX2Init's
 
     // Eight more words do not fit: what was there goes first, by itself.
     call("GX2BeginDisplayListEx", {kList, 0x100, 1});
     write_context(0x10, 4);
     const u32 bytes = call("GX2EndDisplayList", {kList});
     call("GX2CopyDisplayList", {kList, bytes});
-    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 1);
+    CHECK(call_long("GX2GetLastSubmittedTimeStamp") == 2);
     CHECK(os.gpu.pending_commands().size() == bytes / 4);
 
     // And the GPU's timer was armed for it, without waiting for a flush.
     REQUIRE(os.scheduler.has_timer(gx2::gpu_timer_id));
     advance_to(10'000 + latency());
-    CHECK(call_long("GX2GetRetiredTimeStamp") == 1);
+    CHECK(call_long("GX2GetRetiredTimeStamp") == 2);
 }
 
 // --------------------------------------------------------------------------

@@ -123,6 +123,10 @@ void CommandProcessor::packet(const Packet& packet, u32 depth) {
             set_window(packet, Window::Config);
             return;
         case Opcode::SetContextReg:
+        case Opcode::SetAllContexts:
+            // GX2 writes a few registers with SET_ALL_CONTEXTS. The GPU keeps
+            // more than one context in flight; the register file is one, so
+            // it is SET_CONTEXT_REG here -- shadowed like it, as Cemu does.
             set_window(packet, Window::Context);
             return;
         case Opcode::SetAluConst:

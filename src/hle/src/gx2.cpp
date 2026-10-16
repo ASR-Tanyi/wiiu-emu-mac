@@ -2,6 +2,7 @@
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/gx2.hpp>
 #include <wiiu/hle/gx2_context.hpp>
+#include <wiiu/hle/gx2_shader.hpp>
 #include <wiiu/hle/gx2_state.hpp>
 #include <wiiu/hle/gx2_surface.hpp>
 #include <wiiu/hle/registry.hpp>
@@ -532,13 +533,36 @@ physical_address(const memory::Memory& memory, ppcaddr_t address, std::string_vi
     return physical;
 }
 
+void append_registers(std::vector<u32>& out,
+                      latte::pm4::Opcode opcode,
+                      u32 address,
+                      std::span<const u32> values) {
+    using latte::pm4::Opcode;
+    latte::Window window = latte::Window::Context;
+    switch (opcode) {
+        case Opcode::SetConfigReg:
+            window = latte::Window::Config;
+            break;
+        case Opcode::SetCtlConst:
+            window = latte::Window::CtlConst;
+            break;
+        default: // SET_CONTEXT_REG and SET_ALL_CONTEXTS
+            break;
+    }
+    out.push_back(latte::pm4::type3_header(opcode, static_cast<u32>(1 + values.size())));
+    out.push_back((address - latte::window_range(window).base) / 4);
+    out.insert(out.end(), values.begin(), values.end());
+}
+
+void append_context_register(std::vector<u32>& out, u32 address, u32 value) {
+    const std::array<u32, 1> values{value};
+    append_registers(out, latte::pm4::Opcode::SetContextReg, address, values);
+}
+
 bool emit_context_registers(Call& call, u32 address, std::span<const u32> values) {
     std::vector<u32> packet;
     packet.reserve(2 + values.size());
-    packet.push_back(latte::pm4::type3_header(latte::pm4::Opcode::SetContextReg,
-                                              static_cast<u32>(1 + values.size())));
-    packet.push_back((address - context_register_base) / 4);
-    packet.insert(packet.end(), values.begin(), values.end());
+    append_registers(packet, latte::pm4::Opcode::SetContextReg, address, values);
     return emit(call, packet);
 }
 
@@ -607,6 +631,13 @@ void gx2_init(Call& call, u32 attributes_address) {
 
     context.gpu.initialize(call.memory, call.state.core_id, attributes);
     start_vsync(context, call.state.timebase);
+
+    // GX2's own start, as decaf has it: shadowing off, the registers
+    // initialised, the default state, and all of it submitted.
+    static_cast<void>(emit(call, unbind_context_state_packets()));
+    static_cast<void>(emit(call, initial_register_packets()));
+    static_cast<void>(emit(call, default_state_packets()));
+    static_cast<void>(flush_and_arm(call));
     WIIU_LOG_INFO(Gx2, "GX2Init on core {}", call.state.core_id);
 }
 
@@ -914,6 +945,7 @@ void register_gx2(Registry& registry, coreinit::Context& context) {
     register_gx2_surface(registry);
     register_gx2_state(registry);
     register_gx2_context(registry);
+    register_gx2_shader(registry);
 }
 
 } // namespace wiiu::hle::gx2

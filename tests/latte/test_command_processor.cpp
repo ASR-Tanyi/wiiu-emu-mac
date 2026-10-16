@@ -669,3 +669,18 @@ TEST_CASE_METHOD(MemoryFixture,
     REQUIRE(processor.execute(set_context(kXScale, {0x9})));
     CHECK(memory.read<u32>(kMem1 + 0x8000 + (kXScale * 4)) == 0);
 }
+
+TEST_CASE_METHOD(MemoryFixture,
+                 "SET_ALL_CONTEXTS writes the context window, shadowed",
+                 "[latte][cp][shadow]") {
+    const std::vector<u32> stream = join({
+        context_control(kShadowSix, kShadowSix),
+        load_packet(Opcode::LoadContextReg, 0x8000, {{0, 0}}),
+        {type3_header(Opcode::SetAllContexts, 2), (0x286C8 - 0x28000) / 4, 1},
+    });
+    REQUIRE(processor.execute(stream));
+    CHECK(registers->read(0x286C8) == 1);
+    CHECK(memory.read<u32>(kMem1 + 0x8000 + (0x286C8 - 0x28000)) == 1);
+    CHECK(processor.stats().unknown == 0);
+    CHECK(pm4::opcode_name(static_cast<u8>(Opcode::SetAllContexts)) == "SET_ALL_CONTEXTS");
+}

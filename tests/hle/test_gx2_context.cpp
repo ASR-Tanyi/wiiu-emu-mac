@@ -11,6 +11,7 @@
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/gx2.hpp>
 #include <wiiu/hle/gx2_context.hpp>
+#include <wiiu/hle/gx2_shader.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/command_processor.hpp>
 #include <wiiu/latte/pm4.hpp>
@@ -20,6 +21,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <bit>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -279,4 +281,171 @@ TEST_CASE_METHOD(ContextFixture,
     CHECK(xscale() == bits(100.0F));
     CHECK(memory.read<u32>(kStateA + kXScaleInBlock) == bits(640.0F));
     CHECK(os.gpu.processor().shadow_enable() == gx2::shadowing_off);
+}
+
+// --------------------------------------------------------------------------
+// The default state
+// --------------------------------------------------------------------------
+
+namespace {
+
+/// A register file after running `words`, checked to have run cleanly.
+struct Ran {
+    std::unique_ptr<latte::RegisterFile> registers = std::make_unique<latte::RegisterFile>();
+    latte::CommandProcessor processor{*registers};
+
+    explicit Ran(std::span<const u32> words) {
+        REQUIRE(processor.execute(words));
+        CHECK(processor.stats().errors == 0);
+        CHECK(processor.stats().unknown == 0);
+        CHECK(processor.stats().deferred == 0);
+    }
+
+    [[nodiscard]] u32 operator[](u32 address) const { return registers->read(address); }
+};
+
+} // namespace
+
+TEST_CASE("GX2's register initialisation is decaf's, at Linux's addresses", "[hle][gx2][context]") {
+    const std::vector<u32> words = gx2::initial_register_packets();
+    CHECK(packets(words).size() == 45);
+    const Ran ran{words};
+
+    CHECK(ran[0x28034] == 0x20002000);          // PA_SC_SCREEN_SCISSOR_BR: 8192, 8192
+    CHECK(ran[0x28C08] == 0x29);                // PA_SU_VTX_CNTL
+    CHECK(ran[0x28818] == 0x43F);               // PA_CL_VTE_CNTL
+    CHECK(ran[0x28204] == 0x80000000);          // PA_SC_WINDOW_SCISSOR_TL
+    CHECK(ran[0x28A4C] == 0x14001);             // PA_SC_MODE_CNTL, where its name says
+    CHECK(ran[0x28A10] == 1);                   // VGT_OUTPUT_PATH_CNTL, not the mode control
+    CHECK(ran[0x8B24] == 0xFF3FFF);             // PA_SC_FORCE_EOV_MAX_CNTS, a config register
+    CHECK(ran[0x28A94] == 1);                   // VGT_MULTI_PRIM_IB_RESET_EN
+    CHECK(ran[0x28400] == 0xFFFFFFFF);          // VGT_MAX_VTX_INDX
+    CHECK(ran[0x9508] == 0x07000002);           // TA_CNTL_AUX
+    CHECK(ran[0x286D4] == 0x4869);              // SPI_INTERP_CONTROL_0
+    CHECK(ran[0x286C8] == 1);                   // SPI_THREAD_GROUPING, by SET_ALL_CONTEXTS
+    CHECK(ran[0x28C30] == 0x01000000);          // CB_CLRCMP_CONTROL
+    CHECK(ran[0x28C3C] == 0xFFFFFFFF);          // CB_CLRCMP_MSK
+    CHECK(ran[0x28C48] == 0xFFFFFFFF);          // PA_SC_AA_MASK
+    CHECK(ran[0x28230] == 0xAAAAAAAA);          // PA_SC_EDGERULE
+    CHECK(ran.processor.stats().packets == 45); // SQ_VTX_START_INST_LOC's SET_CTL_CONST among them
+}
+
+TEST_CASE("the default state is decaf's sequence of GX2's calls", "[hle][gx2][context]") {
+    const std::vector<u32> words = gx2::default_state_packets();
+    // Two each for the shader mode, the stencil masks, the polygon offset and
+    // the alpha test; eight blend controls; one each for the other fifteen.
+    CHECK(packets(words).size() == 31);
+    const Ran ran{words};
+
+    CHECK(ran[0x28A40] == 0);          // VGT_GS_MODE off
+    CHECK(ran[0x8C00] == 0x1B00000C);  // SQ_CONFIG: priorities 3, 2, 1, 0; DX9 constants
+    CHECK(ran[0x8C04] == 0x403000C8);  // 200 pixel and 48 vertex GPRs, 4 clause temporaries
+    CHECK(ran[0x8C0C] == 0x04043088);  // SQ_THREAD_RESOURCE_MGMT
+    CHECK(ran[0x8C10] == 0x004000C0);  // 192 and 64 stack entries
+    CHECK(ran[0x28430] == 0x00FFFF01); // DB_STENCILREFMASK: ref 1, masks 0xFF
+    CHECK(ran[0x28A00] == 0x00080008); // PA_SU_POINT_SIZE: 1 x 1
+    CHECK(ran[0x28A08] == 8);          // PA_SU_LINE_CNTL: 1
+    CHECK(ran[0x28808] == 0x00CC0000); // CB_COLOR_CONTROL: copy, writes on
+    CHECK(ran[0x28238] == 0xFFFFFFFF); // CB_TARGET_MASK
+    for (u32 target = 0; target < 8; ++target) {
+        CHECK(ran[0x28780 + (4 * target)] == 0x25040504); // source alpha over, both
+    }
+    CHECK(ran[0x28810] == 0x01000000); // PA_CL_CLIP_CNTL
+    CHECK(ran[0x28A18] == bits(1.0F)); // tessellation levels
+    CHECK(ran[0x28A1C] == bits(1.0F));
+    CHECK(ran[0x28D0C] == 0); // DB_RENDER_CONTROL
+}
+
+TEST_CASE("a binding restores the shader mode: the config ranges are its registers",
+          "[hle][gx2][context]") {
+    // The first config range, 0x300 for 6, is SQ_CONFIG to
+    // SQ_STACK_RESOURCE_MGMT_2: what GX2SetShaderModeEx writes.
+    const gx2::ShadowArea& config = gx2::shadow_areas()[0];
+    CHECK(config.ranges[0].offset == (0x8C00 - 0x8000) / 4);
+    CHECK(config.ranges[0].count == 6);
+}
+
+TEST_CASE("the shader modes divide the shader core as decaf and Cemu do", "[hle][gx2][context]") {
+    const gx2::ShaderResources resources{.vs_gprs = 40,
+                                         .vs_stack = 32,
+                                         .gs_gprs = 30,
+                                         .gs_stack = 16,
+                                         .ps_gprs = 100,
+                                         .ps_stack = 48};
+
+    const gx2::ShaderModeRegisters block =
+        gx2::shader_mode_registers(gx2::ShaderMode::UniformBlock, resources);
+    CHECK(block.sq_config == 0x1B000008); // no DX9 constants
+    CHECK(block.sq_gpr_resource_mgmt_1 == (100U | (40U << 16) | (4U << 28)));
+    CHECK(block.sq_stack_resource_mgmt_1 == (48U | (32U << 16)));
+
+    // Geometry: the vertex shader is the ES stage; the VS runs the copy shader.
+    const gx2::ShaderModeRegisters geometry =
+        gx2::shader_mode_registers(gx2::ShaderMode::GeometryShader, resources);
+    CHECK(geometry.sq_gpr_resource_mgmt_1 == (100U | (64U << 16) | (4U << 28)));
+    CHECK(geometry.sq_gpr_resource_mgmt_2 == (30U | (40U << 16)));
+    CHECK(geometry.sq_thread_resource_mgmt == 0x1C08207C);
+    CHECK(geometry.sq_stack_resource_mgmt_2 == (16U | (32U << 16)));
+
+    const gx2::ShaderModeRegisters compute =
+        gx2::shader_mode_registers(gx2::ShaderMode::ComputeShader, resources);
+    CHECK(compute.sq_config == 0xE4000008); // priorities reversed
+    CHECK(compute.sq_gpr_resource_mgmt_2 == (248U << 16));
+    CHECK(compute.sq_thread_resource_mgmt == 0xBD010101);
+    CHECK(compute.sq_stack_resource_mgmt_2 == (256U << 16));
+
+    // Geometry mode leaves VGT_GS_MODE to GX2SetGeometryShader; compute
+    // clears the rings and stream out as well.
+    std::vector<u32> words;
+    gx2::append_shader_mode(words, gx2::ShaderMode::GeometryShader, resources);
+    CHECK(packets(words).size() == 1);
+    words.clear();
+    gx2::append_shader_mode(words, gx2::ShaderMode::ComputeShader, resources);
+    CHECK(packets(words).size() == 5);
+    const Ran ran{words};
+    CHECK(ran[0x28A40] == (3U | (3U << 14) | (1U << 17)));
+    CHECK(ran[0x8C44] == 0xFFFFFF); // SQ_ESGS_RING_SIZE
+    CHECK(ran[0x288AC] == 1);       // SQ_GSVS_RING_ITEMSIZE
+}
+
+TEST_CASE_METHOD(ContextFixture,
+                 "a new context state holds the default state, and gives it back",
+                 "[hle][gx2][context]") {
+    call("GX2SetupContextStateEx", {kStateA, 0});
+    run_gpu();
+    // In the block: the config image's shader mode, the context image's masks.
+    CHECK(memory.read<u32>(kStateA + (0x8C00 - 0x8000)) == 0x1B00000C);
+    CHECK(memory.read<u32>(kStateA + 0x2C00 + (0x28238 - 0x28000)) == 0xFFFFFFFF);
+
+    // A different shader mode and channel mask, then A again.
+    call("GX2SetShaderModeEx", {1, 10, 20, 0, 0, 30, 40});
+    call("GX2SetTargetChannelMasks", {1, 0, 0, 0, 0, 0, 0, 0});
+    call("GX2SetupContextStateEx", {kStateB, 0});
+    run_gpu();
+    CHECK(os.gpu.registers().read(0x8C00) == 0x1B00000C); // B's default
+    call("GX2SetContextState", {kStateA});
+    run_gpu();
+    CHECK(os.gpu.registers().read(0x8C00) == 0x1B000008); // A's: uniform blocks
+    CHECK(os.gpu.registers().read(0x8C04) == (30U | (10U << 16) | (4U << 28)));
+    CHECK(os.gpu.registers().read(0x28238) == 1);
+    CHECK(os.gpu.processor().stats().errors == 0);
+}
+
+TEST_CASE_METHOD(ContextFixture,
+                 "GX2SetDefaultState, stream out and the tessellation levels reach the GPU",
+                 "[hle][gx2][context]") {
+    call("GX2SetStreamOutEnable", {1});
+    call("GX2SetMaxTessellationLevel", {}, {8});
+    call("GX2SetMinTessellationLevel", {}, {2});
+    call("GX2SetShaderModeEx", {4, 1, 1, 1, 1, 1, 1}); // no such mode: refused
+    run_gpu();
+    CHECK(os.gpu.registers().read(0x28AB0) == 1);
+    CHECK(os.gpu.registers().read(0x28A18) == bits(8.0F));
+    CHECK(os.gpu.registers().read(0x28A1C) == bits(2.0F));
+    CHECK(os.gpu.registers().read(0x8C00) == 0x1B00000C); // still GX2Init's
+
+    call("GX2SetDefaultState", {});
+    run_gpu();
+    CHECK(os.gpu.registers().read(0x28AB0) == 0);
+    CHECK(os.gpu.registers().read(0x28A18) == bits(1.0F));
 }

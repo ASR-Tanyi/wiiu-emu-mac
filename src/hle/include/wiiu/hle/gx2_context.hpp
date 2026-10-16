@@ -17,10 +17,16 @@
 // on a value, which is named below, Cemu's is taken, as the reading of what
 // GX2 itself writes.
 //
-// Not yet: the default state `GX2SetupContextStateEx` writes into a new block
-// (decaf's register initialisation and `GX2SetDefaultState`) -- it comes with
-// the calls that state is made of -- and the shader-cache invalidation decaf
-// ends a binding with, which waits for `GX2Invalidate`.
+// A new block is given GX2's **default state**: the register initialisation
+// GX2 does before anything else, then `GX2SetDefaultState`. `GX2Init` writes
+// the same, with shadowing off, and submits it -- so the GPU starts in a
+// known state and the first timestamp a title sees is 2. Both sequences are
+// decaf's, which read them out of gx2.rpl; Cemu writes much less, and only in
+// `GX2SetDefaultState`.
+//
+// Not yet: the shader-cache invalidation decaf ends a binding with, which
+// waits for `GX2Invalidate`, and `GX2SetAAMode`, which decaf's
+// initialisation leaves as a to-do too.
 #pragma once
 
 #include <wiiu/common/types.hpp>
@@ -87,6 +93,21 @@ inline constexpr u32 shadowing_off = 0x80000000;
 /// The packet that turns shadowing off, which `GX2SetContextState(NULL)`
 /// writes.
 [[nodiscard]] std::vector<u32> unbind_context_state_packets();
+
+/// The registers GX2 initialises before writing any state: decaf's
+/// `initialiseRegisters`, register for register and in its order. Where decaf
+/// leaves one unnamed and Linux's R600/R700 headers name it, the name is
+/// Linux's; three stay unnamed. One departure: decaf writes the multipass and
+/// mode controls (PA_SC_MPASS_PS_CNTL, PA_SC_MODE_CNTL, 0x28A48) at 0x28A0C,
+/// PA_SC_LINE_STIPPLE's address, which would put the mode control's value in
+/// VGT_OUTPUT_PATH_CNTL; they are written where their names say.
+[[nodiscard]] std::vector<u32> initial_register_packets();
+
+/// `GX2SetDefaultState`'s packets: decaf's sequence of state calls with
+/// their defaults -- shader mode, depth on with less-than, stencil off,
+/// no culling, every channel written, blending set up (source alpha) but
+/// off, and the rest -- each written as its call writes it.
+[[nodiscard]] std::vector<u32> default_state_packets();
 
 /// Register the context-state calls. Called by `register_gx2`.
 void register_gx2_context(Registry& registry);

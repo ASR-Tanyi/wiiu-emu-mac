@@ -4,6 +4,7 @@
 #include <wiiu/hle/gx2.hpp>
 #include <wiiu/hle/gx2_state.hpp>
 #include <wiiu/hle/registry.hpp>
+#include <wiiu/latte/color_buffer.hpp>
 #include <wiiu/latte/render_state.hpp>
 #include <wiiu/latte/viewport.hpp>
 
@@ -164,6 +165,112 @@ u32 clip_control_register(bool rasterizer, bool z_clip, bool half_z) noexcept {
     reg.dx_clip_space_def = half_z;
     reg.dx_linear_attr_clip_ena = true;
     return reg.raw;
+}
+
+u32 color_control_register(u32 logic_op,
+                           u32 blend_enable_mask,
+                           bool multiwrite,
+                           bool color_write) noexcept {
+    latte::CbColorControl reg{.raw = 0};
+    reg.rop3 = logic_op & 0xFFU;
+    reg.target_blend_enable = blend_enable_mask & 0xFFU;
+    reg.multiwrite_enable = multiwrite;
+    reg.special_op = color_write ? latte::cb_special_normal : latte::cb_special_disable;
+    return reg.raw;
+}
+
+u32 blend_control_register(const BlendControl& state) noexcept {
+    latte::CbBlendControl reg{.raw = 0};
+    reg.color_srcblend = state.color_source & 0x1FU;
+    reg.color_destblend = state.color_destination & 0x1FU;
+    reg.color_comb_fcn = state.color_combine & 7U;
+    reg.separate_alpha_blend = state.separate_alpha;
+    reg.alpha_srcblend = state.alpha_source & 0x1FU;
+    reg.alpha_destblend = state.alpha_destination & 0x1FU;
+    reg.alpha_comb_fcn = state.alpha_combine & 7U;
+    return reg.raw;
+}
+
+u32 target_channel_masks_register(const std::array<u32, 8>& masks) noexcept {
+    u32 value = 0;
+    for (u32 target = 0; target < masks.size(); ++target) {
+        value |= (masks[target] & 0xFU) << (4 * target);
+    }
+    return value;
+}
+
+AlphaTestReg alpha_test_registers(bool enable, u32 compare, f32 reference) noexcept {
+    latte::SxAlphaTestControl control{.raw = 0};
+    control.alpha_test_enable = enable;
+    control.alpha_func = static_cast<latte::CompareFunction>(compare & 7U);
+    return AlphaTestReg{.sx_alpha_test_control = control.raw, .sx_alpha_ref = reference};
+}
+
+u32 alpha_to_mask_register(bool enable, u32 mode) noexcept {
+    // The four quad offsets for each mode, offset 0 first: decaf's table.
+    constexpr std::array<std::array<u32, 4>, 5> offsets{{
+        {2, 2, 2, 2}, // non-dithered
+        {0, 2, 3, 1}, // dither 0
+        {2, 1, 0, 3}, // dither 90
+        {1, 3, 2, 0}, // dither 180
+        {3, 0, 1, 2}, // dither 270
+    }};
+    const std::array<u32, 4>& chosen = offsets[mode < offsets.size() ? mode : 0];
+    latte::DbAlphaToMask reg{.raw = 0};
+    reg.enable = enable;
+    reg.offset0 = chosen[0];
+    reg.offset1 = chosen[1];
+    reg.offset2 = chosen[2];
+    reg.offset3 = chosen[3];
+    return reg.raw;
+}
+
+u32 aa_mask_register(u32 upper_left, u32 upper_right, u32 lower_left, u32 lower_right) noexcept {
+    latte::PaScAaMask reg{.raw = 0};
+    reg.upper_left = upper_left & 0xFFU;
+    reg.upper_right = upper_right & 0xFFU;
+    reg.lower_left = lower_left & 0xFFU;
+    reg.lower_right = lower_right & 0xFFU;
+    return reg.raw;
+}
+
+namespace {
+
+[[nodiscard]] u32 float_bits(const f32be& value) noexcept {
+    return std::bit_cast<u32>(value.value());
+}
+
+} // namespace
+
+void append_stencil_mask(std::vector<u32>& out, const StencilMaskReg& reg) {
+    append_context_register(out, latte::reg::db_stencilrefmask, reg.front.value());
+    append_context_register(out, latte::reg::db_stencilrefmask_bf, reg.back.value());
+}
+
+void append_polygon_offset(std::vector<u32>& out, const PolygonOffsetReg& reg) {
+    const std::array<u32, 4> values{float_bits(reg.front_scale),
+                                    float_bits(reg.front_offset),
+                                    float_bits(reg.back_scale),
+                                    float_bits(reg.back_offset)};
+    append_registers(
+        out, latte::pm4::Opcode::SetContextReg, latte::reg::pa_su_poly_offset_front_scale, values);
+    append_context_register(out, latte::reg::pa_su_poly_offset_clamp, float_bits(reg.clamp));
+}
+
+void append_alpha_test(std::vector<u32>& out, const AlphaTestReg& reg) {
+    append_context_register(
+        out, latte::reg::sx_alpha_test_control, reg.sx_alpha_test_control.value());
+    append_context_register(out, latte::reg::sx_alpha_ref, float_bits(reg.sx_alpha_ref));
+}
+
+void append_blend_control(std::vector<u32>& out, u32 target, u32 value) {
+    append_context_register(out, latte::reg::cb_blend0_control + (4 * target), value);
+}
+
+void append_blend_constant_color(std::vector<u32>& out, const BlendConstantColorReg& reg) {
+    const std::array<u32, 4> values{
+        float_bits(reg.red), float_bits(reg.green), float_bits(reg.blue), float_bits(reg.alpha)};
+    append_registers(out, latte::pm4::Opcode::SetContextReg, latte::reg::cb_blend_red, values);
 }
 
 namespace {
@@ -351,10 +458,16 @@ void gx2_set_depth_only_control(Call& call, bool depth_test, bool depth_write, u
                                                                  .depth_compare = compare}));
 }
 
-/// Two packets, front then back, as decaf and Cemu both write it.
+/// Emit what an `append_*` builds.
+template <typename... Args>
+void emit_built(Call& call, void (*append)(std::vector<u32>&, Args...), Args... args) {
+    std::vector<u32> packets;
+    append(packets, args...);
+    static_cast<void>(emit(call, packets));
+}
+
 void set_stencil_mask(Call& call, const StencilMaskReg& reg) {
-    set_word(call, latte::reg::db_stencilrefmask, reg.front.value());
-    set_word(call, latte::reg::db_stencilrefmask_bf, reg.back.value());
+    emit_built<const StencilMaskReg&>(call, append_stencil_mask, reg);
 }
 
 /// `void GX2SetStencilMask(uint8_t frontMask, uint8_t frontWriteMask,
@@ -474,13 +587,8 @@ void gx2_set_cull_only_control(Call& call, u32 front_face, bool cull_front, bool
                                                        .cull_back = cull_back}));
 }
 
-/// The four scales and offsets in one packet, the clamp in another.
 void set_polygon_offset(Call& call, const PolygonOffsetReg& reg) {
-    const std::array<u32, 4> values{
-        bits(reg.front_scale), bits(reg.front_offset), bits(reg.back_scale), bits(reg.back_offset)};
-    static_cast<void>(
-        emit_context_registers(call, latte::reg::pa_su_poly_offset_front_scale, values));
-    set_word(call, latte::reg::pa_su_poly_offset_clamp, bits(reg.clamp));
+    emit_built<const PolygonOffsetReg&>(call, append_polygon_offset, reg);
 }
 
 void gx2_set_polygon_offset(
@@ -580,6 +688,229 @@ void gx2_set_primitive_restart_index(Call& call, u32 index) {
     set_word(call, latte::reg::vgt_multi_prim_ib_reset_indx, index);
 }
 
+// --- colour -----------------------------------------------------------------
+
+void gx2_set_color_control(
+    Call& call, u32 logic_op, u32 blend_enable_mask, bool multiwrite, bool color_write) {
+    set_word(call,
+             latte::reg::cb_color_control,
+             color_control_register(logic_op, blend_enable_mask, multiwrite, color_write));
+}
+
+void gx2_init_color_control_reg(Call& call,
+                                u32 address,
+                                u32 logic_op,
+                                u32 blend_enable_mask,
+                                bool multiwrite,
+                                bool color_write) {
+    init_word(call,
+              "GX2InitColorControlReg",
+              address,
+              color_control_register(logic_op, blend_enable_mask, multiwrite, color_write));
+}
+
+void gx2_set_color_control_reg(Call& call, u32 address) {
+    set_word_from(call, "GX2SetColorControlReg", latte::reg::cb_color_control, address);
+}
+
+void set_blend_control(Call& call, u32 target, u32 value) {
+    if (target >= latte::reg::render_target_count) {
+        WIIU_LOG_ERROR(Gx2, "a blend control for render target {}, which does not exist", target);
+        return;
+    }
+    emit_built<u32, u32>(call, append_blend_control, target, value);
+}
+
+/// `void GX2SetBlendControl(GX2RenderTarget target, GX2BlendMode
+/// colorSrcBlend, GX2BlendMode colorDstBlend, GX2BlendCombineMode
+/// colorCombine, BOOL useAlphaBlend, GX2BlendMode alphaSrcBlend,
+/// GX2BlendMode alphaDstBlend, GX2BlendCombineMode alphaCombine)`.
+void gx2_set_blend_control(Call& call,
+                           u32 target,
+                           u32 color_source,
+                           u32 color_destination,
+                           u32 color_combine,
+                           bool separate_alpha,
+                           u32 alpha_source,
+                           u32 alpha_destination,
+                           u32 alpha_combine) {
+    set_blend_control(call,
+                      target,
+                      blend_control_register(BlendControl{.color_source = color_source,
+                                                          .color_destination = color_destination,
+                                                          .color_combine = color_combine,
+                                                          .separate_alpha = separate_alpha,
+                                                          .alpha_source = alpha_source,
+                                                          .alpha_destination = alpha_destination,
+                                                          .alpha_combine = alpha_combine}));
+}
+
+/// Nine arguments: the alpha combine mode is on the stack.
+void gx2_init_blend_control_reg(Call& call,
+                                u32 address,
+                                u32 target,
+                                u32 color_source,
+                                u32 color_destination,
+                                u32 color_combine,
+                                bool separate_alpha,
+                                u32 alpha_source,
+                                u32 alpha_destination,
+                                u32 alpha_combine) {
+    const BlendControlReg reg{.target = target,
+                              .cb_blend_control = blend_control_register(
+                                  BlendControl{.color_source = color_source,
+                                               .color_destination = color_destination,
+                                               .color_combine = color_combine,
+                                               .separate_alpha = separate_alpha,
+                                               .alpha_source = alpha_source,
+                                               .alpha_destination = alpha_destination,
+                                               .alpha_combine = alpha_combine})};
+    if (!write_guest(call.memory, address, reg)) {
+        WIIU_LOG_ERROR(Gx2, "GX2InitBlendControlReg: nowhere to write at {:#010x}", address);
+    }
+}
+
+void gx2_set_blend_control_reg(Call& call, u32 address) {
+    BlendControlReg reg{};
+    if (!read_guest(call.memory, address, reg)) {
+        WIIU_LOG_ERROR(Gx2, "GX2SetBlendControlReg: nothing at {:#010x}", address);
+        return;
+    }
+    set_blend_control(call, reg.target.value(), reg.cb_blend_control.value());
+}
+
+void set_blend_constant_color(Call& call, const BlendConstantColorReg& reg) {
+    emit_built<const BlendConstantColorReg&>(call, append_blend_constant_color, reg);
+}
+
+void gx2_set_blend_constant_color(Call& call, f32 red, f32 green, f32 blue, f32 alpha) {
+    set_blend_constant_color(
+        call, BlendConstantColorReg{.red = red, .green = green, .blue = blue, .alpha = alpha});
+}
+
+void gx2_init_blend_constant_color_reg(
+    Call& call, u32 address, f32 red, f32 green, f32 blue, f32 alpha) {
+    if (!write_guest(
+            call.memory,
+            address,
+            BlendConstantColorReg{.red = red, .green = green, .blue = blue, .alpha = alpha})) {
+        WIIU_LOG_ERROR(Gx2, "GX2InitBlendConstantColorReg: nowhere to write at {:#010x}", address);
+    }
+}
+
+void gx2_set_blend_constant_color_reg(Call& call, u32 address) {
+    BlendConstantColorReg reg{};
+    if (!read_guest(call.memory, address, reg)) {
+        WIIU_LOG_ERROR(Gx2, "GX2SetBlendConstantColorReg: nothing at {:#010x}", address);
+        return;
+    }
+    set_blend_constant_color(call, reg);
+}
+
+void gx2_set_target_channel_masks(Call& call,
+                                  u32 mask0,
+                                  u32 mask1,
+                                  u32 mask2,
+                                  u32 mask3,
+                                  u32 mask4,
+                                  u32 mask5,
+                                  u32 mask6,
+                                  u32 mask7) {
+    set_word(
+        call,
+        latte::reg::cb_target_mask,
+        target_channel_masks_register({mask0, mask1, mask2, mask3, mask4, mask5, mask6, mask7}));
+}
+
+/// Nine arguments: target 7's mask is on the stack.
+void gx2_init_target_channel_masks_reg(Call& call,
+                                       u32 address,
+                                       u32 mask0,
+                                       u32 mask1,
+                                       u32 mask2,
+                                       u32 mask3,
+                                       u32 mask4,
+                                       u32 mask5,
+                                       u32 mask6,
+                                       u32 mask7) {
+    init_word(
+        call,
+        "GX2InitTargetChannelMasksReg",
+        address,
+        target_channel_masks_register({mask0, mask1, mask2, mask3, mask4, mask5, mask6, mask7}));
+}
+
+void gx2_set_target_channel_masks_reg(Call& call, u32 address) {
+    set_word_from(call, "GX2SetTargetChannelMasksReg", latte::reg::cb_target_mask, address);
+}
+
+void set_alpha_test(Call& call, const AlphaTestReg& reg) {
+    emit_built<const AlphaTestReg&>(call, append_alpha_test, reg);
+}
+
+void gx2_set_alpha_test(Call& call, bool enable, u32 compare, f32 reference) {
+    set_alpha_test(call, alpha_test_registers(enable, compare, reference));
+}
+
+void gx2_init_alpha_test_reg(Call& call, u32 address, bool enable, u32 compare, f32 reference) {
+    if (!write_guest(call.memory, address, alpha_test_registers(enable, compare, reference))) {
+        WIIU_LOG_ERROR(Gx2, "GX2InitAlphaTestReg: nowhere to write at {:#010x}", address);
+    }
+}
+
+void gx2_set_alpha_test_reg(Call& call, u32 address) {
+    AlphaTestReg reg{};
+    if (!read_guest(call.memory, address, reg)) {
+        WIIU_LOG_ERROR(Gx2, "GX2SetAlphaTestReg: nothing at {:#010x}", address);
+        return;
+    }
+    set_alpha_test(call, reg);
+}
+
+void gx2_set_alpha_to_mask(Call& call, bool enable, u32 mode) {
+    set_word(call, latte::reg::db_alpha_to_mask, alpha_to_mask_register(enable, mode));
+}
+
+void gx2_init_alpha_to_mask_reg(Call& call, u32 address, bool enable, u32 mode) {
+    init_word(call, "GX2InitAlphaToMaskReg", address, alpha_to_mask_register(enable, mode));
+}
+
+void gx2_set_alpha_to_mask_reg(Call& call, u32 address) {
+    set_word_from(call, "GX2SetAlphaToMaskReg", latte::reg::db_alpha_to_mask, address);
+}
+
+void gx2_set_aa_mask(Call& call, u32 upper_left, u32 upper_right, u32 lower_left, u32 lower_right) {
+    set_word(call,
+             latte::reg::pa_sc_aa_mask,
+             aa_mask_register(upper_left, upper_right, lower_left, lower_right));
+}
+
+void gx2_init_aa_mask_reg(
+    Call& call, u32 address, u32 upper_left, u32 upper_right, u32 lower_left, u32 lower_right) {
+    init_word(call,
+              "GX2InitAAMaskReg",
+              address,
+              aa_mask_register(upper_left, upper_right, lower_left, lower_right));
+}
+
+void gx2_set_aa_mask_reg(Call& call, u32 address) {
+    set_word_from(call, "GX2SetAAMaskReg", latte::reg::pa_sc_aa_mask, address);
+}
+
+// --- stream out and tessellation ------------------------------------------
+
+void gx2_set_stream_out_enable(Call& call, bool enable) {
+    set_word(call, latte::reg::vgt_strmout_en, enable ? 1U : 0U);
+}
+
+void gx2_set_max_tessellation_level(Call& call, f32 level) {
+    set_word(call, latte::reg::vgt_hos_max_tess_level, std::bit_cast<u32>(level));
+}
+
+void gx2_set_min_tessellation_level(Call& call, f32 level) {
+    set_word(call, latte::reg::vgt_hos_min_tess_level, std::bit_cast<u32>(level));
+}
+
 } // namespace
 
 void register_gx2_state(Registry& registry) {
@@ -618,6 +949,35 @@ void register_gx2_state(Registry& registry) {
     registry.add("gx2", "GX2SetRasterizerClipControlEx", gx2_set_rasterizer_clip_control_ex);
     registry.add("gx2", "GX2SetRasterizerClipControlHalfZ", gx2_set_rasterizer_clip_control_ex);
     registry.add("gx2", "GX2SetPrimitiveRestartIndex", gx2_set_primitive_restart_index);
+
+    registry.add("gx2", "GX2SetColorControl", gx2_set_color_control);
+    registry.add("gx2", "GX2InitColorControlReg", gx2_init_color_control_reg);
+    registry.add("gx2", "GX2SetColorControlReg", gx2_set_color_control_reg);
+    registry.add("gx2", "GX2SetBlendControl", gx2_set_blend_control);
+    registry.add("gx2", "GX2InitBlendControlReg", gx2_init_blend_control_reg);
+    registry.add("gx2", "GX2SetBlendControlReg", gx2_set_blend_control_reg);
+    registry.add("gx2", "GX2SetBlendConstantColor", gx2_set_blend_constant_color);
+    registry.add("gx2", "GX2InitBlendConstantColorReg", gx2_init_blend_constant_color_reg);
+    registry.add("gx2", "GX2SetBlendConstantColorReg", gx2_set_blend_constant_color_reg);
+    registry.add("gx2", "GX2SetTargetChannelMasks", gx2_set_target_channel_masks);
+    registry.add("gx2", "GX2InitTargetChannelMasksReg", gx2_init_target_channel_masks_reg);
+    registry.add("gx2", "GX2SetTargetChannelMasksReg", gx2_set_target_channel_masks_reg);
+    registry.add("gx2", "GX2SetAlphaTest", gx2_set_alpha_test);
+    registry.add("gx2", "GX2InitAlphaTestReg", gx2_init_alpha_test_reg);
+    registry.add("gx2", "GX2SetAlphaTestReg", gx2_set_alpha_test_reg);
+    registry.add("gx2", "GX2SetAlphaToMask", gx2_set_alpha_to_mask);
+    registry.add("gx2", "GX2InitAlphaToMaskReg", gx2_init_alpha_to_mask_reg);
+    registry.add("gx2", "GX2SetAlphaToMaskReg", gx2_set_alpha_to_mask_reg);
+    registry.add("gx2", "GX2SetAAMask", gx2_set_aa_mask);
+    registry.add("gx2", "GX2InitAAMaskReg", gx2_init_aa_mask_reg);
+    registry.add("gx2", "GX2SetAAMaskReg", gx2_set_aa_mask_reg);
+
+    registry.add("gx2", "GX2SetStreamOutEnable", gx2_set_stream_out_enable);
+    registry.add("gx2", "GX2SetMaxTessellationLevel", gx2_set_max_tessellation_level);
+    registry.add("gx2", "GX2SetMinTessellationLevel", gx2_set_min_tessellation_level);
+    // Eight registers decaf names and does not fill in; Cemu has no call.
+    // Logged and counted until a title needs it.
+    registry.add_stub("gx2", "GX2SetTessellation");
 }
 
 } // namespace wiiu::hle::gx2

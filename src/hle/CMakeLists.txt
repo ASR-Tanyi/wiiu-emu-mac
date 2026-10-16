@@ -11,6 +11,7 @@ wiiu_add_library(hle
         src/gx2.cpp
         src/gx2_context.cpp
         src/gx2_display.cpp
+        src/gx2_shader.cpp
         src/gx2_state.cpp
         src/gx2_surface.cpp
         src/heap.cpp
@@ -26,6 +27,7 @@ wiiu_add_library(hle
         include/wiiu/hle/filesystem.hpp
         include/wiiu/hle/gx2.hpp
         include/wiiu/hle/gx2_context.hpp
+        include/wiiu/hle/gx2_shader.hpp
         include/wiiu/hle/gx2_state.hpp
         include/wiiu/hle/gx2_surface.hpp
         include/wiiu/hle/heap.hpp

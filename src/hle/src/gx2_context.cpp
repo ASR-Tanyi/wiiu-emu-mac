@@ -4,10 +4,15 @@
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/gx2.hpp>
 #include <wiiu/hle/gx2_context.hpp>
+#include <wiiu/hle/gx2_shader.hpp>
+#include <wiiu/hle/gx2_state.hpp>
 #include <wiiu/hle/registry.hpp>
+#include <wiiu/latte/color_buffer.hpp>
 #include <wiiu/latte/pm4.hpp>
+#include <wiiu/latte/render_state.hpp>
 
 #include <array>
+#include <bit>
 #include <optional>
 
 namespace wiiu::hle::gx2 {
@@ -128,7 +133,10 @@ void gx2_setup_context_state_ex(Call& call, u32 state, u32 flags) {
     // Name the block, so what is written from here on lands in it.
     static_cast<void>(emit(call, bind_context_state_packets(*physical, false)));
 
-    // The default state is written here next (see the header).
+    // The new block's state: written now, with the block named, it is what
+    // the block holds.
+    static_cast<void>(emit(call, initial_register_packets()));
+    static_cast<void>(emit(call, default_state_packets()));
 
     if ((flags & context_state_no_display_list_flag) != 0) {
         return;
@@ -225,7 +233,212 @@ std::vector<u32> unbind_context_state_packets() {
     };
 }
 
+namespace {
+
+void gx2_set_default_state(Call& call) {
+    static_cast<void>(emit(call, default_state_packets()));
+}
+
+/// A register write, for the table below.
+struct Write {
+    Opcode opcode;
+    u32 address;
+    std::vector<u32> values;
+};
+
+} // namespace
+
+std::vector<u32> initial_register_packets() {
+    constexpr Opcode context = Opcode::SetContextReg;
+    constexpr Opcode config = Opcode::SetConfigReg;
+
+    // A scissor corner at 8192, 8192; and the same top-left corner with
+    // WINDOW_OFFSET_DISABLE (bit 31).
+    constexpr u32 corner_8192 = 8192U | (8192U << 16);
+    constexpr u32 no_window_offset = 1U << 31;
+
+    const std::vector<Write> writes{
+        // PA_SC_SCREEN_SCISSOR_TL, _BR
+        {context, 0x28030, {0, corner_8192}},
+        // PA_SC_LINE_CNTL
+        {context, 0x28C00, {0}},
+        // PA_SU_VTX_CNTL: pixel centres OpenGL's (1), round by truncation (0),
+        // quantised to 1/256 (5, in bits 3-5)
+        {context, 0x28C08, {1U | (5U << 3)}},
+        // PA_CL_POINT_X_RAD .. PA_CL_POINT_CULL_RAD
+        {context, 0x28E10, std::vector<u32>(4, 0)},
+        // PA_CL_UCP_0_X .. PA_CL_UCP_5_W: the user clip planes
+        {context, 0x28E20, std::vector<u32>(24, 0)},
+        // PA_CL_VTE_CNTL: the viewport's scale and offset on in x, y and z,
+        // and W0 in the vertex (bit 10)
+        {context, 0x28818, {0x3FU | (1U << 10)}},
+        // PA_CL_NANINF_CNTL
+        {context, 0x28820, {0}},
+        // PA_SC_WINDOW_OFFSET, PA_SC_WINDOW_SCISSOR_TL, _BR
+        {context, 0x28200, {0, no_window_offset, corner_8192}},
+        // PA_SC_LINE_STIPPLE
+        {context, 0x28A0C, {0}},
+        // PA_SC_MPASS_PS_CNTL, PA_SC_MODE_CNTL: MSAA on (bit 0),
+        // FORCE_EOV_CNTDWN_ENABLE (14) and FORCE_EOV_REZ_ENABLE (16)
+        {context, 0x28A48, {0, 1U | (1U << 14) | (1U << 16)}},
+        // PA_SC_VPORT_SCISSOR_0_TL, _BR
+        {context, 0x28250, {no_window_offset, corner_8192}},
+        // PA_SC_FORCE_EOV_MAX_CNTS (Linux's rv770d.h)
+        {config, 0x8B24, {0xFF3FFF}},
+        // PA_SC_CLIPRECT_RULE: every pixel passes
+        {context, 0x2820C, {0xFFFF}},
+        // VGT_GS_VERTEX_REUSE
+        {config, 0x88D4, {16}},
+        // VGT_OUTPUT_PATH_CNTL: tessellation's path (1)
+        {context, 0x28A10, {1}},
+        // VGT_ES_PER_GS (decaf: 16 times two values from GX2's state, both 1
+        // as far as it knows), VGT_GS_PER_ES, VGT_GS_PER_VS
+        {config, 0x88CC, {16}},
+        {config, 0x88C8, {256}},
+        {config, 0x88E8, {4}},
+        // VGT_INDX_OFFSET, VGT_REUSE_OFF
+        {context, 0x28408, {0}},
+        {context, 0x28AB4, {0}},
+        // VGT_MULTI_PRIM_IB_RESET_EN: primitive restart on
+        {context, 0x28A94, {1}},
+        // VGT_VERTEX_REUSE_BLOCK_CNTL, VGT_OUT_DEALLOC_CNTL
+        {context, 0x28C58, {14, 16}},
+        // VGT_HOS_REUSE_DEPTH, VGT_STRMOUT_DRAW_OPAQUE_OFFSET, VGT_VTX_CNT_EN
+        {context, 0x28A20, {16}},
+        {context, 0x28B28, {0}},
+        {context, 0x28AB8, {0}},
+        // VGT_MAX_VTX_INDX, VGT_MIN_VTX_INDX
+        {context, 0x28400, {0xFFFFFFFF, 0}},
+        // TA_CNTL_AUX: bit 1, and the three SYNC bits (24-26)
+        {config, 0x9508, {(1U << 1) | (7U << 24)}},
+        // VC_ENHANCE (Linux's r600d.h)
+        {config, 0x9714, {1}},
+        // SQ_DYN_GPR_CNTL_PS_FLUSH_REQ (Linux's R7xx register list)
+        {config, 0x8D8C, {0x4000}},
+        // SQ_ESTMP_RING_BASE .. SQ_REDUC_RING_SIZE
+        {config, 0x8C50, std::vector<u32>(12, 0)},
+        // SQ_ESTMP_RING_ITEMSIZE .. SQ_REDUC_RING_ITEMSIZE
+        {context, 0x288B0, std::vector<u32>(6, 0)},
+        // SQ_VTX_START_INST_LOC
+        {Opcode::SetCtlConst, 0x3CFF4, {0}},
+        // SPI_FOG_CNTL, SPI_FOG_FUNC_SCALE, SPI_FOG_FUNC_BIAS
+        {context, 0x286DC, {0, 0, 0}},
+        // SPI_INTERP_CONTROL_0: flat shading on, point sprites off and
+        // overridden to s, t, 0, 1, top at 1
+        {context, 0x286D4, {1U | (2U << 2) | (3U << 5) | (0U << 8) | (1U << 11) | (1U << 14)}},
+        // SPI_CONFIG_CNTL_1
+        {config, 0x913C, {0}},
+        // SPI_THREAD_GROUPING (Linux's R7xx register list), in every context
+        {Opcode::SetAllContexts, 0x286C8, {1}},
+        // SX_SURFACE_SYNC (likewise): 0x1FF, decaf's branch for a value it
+        // reads as zero
+        {context, 0x28354, {0x1FF}},
+        // DB_SRESULTS_COMPARE_STATE0, _1; DB_RENDER_OVERRIDE
+        {context, 0x28D28, {0, 0}},
+        {context, 0x28D10, {0}},
+        // DB_DEBUG (Linux's r600d.h), then an unnamed one
+        {config, 0x9830, {0}},
+        {config, 0x983C, {0x1000000}},
+        // CB_CLRCMP_CONTROL (select the source, 1 in bits 24-25), _SRC, _DST,
+        // _MSK
+        {context, 0x28C30, {1U << 24, 0, 0, 0xFFFFFFFF}},
+        // unnamed
+        {config, 0x9A1C, {0}},
+        // PA_SC_AA_MASK: every sample
+        {context, 0x28C48, {0xFFFFFFFF}},
+        // PA_SC_EDGERULE (Linux's rv770d.h, which sets the same)
+        {context, 0x28230, {0xAAAAAAAA}},
+    };
+
+    std::vector<u32> out;
+    for (const Write& write : writes) {
+        append_registers(out, write.opcode, write.address, write.values);
+    }
+    return out;
+}
+
+std::vector<u32> default_state_packets() {
+    std::vector<u32> out;
+
+    append_shader_mode(out,
+                       ShaderMode::UniformRegister,
+                       ShaderResources{.vs_gprs = 48,
+                                       .vs_stack = 64,
+                                       .gs_gprs = 0,
+                                       .gs_stack = 0,
+                                       .ps_gprs = 200,
+                                       .ps_stack = 192});
+
+    constexpr u32 less = 1;
+    constexpr u32 always = 7;
+    constexpr u32 replace = 2;
+    append_context_register(out,
+                            latte::reg::db_depth_control,
+                            depth_stencil_control(DepthStencil{.depth_test = true,
+                                                               .depth_write = true,
+                                                               .depth_compare = less,
+                                                               .stencil_test = false,
+                                                               .backface_stencil = false,
+                                                               .front_compare = always,
+                                                               .front_depth_pass = replace,
+                                                               .front_depth_fail = replace,
+                                                               .front_stencil_fail = replace,
+                                                               .back_compare = always,
+                                                               .back_depth_pass = replace,
+                                                               .back_depth_fail = replace,
+                                                               .back_stencil_fail = replace}));
+
+    constexpr u32 triangles = 2;
+    append_context_register(out,
+                            latte::reg::pa_su_sc_mode_cntl,
+                            polygon_control(PolygonControl{
+                                .front_face = 0, .front_mode = triangles, .back_mode = triangles}));
+
+    append_stencil_mask(out, stencil_mask_registers(0xFF, 0xFF, 1, 0xFF, 0xFF, 1));
+    append_polygon_offset(out, polygon_offset_registers(0, 0, 0, 0, 0));
+    append_context_register(out, latte::reg::pa_su_point_size, point_size_register(1, 1));
+    append_context_register(out, latte::reg::pa_su_point_minmax, point_limits_register(1, 1));
+    append_context_register(out, latte::reg::pa_su_line_cntl, line_width_register(1));
+    append_context_register(out, latte::reg::vgt_multi_prim_ib_reset_indx, 0xFFFFFFFF);
+    append_alpha_test(out, alpha_test_registers(false, less, 0));
+    append_context_register(out, latte::reg::db_alpha_to_mask, alpha_to_mask_register(false, 0));
+    append_context_register(
+        out,
+        latte::reg::cb_target_mask,
+        target_channel_masks_register({0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF}));
+
+    constexpr u32 copy = 0xCC;
+    append_context_register(
+        out, latte::reg::cb_color_control, color_control_register(copy, 0, false, true));
+
+    constexpr u32 source_alpha = 4;
+    constexpr u32 inverse_source_alpha = 5;
+    constexpr u32 add = 0;
+    const u32 blend = blend_control_register(BlendControl{.color_source = source_alpha,
+                                                          .color_destination = inverse_source_alpha,
+                                                          .color_combine = add,
+                                                          .separate_alpha = true,
+                                                          .alpha_source = source_alpha,
+                                                          .alpha_destination = inverse_source_alpha,
+                                                          .alpha_combine = add});
+    for (u32 target = 0; target < latte::reg::render_target_count; ++target) {
+        append_blend_control(out, target, blend);
+    }
+
+    append_blend_constant_color(out,
+                                BlendConstantColorReg{.red = 0, .green = 0, .blue = 0, .alpha = 0});
+    append_context_register(out, latte::reg::vgt_strmout_en, 0);
+    append_context_register(
+        out, latte::reg::pa_cl_clip_cntl, clip_control_register(true, true, false));
+    // GX2SetTessellation is a stub (gx2_state.hpp), so it writes nothing.
+    append_context_register(out, latte::reg::vgt_hos_max_tess_level, std::bit_cast<u32>(1.0F));
+    append_context_register(out, latte::reg::vgt_hos_min_tess_level, std::bit_cast<u32>(1.0F));
+    append_context_register(out, latte::reg::db_render_control, 0);
+    return out;
+}
+
 void register_gx2_context(Registry& registry) {
+    registry.add("gx2", "GX2SetDefaultState", gx2_set_default_state);
     registry.add("gx2", "GX2SetupContextStateEx", gx2_setup_context_state_ex);
     registry.add("gx2", "GX2SetContextState", gx2_set_context_state);
     registry.add("gx2", "GX2GetContextStateDisplayList", gx2_get_context_state_display_list);

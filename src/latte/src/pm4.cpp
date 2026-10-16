@@ -124,6 +124,8 @@ std::string_view opcode_name(u8 opcode) noexcept {
             return "STRMOUT_BASE_UPDATE";
         case Opcode::SurfaceBaseUpdate:
             return "SURFACE_BASE_UPDATE";
+        case Opcode::SetAllContexts:
+            return "SET_ALL_CONTEXTS";
     }
     return {};
 }

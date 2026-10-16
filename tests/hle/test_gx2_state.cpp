@@ -297,9 +297,11 @@ TEST_CASE_METHOD(StateFixture,
 }
 
 TEST_CASE_METHOD(StateFixture, "a render target past the eighth is refused", "[hle][gx2][state]") {
+    run_gpu(); // GX2Init's own state
+    const u64 before = os.gpu.processor().stats().packets;
     call("GX2SetColorBuffer", {kBuffer, 8});
     run_gpu();
-    CHECK(os.gpu.processor().stats().packets == 0);
+    CHECK(os.gpu.processor().stats().packets == before);
 }
 
 // --------------------------------------------------------------------------
@@ -475,4 +477,119 @@ TEST_CASE_METHOD(StateFixture,
     CHECK(reg(latte::reg::pa_su_point_size) == ((24U << 16) | 24U));
     CHECK(reg(latte::reg::pa_su_point_minmax) == ((64U << 16) | 4U));
     CHECK(reg(latte::reg::pa_su_line_cntl) == 16);
+}
+
+// --------------------------------------------------------------------------
+// Colour
+// --------------------------------------------------------------------------
+
+TEST_CASE("colour, blend and mask state pack as decaf and Cemu do", "[hle][gx2][state]") {
+    // GX2SetDefaultState's: copy, no blending, colour writes on.
+    CHECK(gx2::color_control_register(0xCC, 0, false, true) == (0xCCU << 16));
+    // Writes off is SPECIAL_OP 1, bits 4-6 (Linux's r600d.h); the blend
+    // mask is a bit per target from bit 8.
+    CHECK(gx2::color_control_register(0x66, 0x81, true, false) ==
+          ((0x66U << 16) | (0x81U << 8) | (1U << 4) | (1U << 1)));
+
+    // Source alpha, one minus source alpha, add -- for colour and alpha both.
+    const u32 blend = gx2::blend_control_register({.color_source = 4,
+                                                   .color_destination = 5,
+                                                   .color_combine = 0,
+                                                   .separate_alpha = true,
+                                                   .alpha_source = 1,
+                                                   .alpha_destination = 0,
+                                                   .alpha_combine = 4});
+    CHECK(blend == (4U | (5U << 8) | (1U << 16) | (4U << 21) | (1U << 29)));
+    const latte::CbBlendControl decoded{.raw = blend};
+    CHECK(decoded.color_destblend == 5);
+    CHECK(decoded.alpha_comb_fcn == 4);
+
+    // A nibble a target, target 0 lowest (Linux's r600d.h).
+    CHECK(gx2::target_channel_masks_register({0xF, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x8}) ==
+          0x8654321FU);
+
+    const gx2::AlphaTestReg alpha = gx2::alpha_test_registers(true, 4, 0.5F);
+    CHECK(alpha.sx_alpha_test_control == (4U | (1U << 3)));
+    CHECK(alpha.sx_alpha_ref == 0.5F);
+
+    // decaf's dither tables, read back as the byte its Get call matches.
+    CHECK(gx2::alpha_to_mask_register(true, 0) == (1U | (0xAAU << 8)));
+    CHECK(((gx2::alpha_to_mask_register(false, 1) >> 8) & 0xFF) == 0x78);
+    CHECK(((gx2::alpha_to_mask_register(false, 2) >> 8) & 0xFF) == 0xC6);
+    CHECK(((gx2::alpha_to_mask_register(false, 3) >> 8) & 0xFF) == 0x2D);
+    CHECK(((gx2::alpha_to_mask_register(false, 4) >> 8) & 0xFF) == 0x93);
+    CHECK(gx2::alpha_to_mask_register(false, 99) == (0xAAU << 8));
+
+    CHECK(gx2::aa_mask_register(0x01, 0x02, 0x04, 0x108) == 0x08040201U);
+}
+
+TEST_CASE_METHOD(StateFixture, "the colour calls reach their registers", "[hle][gx2][state]") {
+    call("GX2SetColorControl", {0xCC, 0x01, 0, 1});
+    call("GX2SetBlendControl", {2, 4, 5, 0, 1, 1, 0, 4});
+    call("GX2SetBlendConstantColor", {}, {0.25F, 0.5F, 0.75F, 1.0F});
+    call("GX2SetTargetChannelMasks", {0xF, 0xF, 0, 0, 0, 0, 0, 0x7});
+    call("GX2SetAlphaTest", {1, 4}, {0.5F});
+    call("GX2SetAlphaToMask", {1, 2});
+    call("GX2SetAAMask", {0xFF, 0xFF, 0xFF, 0xFF});
+    run_gpu();
+
+    CHECK(reg(latte::reg::cb_color_control) == ((0xCCU << 16) | (1U << 8)));
+    // Target 2's, not 0's, which is still the default state's.
+    CHECK(reg(latte::reg::cb_blend0_control) == gx2::blend_control_register({.color_source = 4,
+                                                                             .color_destination = 5,
+                                                                             .color_combine = 0,
+                                                                             .separate_alpha = true,
+                                                                             .alpha_source = 4,
+                                                                             .alpha_destination = 5,
+                                                                             .alpha_combine = 0}));
+    CHECK(reg(latte::reg::cb_blend0_control + 8) ==
+          (4U | (5U << 8) | (1U << 16) | (4U << 21) | (1U << 29)));
+    CHECK(reg(latte::reg::cb_blend_red) == bits(0.25F));
+    CHECK(reg(latte::reg::cb_blend_red + 12) == bits(1.0F)); // alpha
+    CHECK(reg(latte::reg::cb_target_mask) == 0x700000FFU);
+    CHECK(reg(latte::reg::sx_alpha_test_control) == (4U | (1U << 3)));
+    CHECK(reg(latte::reg::sx_alpha_ref) == bits(0.5F));
+    CHECK(reg(latte::reg::db_alpha_to_mask) == (1U | (0xC6U << 8)));
+    CHECK(reg(latte::reg::pa_sc_aa_mask) == 0xFFFFFFFFU);
+
+    // A target past the eighth is refused, and writes nothing.
+    call("GX2SetBlendControl", {8, 1, 1, 0, 0, 0, 0, 0});
+    run_gpu();
+    CHECK(reg(latte::reg::cb_blend0_control + 32) == 0);
+}
+
+TEST_CASE_METHOD(StateFixture,
+                 "the colour Init/Set pairs write what the one call does",
+                 "[hle][gx2][state]") {
+    // Nine arguments each: the last on the stack.
+    call("GX2InitBlendControlReg", {kReg, 7, 2, 3, 1, 0, 0, 0, 3});
+    call("GX2InitTargetChannelMasksReg", {kReg + 0x10, 1, 2, 3, 4, 5, 6, 7, 8});
+    call("GX2InitColorControlReg", {kReg + 0x20, 0x00, 0xFF, 0, 0});
+    call("GX2InitBlendConstantColorReg", {kReg + 0x30}, {1, 0, 0, 0.5F});
+    call("GX2InitAlphaTestReg", {kReg + 0x40, 1, 7}, {0.25F});
+    call("GX2InitAlphaToMaskReg", {kReg + 0x50, 1, 3});
+    call("GX2InitAAMaskReg", {kReg + 0x54, 1, 2, 3, 4});
+    CHECK(memory.read<u32>(kReg) == 7); // the target first
+    CHECK(memory.read<u32>(kReg + 4) ==
+          (2U | (1U << 5) | (3U << 8) | (3U << 21))); // from the stack
+    CHECK(memory.read<u32>(kReg + 0x10) == 0x87654321U);
+
+    call("GX2SetBlendControlReg", {kReg});
+    call("GX2SetTargetChannelMasksReg", {kReg + 0x10});
+    call("GX2SetColorControlReg", {kReg + 0x20});
+    call("GX2SetBlendConstantColorReg", {kReg + 0x30});
+    call("GX2SetAlphaTestReg", {kReg + 0x40});
+    call("GX2SetAlphaToMaskReg", {kReg + 0x50});
+    call("GX2SetAAMaskReg", {kReg + 0x54});
+    run_gpu();
+
+    CHECK(reg(latte::reg::cb_blend0_control + 28) == (2U | (1U << 5) | (3U << 8) | (3U << 21)));
+    CHECK(reg(latte::reg::cb_target_mask) == 0x87654321U);
+    CHECK(reg(latte::reg::cb_color_control) == ((0xFFU << 8) | (1U << 4)));
+    CHECK(reg(latte::reg::cb_blend_red) == bits(1.0F));
+    CHECK(reg(latte::reg::cb_blend_red + 12) == bits(0.5F));
+    CHECK(reg(latte::reg::sx_alpha_test_control) == (7U | (1U << 3)));
+    CHECK(reg(latte::reg::sx_alpha_ref) == bits(0.25F));
+    CHECK(reg(latte::reg::db_alpha_to_mask) == (1U | (0x2DU << 8)));
+    CHECK(reg(latte::reg::pa_sc_aa_mask) == 0x04030201U);
 }

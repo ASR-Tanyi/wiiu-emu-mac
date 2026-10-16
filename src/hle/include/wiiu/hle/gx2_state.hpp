@@ -7,13 +7,16 @@
 // reads them at the draw.
 //
 // So far: the viewport and the scissor, which every title sets for its
-// render targets before drawing anything; and the depth, stencil and
-// rasterizer state -- the depth test, the stencil test and its masks,
-// culling and polygon mode, polygon offset, point and line sizes, clipping,
-// and the primitive restart index. Each comes as GX2 has it: the call that
-// sets the state, and for most an `Init…Reg` that computes it into the
-// title's structure and a `Set…Reg` that writes that. The `Get…Reg` calls
-// that read a structure back are not here yet.
+// render targets before drawing anything; the depth, stencil and rasterizer
+// state -- the depth test, the stencil test and its masks, culling and
+// polygon mode, polygon offset, point and line sizes, clipping, and the
+// primitive restart index; and the colour state -- colour control, blending
+// and its constant, the channel masks, the alpha test, alpha-to-mask and the
+// multisample mask; and stream out on or off and the tessellation levels'
+// bounds. `GX2SetTessellation` itself is a stub, as it is in decaf. Each comes as GX2 has it: the
+// call that sets the state, and for most an `Init…Reg` that computes it into the title's structure
+// and a `Set…Reg` that writes that. The `Get…Reg` calls that read a structure back are not here
+// yet.
 //
 // Where decaf and Cemu compute a value differently it is named, with the
 // one taken; the field layouts are latte/render_state.hpp's.
@@ -24,6 +27,7 @@
 
 #include <array>
 #include <cstddef>
+#include <vector>
 
 namespace wiiu::hle {
 
@@ -182,6 +186,101 @@ struct PolygonControl {
 /// DX clip space. Cemu also sets DX_LINEAR_ATTR_CLIP_ENA every time, and so
 /// does this; decaf leaves it clear.
 [[nodiscard]] u32 clip_control_register(bool rasterizer, bool z_clip, bool half_z) noexcept;
+
+// --- colour -----------------------------------------------------------------
+
+/// `GX2ColorControlReg`, `GX2BlendControlReg`, `GX2BlendConstantColorReg`,
+/// `GX2TargetChannelMaskReg`, `GX2AlphaTestReg`, `GX2AlphaToMaskReg`,
+/// `GX2AAMaskReg`.
+struct ColorControlReg {
+    u32be cb_color_control;
+};
+
+struct BlendControlReg {
+    u32be target; ///< which CB_BLENDn_CONTROL
+    u32be cb_blend_control;
+};
+
+struct BlendConstantColorReg {
+    f32be red;
+    f32be green;
+    f32be blue;
+    f32be alpha;
+};
+
+struct TargetChannelMaskReg {
+    u32be cb_target_mask;
+};
+
+struct AlphaTestReg {
+    u32be sx_alpha_test_control;
+    f32be sx_alpha_ref;
+};
+
+struct AlphaToMaskReg {
+    u32be db_alpha_to_mask;
+};
+
+struct AaMaskReg {
+    u32be pa_sc_aa_mask;
+};
+
+static_assert(sizeof(ColorControlReg) == 0x4);
+static_assert(sizeof(BlendControlReg) == 0x8);
+static_assert(sizeof(BlendConstantColorReg) == 0x10);
+static_assert(sizeof(TargetChannelMaskReg) == 0x4);
+static_assert(sizeof(AlphaTestReg) == 0x8);
+static_assert(sizeof(AlphaToMaskReg) == 0x4);
+static_assert(sizeof(AaMaskReg) == 0x4);
+
+/// CB_COLOR_CONTROL for `GX2SetColorControl`: the logic op (a ROP3 code;
+/// `GX2LogicOp` is one), a blend-enable bit per target, multiwrite, and
+/// colour writes on or off -- SPECIAL_OP normal or disable. decaf and Cemu
+/// agree.
+[[nodiscard]] u32 color_control_register(u32 logic_op,
+                                         u32 blend_enable_mask,
+                                         bool multiwrite,
+                                         bool color_write) noexcept;
+
+/// `GX2SetBlendControl`'s arguments after the target.
+struct BlendControl {
+    u32 color_source = 0; ///< GX2BlendMode
+    u32 color_destination = 0;
+    u32 color_combine = 0; ///< GX2BlendCombineMode
+    bool separate_alpha = false;
+    u32 alpha_source = 0;
+    u32 alpha_destination = 0;
+    u32 alpha_combine = 0;
+};
+
+/// CB_BLENDn_CONTROL for it. decaf and Cemu agree.
+[[nodiscard]] u32 blend_control_register(const BlendControl& state) noexcept;
+
+/// CB_TARGET_MASK: target n's `GX2ChannelMask` in bits 4n to 4n+3.
+[[nodiscard]] u32 target_channel_masks_register(const std::array<u32, 8>& masks) noexcept;
+
+[[nodiscard]] AlphaTestReg alpha_test_registers(bool enable, u32 compare, f32 reference) noexcept;
+
+/// DB_ALPHA_TO_MASK for a `GX2AlphaToMaskMode`: decaf's dither offsets for
+/// each mode (it alone has the call). An unknown mode is non-dithered.
+[[nodiscard]] u32 alpha_to_mask_register(bool enable, u32 mode) noexcept;
+
+[[nodiscard]] u32
+aa_mask_register(u32 upper_left, u32 upper_right, u32 lower_left, u32 lower_right) noexcept;
+
+// --- the packets ------------------------------------------------------------
+
+/// What the calls that write more than one packet write, appended to `out`
+/// -- for `GX2SetDefaultState`, which writes them too. Two packets each for
+/// the stencil masks (front, back), the polygon offset (the four scales and
+/// offsets, then the clamp) and the alpha test (control, reference), as
+/// decaf and Cemu write them; one for the blend constant. The blend
+/// control's target must be below 8.
+void append_stencil_mask(std::vector<u32>& out, const StencilMaskReg& reg);
+void append_polygon_offset(std::vector<u32>& out, const PolygonOffsetReg& reg);
+void append_alpha_test(std::vector<u32>& out, const AlphaTestReg& reg);
+void append_blend_control(std::vector<u32>& out, u32 target, u32 value);
+void append_blend_constant_color(std::vector<u32>& out, const BlendConstantColorReg& reg);
 
 /// Register the state calls. Called by `register_gx2`.
 void register_gx2_state(Registry& registry);

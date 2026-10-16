@@ -95,9 +95,10 @@ enum class Opcode : u8 {
     SetCtlConst = 0x6F,
     StreamOutBaseUpdate = 0x72,
     SurfaceBaseUpdate = 0x73,
+    SetAllContexts = 0x74, ///< SET_CONTEXT_REG for every context; Latte here has one
 
     // The emulator's own commands, from 0xF0 up -- R600's highest opcode is
-    // 0x73, so no packet meant for the hardware is one. Each stands for work GX2
+    // 0x74, so no packet meant for the hardware is one. Each stands for work GX2
     // does on hardware with a draw, a DMA or the display controller, and
     // which the emulator does in one step when the packet runs: in stream
     // order, on the guest's clock (ADR-004), from a display list as well as

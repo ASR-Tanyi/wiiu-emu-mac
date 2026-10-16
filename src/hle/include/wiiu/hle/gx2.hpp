@@ -47,6 +47,7 @@
 
 #include <wiiu/common/types.hpp>
 #include <wiiu/latte/command_processor.hpp>
+#include <wiiu/latte/pm4.hpp>
 #include <wiiu/latte/registers.hpp>
 #include <wiiu/latte/timeline.hpp>
 #include <wiiu/memory/memory.hpp>
@@ -465,6 +466,19 @@ inline constexpr u32 context_register_base = 0x28000;
 /// `SET_CONTEXT_REG` for consecutive registers from the byte address
 /// `address`, through `emit`.
 bool emit_context_registers(Call& call, u32 address, std::span<const u32> values);
+
+/// Append a register-window write -- `SET_CONFIG_REG`, `SET_CONTEXT_REG`,
+/// `SET_ALL_CONTEXTS` or `SET_CTL_CONST` -- for consecutive registers from
+/// the byte address `address`, which must be in that opcode's window. For
+/// state built up before it is emitted: the default state, and calls that
+/// write more than one packet.
+void append_registers(std::vector<u32>& out,
+                      latte::pm4::Opcode opcode,
+                      u32 address,
+                      std::span<const u32> values);
+
+/// `SET_CONTEXT_REG` of one register.
+void append_context_register(std::vector<u32>& out, u32 address, u32 value);
 
 /// Call a display list in the title's memory, `bytes` long, with
 /// `INDIRECT_BUFFER_PRIV` through `emit` -- `GX2CallDisplayList`. False,
