@@ -9,6 +9,7 @@ wiiu_add_library(hle
         src/coreinit_time.cpp
         src/filesystem.cpp
         src/gx2.cpp
+        src/gx2_buffers.cpp
         src/gx2_context.cpp
         src/gx2_display.cpp
         src/gx2_fetch_shader.cpp
@@ -27,6 +28,7 @@ wiiu_add_library(hle
         include/wiiu/hle/coreinit.hpp
         include/wiiu/hle/filesystem.hpp
         include/wiiu/hle/gx2.hpp
+        include/wiiu/hle/gx2_buffers.hpp
         include/wiiu/hle/gx2_context.hpp
         include/wiiu/hle/gx2_fetch_shader.hpp
         include/wiiu/hle/gx2_shader.hpp
