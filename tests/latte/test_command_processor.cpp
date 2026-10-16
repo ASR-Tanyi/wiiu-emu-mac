@@ -684,3 +684,27 @@ TEST_CASE_METHOD(MemoryFixture,
     CHECK(processor.stats().unknown == 0);
     CHECK(pm4::opcode_name(static_cast<u8>(Opcode::SetAllContexts)) == "SET_ALL_CONTEXTS");
 }
+
+TEST_CASE_METHOD(Fixture, "SQ_VTX_SEMANTIC_CLEAR empties the semantics it names", "[latte][cp]") {
+    // Semantics 0-3 set; then a clear of 1 and 3 in a packet that also sets 3.
+    const std::vector<u32> stream{
+        type3_header(Opcode::SetContextReg, 5),
+        (0x28380 - 0x28000) / 4,
+        10,
+        11,
+        12,
+        13,
+        type3_header(Opcode::SetContextReg, 2),
+        (0x288E0 - 0x28000) / 4,
+        0xA,
+        type3_header(Opcode::SetContextReg, 2),
+        (0x2838C - 0x28000) / 4,
+        33,
+    };
+    REQUIRE(processor.execute(stream));
+    CHECK(registers->read(0x28380) == 10);
+    CHECK(registers->read(0x28384) == 0xFFFFFFFF);
+    CHECK(registers->read(0x28388) == 12);
+    CHECK(registers->read(0x2838C) == 33); // written again after the clear
+    CHECK(registers->read(0x288E0) == 0xA);
+}

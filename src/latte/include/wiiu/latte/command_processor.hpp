@@ -259,6 +259,11 @@ private:
 
     void packet(const pm4::Packet& packet, u32 depth);
     void set_window(const pm4::Packet& packet, Window window);
+
+    /// A context write that includes SQ_VTX_SEMANTIC_CLEAR: every semantic
+    /// register whose bit it sets, and that the same write does not set,
+    /// becomes all ones. Not shadowed: only what the packet carried is.
+    void clear_semantics(Window window, u32 offset, std::span<const u32> values);
     void context_control(const pm4::Packet& packet);
     void load(const pm4::Packet& packet, Window window);
 

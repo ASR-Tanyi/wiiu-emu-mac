@@ -546,6 +546,21 @@ void append_registers(std::vector<u32>& out,
         case Opcode::SetCtlConst:
             window = latte::Window::CtlConst;
             break;
+        case Opcode::SetAluConst:
+            window = latte::Window::AluConst;
+            break;
+        case Opcode::SetResource:
+            window = latte::Window::Resource;
+            break;
+        case Opcode::SetSampler:
+            window = latte::Window::Sampler;
+            break;
+        case Opcode::SetLoopConst:
+            window = latte::Window::LoopConst;
+            break;
+        case Opcode::SetBoolConst:
+            window = latte::Window::BoolConst;
+            break;
         default: // SET_CONTEXT_REG and SET_ALL_CONTEXTS
             break;
     }
@@ -564,6 +579,50 @@ bool emit_context_registers(Call& call, u32 address, std::span<const u32> values
     packet.reserve(2 + values.size());
     append_registers(packet, latte::pm4::Opcode::SetContextReg, address, values);
     return emit(call, packet);
+}
+
+std::vector<u32> invalidate_packets(u32 mode, physaddr_t address, u32 size) {
+    namespace coher = latte::pm4::coher;
+    if ((mode & ~invalidate::cpu) == 0) {
+        return {};
+    }
+    u32 control = coher::engine_me;
+    const bool everything = address == 0 && size == 0xFFFFFFFF;
+    if (everything && (mode & 0xFU) != 0) {
+        control |= coher::full_cache_ena;
+    }
+    if ((mode & (invalidate::texture | invalidate::attribute_buffer)) != 0) {
+        control |= coher::tc_action_ena;
+    }
+    if ((mode & invalidate::uniform_block) != 0) {
+        control |= coher::tc_action_ena | coher::sh_action_ena;
+    }
+    if ((mode & invalidate::shader) != 0) {
+        control |= coher::sh_action_ena;
+    }
+    if ((mode & invalidate::color_buffer) != 0) {
+        control |= coher::cb_dest_base_ena_all | coher::cb_action_ena;
+    }
+    if ((mode & invalidate::depth_buffer) != 0) {
+        control |= coher::db_dest_base_ena | coher::db_action_ena;
+    }
+    if ((mode & invalidate::stream_out_buffer) != 0) {
+        control |= coher::so_dest_base_ena_all | coher::sx_action_ena;
+    }
+    if ((mode & invalidate::export_buffer) != 0) {
+        control |= coher::dest_base_0_ena | coher::tc_action_ena | coher::cb_action_ena |
+                   coher::db_action_ena | coher::sx_action_ena;
+    }
+    // In 256-byte units, rounded up; all ones for everything.
+    const u32 units =
+        size == 0xFFFFFFFF ? 0xFFFFFFU : static_cast<u32>((static_cast<u64>(size) + 0xFF) >> 8);
+    return {
+        latte::pm4::type3_header(latte::pm4::Opcode::SurfaceSync, 4),
+        control,
+        units,
+        address >> 8,
+        4, // the poll interval, as decaf and Cemu write it
+    };
 }
 
 bool emit_display_list_call(Call& call, ppcaddr_t list, u32 bytes, std::string_view what) {
@@ -799,6 +858,25 @@ void gx2_copy_display_list(Call& call, u32 list, u32 bytes) {
     static_cast<void>(emit(call, words));
 }
 
+/// `void GX2Invalidate(GX2InvalidateMode mode, void *buffer, uint32_t
+/// size)`. The CPU's part -- a data-cache flush -- needs nothing here yet;
+/// it will tell the texture and buffer caches (8.13) what changed.
+void gx2_invalidate(Call& call, u32 mode, u32 buffer, u32 size) {
+    physaddr_t physical = 0;
+    if (buffer != 0) {
+        const std::optional<physaddr_t> found =
+            physical_address(call.memory, buffer, "GX2Invalidate's buffer");
+        if (!found.has_value()) {
+            return;
+        }
+        physical = *found;
+    }
+    const std::vector<u32> packet = invalidate_packets(mode, physical, size);
+    if (!packet.empty()) {
+        static_cast<void>(emit(call, packet));
+    }
+}
+
 void gx2_set_event_callback(Call&, u32 type, u32 function, u32 user_data) {
     if (type >= event_type_count) {
         WIIU_LOG_WARN(Gx2, "GX2SetEventCallback for event type {}, which does not exist", type);
@@ -916,6 +994,7 @@ void register_gx2(Registry& registry, coreinit::Context& context) {
     registry.add("gx2", "GX2Shutdown", gx2_shutdown);
     registry.add("gx2", "GX2GetMainCoreId", gx2_get_main_core_id);
     registry.add("gx2", "GX2Flush", gx2_flush);
+    registry.add("gx2", "GX2Invalidate", gx2_invalidate);
 
     registry.add("gx2", "GX2GetLastSubmittedTimeStamp", gx2_get_last_submitted_time_stamp);
     registry.add("gx2", "GX2GetRetiredTimeStamp", gx2_get_retired_time_stamp);

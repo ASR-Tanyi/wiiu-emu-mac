@@ -111,6 +111,26 @@ enum class Opcode : u8 {
     HleClearDepthStencil = 0xF3, ///< GX2ClearDepthStencilEx
 };
 
+/// SURFACE_SYNC's first word, CP_COHER_CNTL: which caches to flush or
+/// invalidate, and for which destinations. The action bits and FULL_CACHE
+/// are Linux's `r600d.h`'s (`PACKET3_*`); the destination bits decaf's.
+/// SURFACE_SYNC's other words are the size and base, both >> 8, and a poll
+/// interval.
+namespace coher {
+inline constexpr u32 dest_base_0_ena = 1U << 0;
+inline constexpr u32 so_dest_base_ena_all = 0xFU << 2;  ///< stream out 0-3
+inline constexpr u32 cb_dest_base_ena_all = 0xFFU << 6; ///< colour buffers 0-7
+inline constexpr u32 db_dest_base_ena = 1U << 14;
+inline constexpr u32 full_cache_ena = 1U << 20;
+inline constexpr u32 tc_action_ena = 1U << 23; ///< texture cache
+inline constexpr u32 vc_action_ena = 1U << 24; ///< vertex cache
+inline constexpr u32 cb_action_ena = 1U << 25;
+inline constexpr u32 db_action_ena = 1U << 26;
+inline constexpr u32 sh_action_ena = 1U << 27; ///< shader instruction and constant caches
+inline constexpr u32 sx_action_ena = 1U << 28;
+inline constexpr u32 engine_me = 1U << 31;
+} // namespace coher
+
 /// Whether an opcode is one of the emulator's own (`Hle*`).
 [[nodiscard]] constexpr bool is_hle_opcode(u8 opcode) noexcept {
     return opcode >= 0xF0;

@@ -53,6 +53,7 @@
 #include <wiiu/memory/memory.hpp>
 
 #include <array>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -60,6 +61,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace wiiu::hle {
@@ -467,9 +469,9 @@ inline constexpr u32 context_register_base = 0x28000;
 /// `address`, through `emit`.
 bool emit_context_registers(Call& call, u32 address, std::span<const u32> values);
 
-/// Append a register-window write -- `SET_CONFIG_REG`, `SET_CONTEXT_REG`,
-/// `SET_ALL_CONTEXTS` or `SET_CTL_CONST` -- for consecutive registers from
-/// the byte address `address`, which must be in that opcode's window. For
+/// Append a register-window write -- any `SET_*` opcode, or
+/// `SET_ALL_CONTEXTS` -- for consecutive registers from the byte address
+/// `address`, which must be in that opcode's window. For
 /// state built up before it is emitted: the default state, and calls that
 /// write more than one packet.
 void append_registers(std::vector<u32>& out,
@@ -489,6 +491,50 @@ bool emit_display_list_call(Call& call, ppcaddr_t list, u32 bytes, std::string_v
 /// memory, or nothing -- logged, naming `what` -- if the GPU cannot see it.
 [[nodiscard]] std::optional<physaddr_t>
 physical_address(const memory::Memory& memory, ppcaddr_t address, std::string_view what);
+
+/// `GX2InvalidateMode`: what `GX2Invalidate` is told was written, and so
+/// which caches must forget it.
+namespace invalidate {
+inline constexpr u32 attribute_buffer = 1U << 0;
+inline constexpr u32 texture = 1U << 1;
+inline constexpr u32 uniform_block = 1U << 2;
+inline constexpr u32 shader = 1U << 3;
+inline constexpr u32 color_buffer = 1U << 4;
+inline constexpr u32 depth_buffer = 1U << 5;
+inline constexpr u32 cpu = 1U << 6;
+inline constexpr u32 stream_out_buffer = 1U << 7;
+inline constexpr u32 export_buffer = 1U << 8;
+} // namespace invalidate
+
+/// The SURFACE_SYNC `GX2Invalidate` writes for `mode` over `size` bytes at
+/// physical `address`: decaf's choice of cache actions and destinations,
+/// which Cemu's agrees with but for one -- decaf also asks for the full
+/// cache when the whole of memory is meant (a null address and a size of
+/// all ones) and a GPU read cache is involved. Empty when the mode asks
+/// nothing of the GPU: zero, or the CPU's cache alone.
+[[nodiscard]] std::vector<u32> invalidate_packets(u32 mode, physaddr_t address, u32 size);
+
+/// A structure of the title's -- made of `u32be` and `f32be` fields, laid
+/// out as GX2 lays it out -- copied out of guest memory or into it. False if
+/// the memory is not there.
+template <typename T>
+[[nodiscard]] bool read_guest(const memory::Memory& memory, ppcaddr_t address, T& out) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    std::array<u8, sizeof(T)> bytes{};
+    if (!memory.read_bytes(address, bytes)) {
+        return false;
+    }
+    std::memcpy(&out, bytes.data(), sizeof(T));
+    return true;
+}
+
+template <typename T>
+[[nodiscard]] bool write_guest(memory::Memory& memory, ppcaddr_t address, const T& value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    std::array<u8, sizeof(T)> bytes{};
+    std::memcpy(bytes.data(), &value, sizeof(T));
+    return memory.write_bytes(address, bytes);
+}
 
 /// Register the GX2 entry points under the `gx2` library.
 void register_gx2(Registry& registry, coreinit::Context& context);

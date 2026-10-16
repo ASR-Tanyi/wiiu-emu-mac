@@ -235,7 +235,25 @@ void CommandProcessor::set_window(const Packet& packet, Window window) {
         fail(fmt::format("{} at word {}", error, packet.offset));
         return;
     }
+    clear_semantics(window, offset, values);
     shadow(packet, window, offset, values);
+}
+
+void CommandProcessor::clear_semantics(Window window, u32 offset, std::span<const u32> values) {
+    constexpr u32 base = 0x28000;
+    constexpr u32 clear = (0x288E0 - base) / 4; // SQ_VTX_SEMANTIC_CLEAR
+    constexpr u32 first = (0x28380 - base) / 4; // SQ_VTX_SEMANTIC_0
+    if (window != Window::Context || clear < offset || clear >= offset + values.size()) {
+        return;
+    }
+    const u32 mask = values[clear - offset];
+    for (u32 semantic = 0; semantic < 32; ++semantic) {
+        const u32 index = first + semantic;
+        const bool written = index >= offset && index < offset + values.size();
+        if ((mask & (1U << semantic)) != 0 && !written) {
+            static_cast<void>(registers_->write(base + (index * 4), 0xFFFFFFFF));
+        }
+    }
 }
 
 void CommandProcessor::context_control(const Packet& packet) {
@@ -333,6 +351,7 @@ void CommandProcessor::load(const Packet& packet, Window window) {
             fail(fmt::format("{} at word {}", error, packet.offset));
             return;
         }
+        clear_semantics(window, offset, values);
         stats_.registers_loaded += count;
     }
 }

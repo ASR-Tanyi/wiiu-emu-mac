@@ -83,23 +83,6 @@ using latte::TileMode;
                                           : latte::CbSourceFormat::ExportFull;
 }
 
-template <typename T>
-[[nodiscard]] bool read_guest(const memory::Memory& memory, ppcaddr_t address, T& out) {
-    std::array<u8, sizeof(T)> bytes{};
-    if (!memory.read_bytes(address, bytes)) {
-        return false;
-    }
-    std::memcpy(&out, bytes.data(), sizeof(T));
-    return true;
-}
-
-template <typename T>
-[[nodiscard]] bool write_guest(memory::Memory& memory, ppcaddr_t address, const T& value) {
-    std::array<u8, sizeof(T)> bytes{};
-    std::memcpy(bytes.data(), &value, sizeof(T));
-    return memory.write_bytes(address, bytes);
-}
-
 } // namespace
 
 latte::SurfaceDesc surface_desc(const Surface& surface, u32 level) {
