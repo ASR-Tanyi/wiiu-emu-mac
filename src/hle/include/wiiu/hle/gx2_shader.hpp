@@ -15,9 +15,9 @@
 // which read them out of gx2.rpl; Cemu writes a subset of each, and where
 // the two put different values in the same register, the one taken is named.
 //
-// Not yet: the fetch shader's generation (`GX2InitFetchShaderEx`), uniform
-// blocks, samplers and textures, and loop variables, whose offsets decaf
-// adds to the loop constants as bytes and Cemu does not write at all.
+// The fetch shader GX2 generates itself is gx2_fetch_shader.hpp's. Not yet:
+// uniform blocks, samplers and textures, and loop variables, whose offsets
+// decaf adds to the loop constants as bytes and Cemu does not write at all.
 #pragma once
 
 #include <wiiu/common/endian.hpp>

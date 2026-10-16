@@ -2,6 +2,7 @@
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/hle/gx2.hpp>
+#include <wiiu/hle/gx2_fetch_shader.hpp>
 #include <wiiu/hle/gx2_shader.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/pm4.hpp>
@@ -488,6 +489,7 @@ void register_gx2_shader(Registry& registry) {
     registry.add("gx2", "GX2GetGeometryShaderStackEntries", gx2_get_geometry_shader_stack_entries);
     registry.add("gx2", "GX2SetVertexUniformReg", gx2_set_vertex_uniform_reg);
     registry.add("gx2", "GX2SetPixelUniformReg", gx2_set_pixel_uniform_reg);
+    register_gx2_fetch_shader(registry);
 }
 
 } // namespace wiiu::hle::gx2

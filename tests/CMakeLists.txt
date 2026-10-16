@@ -168,6 +168,7 @@ wiiu_add_test(hle
         hle/test_callbacks.cpp
         hle/test_coreinit.cpp
         hle/test_gx2.cpp
+        hle/test_gx2_fetch_shader.cpp
         hle/test_gx2_scanout.cpp
         hle/test_gx2_shader.cpp
         hle/test_gx2_context.cpp
