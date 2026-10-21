@@ -10,6 +10,7 @@ wiiu_add_library(latte
     SOURCES
         src/command_processor.cpp
         src/control_flow.cpp
+        src/draw_shaders.cpp
         src/formats.cpp
         src/msl.cpp
         src/pm4.cpp
@@ -23,6 +24,7 @@ wiiu_add_library(latte
         include/wiiu/latte/command_processor.hpp
         include/wiiu/latte/control_flow.hpp
         include/wiiu/latte/depth_buffer.hpp
+        include/wiiu/latte/draw_shaders.hpp
         include/wiiu/latte/draw.hpp
         include/wiiu/latte/formats.hpp
         include/wiiu/latte/microcode.hpp
