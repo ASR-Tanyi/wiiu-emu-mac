@@ -102,7 +102,9 @@ endif()
 
 wiiu_add_test(gpu
     SOURCES ${WIIU_GPU_TEST_SOURCES}
-    DEPS wiiu::gpu)
+    DEPS
+        wiiu::gpu
+        wiiu::latte)
 
 if(WIIU_PLATFORM_APPLE)
     # Phase 7.8 — GPU capture cannot record a process running Metal's shader
@@ -120,6 +122,7 @@ wiiu_add_test(latte
         latte/test_control_flow.cpp
         latte/test_depth_buffer.cpp
         latte/test_formats.cpp
+        latte/test_msl.cpp
         latte/test_pm4.cpp
         latte/test_registers.cpp
         latte/test_shader_ir.cpp

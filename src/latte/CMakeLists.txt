@@ -11,6 +11,7 @@ wiiu_add_library(latte
         src/command_processor.cpp
         src/control_flow.cpp
         src/formats.cpp
+        src/msl.cpp
         src/pm4.cpp
         src/registers.cpp
         src/shader_ir.cpp
@@ -25,6 +26,7 @@ wiiu_add_library(latte
         include/wiiu/latte/draw.hpp
         include/wiiu/latte/formats.hpp
         include/wiiu/latte/microcode.hpp
+        include/wiiu/latte/msl.hpp
         include/wiiu/latte/pm4.hpp
         include/wiiu/latte/registers.hpp
         include/wiiu/latte/render_state.hpp
