@@ -185,6 +185,37 @@ void Presenter::update(PresentScreen which, const ScreenImage& image) {
     screen.width = image.width;
     screen.height = image.height;
     screen.dirty = true;
+    screen.texture = {};
+}
+
+void Presenter::show(PresentScreen which, const ScreenTexture& image) {
+    if (!image.texture.valid() || image.width == 0 || image.height == 0) {
+        WIIU_LOG_WARN(Gpu,
+                      "present: a {}x{} texture {} is nothing to show",
+                      image.width,
+                      image.height,
+                      image.texture.value());
+        return;
+    }
+    Screen& screen = screens_[static_cast<std::size_t>(which)];
+    // The bytes go, the slots stay: their rotation still has to skip the one
+    // a frame in flight may be reading when bytes come back.
+    screen.pixels.clear();
+    screen.dirty = false;
+    screen.texture = image.texture;
+    screen.width = image.width;
+    screen.height = image.height;
+}
+
+void Presenter::forget(TextureHandle texture) {
+    if (!texture.valid()) {
+        return;
+    }
+    for (Screen& screen : screens_) {
+        if (screen.texture == texture) {
+            screen.texture = {};
+        }
+    }
 }
 
 void Presenter::set_shown(PresentScreen which, bool shown) {
@@ -192,7 +223,18 @@ void Presenter::set_shown(PresentScreen which, bool shown) {
 }
 
 bool Presenter::has_image(PresentScreen which) const noexcept {
-    return !screens_[static_cast<std::size_t>(which)].pixels.empty();
+    const Screen& screen = screens_[static_cast<std::size_t>(which)];
+    return !screen.pixels.empty() || screen.texture.valid();
+}
+
+TextureHandle Presenter::image(const Screen& screen) noexcept {
+    if (screen.texture.valid()) {
+        return screen.texture;
+    }
+    if (!screen.pixels.empty() && screen.uploaded) {
+        return screen.slots[screen.current];
+    }
+    return {};
 }
 
 bool Presenter::upload(Screen& screen, std::string_view name) {
@@ -245,7 +287,7 @@ bool Presenter::draw(TextureHandle target, u32 width, u32 height) {
             WIIU_LOG_WARN(Gpu, "present: the {} image could not be uploaded", screen_label(index));
         }
         sizes[index] = Rect{0, 0, screen.width, screen.height};
-        shown[index] = screen.shown && screen.uploaded;
+        shown[index] = screen.shown && image(screen).valid();
     }
     layout_ = layout_screens(width, height, sizes, shown);
 
@@ -275,8 +317,7 @@ bool Presenter::draw(TextureHandle target, u32 width, u32 height) {
                                         0.0F,
                                         1.0F});
         backend_->set_scissor(rect);
-        backend_->bind_texture(
-            ShaderStage::Fragment, 0, screens_[index].slots[screens_[index].current]);
+        backend_->bind_texture(ShaderStage::Fragment, 0, image(screens_[index]));
         backend_->bind_sampler(ShaderStage::Fragment, 0, sampler_);
 
         DrawCall call;

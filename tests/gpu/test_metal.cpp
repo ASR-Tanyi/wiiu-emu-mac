@@ -548,6 +548,49 @@ TEST_CASE("a screen image reaches the target the right way up", "[gpu][metal][pr
     backend->shutdown();
 }
 
+TEST_CASE("a texture the GPU drew is shown without leaving the GPU", "[gpu][metal][present]") {
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+
+    {
+        // A scan-out frame as ADR-006 keeps it: private, rendered to, then
+        // sampled by the presenter where it lies.
+        TextureDesc desc;
+        desc.width = 32;
+        desc.height = 16;
+        desc.format = TextureFormat::RGBA8Unorm;
+        desc.usage = TextureUsage::RenderTarget | TextureUsage::Sampled;
+        desc.storage = Storage::Private;
+        desc.label = "scan";
+        const TextureHandle scan = backend->create_texture(desc);
+        REQUIRE(scan.valid());
+
+        // Fifths of 255 survive the trip to bytes and back exactly; the alpha
+        // of zero is a scan-out byte the display ignores.
+        REQUIRE(backend->begin_render_pass(clear_pass(scan, ClearColor{0.2F, 0.4F, 0.6F, 0.0F})));
+        backend->end_render_pass();
+
+        Presenter presenter;
+        std::string error;
+        REQUIRE(presenter.initialize(*backend, TextureFormat::BGRA8Unorm, error));
+        presenter.show(PresentScreen::Tv, ScreenTexture{scan, 32, 16});
+
+        const TextureHandle target = make_target(*backend, 64, 32);
+        REQUIRE(presenter.draw(target, 64, 32));
+        backend->submit();
+
+        std::vector<u8> pixels(64U * 32U * 4U);
+        REQUIRE(backend->read_texture(target, pixels));
+        CHECK(at(pixels, 32, 16, 64) == std::array<u8, 4>{153, 102, 51, 0xFF}); // BGRA
+        CHECK(at(pixels, 1, 1, 64) == std::array<u8, 4>{153, 102, 51, 0xFF});
+        CHECK(backend->command_errors() == 0);
+
+        presenter.forget(scan);
+        backend->destroy(scan);
+    }
+
+    backend->shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // 8.6 — the decompiler's MSL, drawing
 // ---------------------------------------------------------------------------

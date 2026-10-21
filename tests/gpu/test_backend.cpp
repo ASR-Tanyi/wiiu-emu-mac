@@ -813,6 +813,103 @@ TEST_CASE_METHOD(BackendFixture, "a hidden screen gives its space away", "[gpu][
     CHECK(backend.last_frame_stats().draws == 1);
 }
 
+TEST_CASE_METHOD(BackendFixture,
+                 "the presenter shows a texture the GPU already holds",
+                 "[gpu][present]") {
+    Presenter presenter;
+    std::string error;
+    REQUIRE(presenter.initialize(backend, TextureFormat::BGRA8Unorm, error));
+
+    // A scan-out frame as ADR-006 has it: GPU-only, drawn to, sampled.
+    TextureDesc desc;
+    desc.width = 64;
+    desc.height = 48;
+    desc.format = TextureFormat::RGBA8Unorm;
+    desc.usage = TextureUsage::RenderTarget | TextureUsage::Sampled;
+    desc.storage = Storage::Private;
+    desc.label = "scan";
+    const TextureHandle scan = backend.create_texture(desc);
+    REQUIRE(scan.valid());
+
+    presenter.show(PresentScreen::Tv, ScreenTexture{scan, 64, 48});
+    CHECK(presenter.has_image(PresentScreen::Tv));
+
+    backend.clear_events();
+    FrameInfo frame;
+    REQUIRE(backend.begin_frame(frame));
+    REQUIRE(presenter.draw(frame.drawable, frame.width, frame.height));
+    backend.end_frame();
+
+    // Sampled where it is: nothing made, nothing uploaded.
+    CHECK(backend.recorded("bind_texture fragment [0] = " + std::to_string(scan.value())));
+    CHECK_FALSE(backend.recorded("create_texture"));
+    CHECK_FALSE(backend.recorded("write_texture"));
+    CHECK(backend.last_frame_stats().draws == 1);
+    // Laid out by the texture's size: 4:3 in a 16:9 window.
+    CHECK(presenter.last_layout().rects[0] == Rect{160, 0, 960, 720});
+    CHECK(backend.rejected() == 0);
+}
+
+TEST_CASE_METHOD(BackendFixture,
+                 "bytes and textures take turns, and a forgotten texture is not drawn",
+                 "[gpu][present]") {
+    Presenter presenter;
+    std::string error;
+    REQUIRE(presenter.initialize(backend, TextureFormat::BGRA8Unorm, error));
+
+    TextureDesc desc;
+    desc.width = 16;
+    desc.height = 9;
+    desc.format = TextureFormat::RGBA8Unorm;
+    desc.usage = TextureUsage::RenderTarget | TextureUsage::Sampled;
+    desc.label = "scan";
+    const TextureHandle scan = backend.create_texture(desc);
+    REQUIRE(scan.valid());
+    const std::string bound_scan = "bind_texture fragment [0] = " + std::to_string(scan.value());
+
+    const auto draw_frame = [&] {
+        backend.clear_events();
+        FrameInfo frame;
+        REQUIRE(backend.begin_frame(frame));
+        REQUIRE(presenter.draw(frame.drawable, frame.width, frame.height));
+        backend.end_frame();
+    };
+
+    // Bytes first: uploaded and drawn from the presenter's own texture.
+    std::vector<u8> pixels(16 * 9 * 4, 0x40);
+    presenter.update(PresentScreen::Tv, ScreenImage{pixels, 16, 9, 64});
+    draw_frame();
+    CHECK(backend.recorded("write_texture"));
+    CHECK_FALSE(backend.recorded(bound_scan));
+
+    // Then a texture: drawn instead, nothing uploaded.
+    presenter.show(PresentScreen::Tv, ScreenTexture{scan, 16, 9});
+    draw_frame();
+    CHECK_FALSE(backend.recorded("write_texture"));
+    CHECK(backend.recorded(bound_scan));
+
+    // Bytes again replace it.
+    presenter.update(PresentScreen::Tv, ScreenImage{pixels, 16, 9, 64});
+    draw_frame();
+    CHECK(backend.recorded("write_texture"));
+    CHECK_FALSE(backend.recorded(bound_scan));
+
+    // Taken back before its owner destroys it: the screen has nothing to
+    // show, and is not drawn.
+    presenter.show(PresentScreen::Tv, ScreenTexture{scan, 16, 9});
+    presenter.forget(scan);
+    backend.destroy(scan);
+    CHECK_FALSE(presenter.has_image(PresentScreen::Tv));
+    draw_frame();
+    CHECK_FALSE(presenter.last_layout().visible[0]);
+    CHECK(backend.last_frame_stats().draws == 0);
+
+    // Nothing to show is refused, and changes nothing.
+    presenter.show(PresentScreen::Drc, ScreenTexture{TextureHandle{}, 16, 9});
+    CHECK_FALSE(presenter.has_image(PresentScreen::Drc));
+    CHECK(backend.rejected() == 0);
+}
+
 TEST_CASE_METHOD(BackendFixture, "a clear can be rendered and read back", "[gpu]") {
     TextureDesc desc;
     desc.width = 4;

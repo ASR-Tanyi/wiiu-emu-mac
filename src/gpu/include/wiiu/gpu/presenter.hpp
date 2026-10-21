@@ -6,10 +6,14 @@
 // it are cleared to black, which is what a TV shows around a 16:9 picture.
 //
 // It is written against `GpuBackend` alone, so it runs, and is tested, on the
-// null backend too. Its first client is OSScreen (6.8); GX2's scan-out
-// (8.1) hands it a colour buffer the same way.
+// null backend too. Its first client is OSScreen (6.8), whose frames are
+// bytes in guest memory, and GX2's scan-out (8.1) hands it its frames the
+// same way for now. Once what the GPU draws stays on the GPU (ADR-006), a
+// scan-out frame is a texture already, and `show` takes it as one: sampled
+// where it is, nothing copied or uploaded.
 //
-// Two things are worth knowing before changing it:
+// Two things are worth knowing before changing it -- both about images
+// handed over as bytes:
 //
 //   * **An image is copied when it is handed over**, not read later. A
 //     flipped OSScreen frame is the one the title will draw into two flips
@@ -50,6 +54,21 @@ struct ScreenImage {
     u32 bytes_per_row = 0;
 };
 
+/// One screen's image already on the GPU: a texture `width` x `height`,
+/// shown whole.
+///
+/// The texture is the caller's, and two things are asked of it. It must
+/// stay alive while it is shown -- until another image replaces it, or the
+/// caller takes it back with `Presenter::forget` before destroying it. And
+/// its format must be a UNORM one: the window shows a screen's bytes as they
+/// are, and sampling an sRGB texture would decode them to linear on the way,
+/// darkening the picture.
+struct ScreenTexture {
+    TextureHandle texture;
+    u32 width = 0;
+    u32 height = 0;
+};
+
 /// Where each screen lands in a drawable, in pixels.
 struct PresentLayout {
     std::array<Rect, present_screen_count> rects{};
@@ -85,6 +104,17 @@ public:
     /// an HLE call, where a flip arrives.
     void update(PresentScreen screen, const ScreenImage& image);
 
+    /// Show a texture the GPU already holds as a screen's image, in place of
+    /// any image handed over as bytes, until another replaces it. Nothing is
+    /// copied: each `draw` samples the texture as it is then, so whatever the
+    /// GPU wrote to it before that draw is what the window shows.
+    void show(PresentScreen screen, const ScreenTexture& image);
+
+    /// Stop showing `texture` wherever it is shown, before its owner destroys
+    /// it. A screen left without an image is not drawn until it is given
+    /// another.
+    void forget(TextureHandle texture);
+
     /// Show or hide a screen. A hidden one is not drawn, and its space goes
     /// to the other: an OSScreen title that disables the DRC gets the TV in
     /// the whole window.
@@ -110,6 +140,10 @@ private:
         bool dirty = false;
         bool shown = true;
 
+        /// The caller's texture, when `show` gave one: drawn instead of
+        /// the slots, and replaced by the next `update`.
+        TextureHandle texture;
+
         std::array<TextureHandle, frames_in_flight> slots{};
         std::array<Rect, frames_in_flight> slot_sizes{};
         u32 current = 0; ///< the slot the last draw sampled
@@ -117,6 +151,9 @@ private:
     };
 
     [[nodiscard]] bool upload(Screen& screen, std::string_view name);
+
+    /// What a draw samples for `screen`, or nothing if it has no image yet.
+    [[nodiscard]] static TextureHandle image(const Screen& screen) noexcept;
 
     GpuBackend* backend_ = nullptr;
     TextureFormat target_format_ = TextureFormat::Unknown;
