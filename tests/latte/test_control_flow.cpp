@@ -26,7 +26,8 @@ namespace {
     return static_cast<u32>(inst) << 23;
 }
 
-[[nodiscard]] constexpr u32 exp(ExportInst inst) noexcept {
+// Not `exp`: <math.h> has one, and libc++ puts it in the global namespace.
+[[nodiscard]] constexpr u32 export_inst(ExportInst inst) noexcept {
     return static_cast<u32>(inst) << 23;
 }
 
@@ -75,9 +76,9 @@ TEST_CASE("decaf's example vertex shader reads as it was written", "[latte][shad
         0x00000000,
         cf(CfInst::CallFs), // no barrier
         exp0(60, 1, 2),
-        xyzw | exp(ExportInst::ExportDone) | barrier, // POS0, R2
+        xyzw | export_inst(ExportInst::ExportDone) | barrier, // POS0, R2
         exp0(0, 2, 1),
-        xyzw | exp(ExportInst::ExportDone) | end_of_program, // PARAM0, R1
+        xyzw | export_inst(ExportInst::ExportDone) | end_of_program, // PARAM0, R1
     };
     // The words themselves, as the fields put them.
     CHECK(words[2] == 0x0001203C);
@@ -96,8 +97,8 @@ TEST_CASE("decaf's example vertex shader reads as it was written", "[latte][shad
 }
 
 TEST_CASE("decaf's example pixel shader reads as it was written", "[latte][shader][cf]") {
-    const std::vector<u32> words{exp0(0, 0, 0),
-                                 xyzw | exp(ExportInst::ExportDone) | barrier | end_of_program};
+    const std::vector<u32> words{
+        exp0(0, 0, 0), xyzw | export_inst(ExportInst::ExportDone) | barrier | end_of_program};
     CHECK(words[1] == 0x94200688);
     CHECK(disassemble(decoded(words)) == "00 EXP_DONE: PIX0, R0.xyzw\nEND_OF_PROGRAM\n");
 }
@@ -109,7 +110,7 @@ TEST_CASE("an ALU clause, its constant caches and the clause list", "[latte][sha
     words[0] = 32U | (1U << 22) | (3U << 26) | (1U << 30);
     words[1] = 2U | (0U << 2) | (2U << 10) | (3U << 18) | alu(AluCfInst::Alu) | barrier;
     words[2] = exp0(0, 0, 0);
-    words[3] = xyzw | exp(ExportInst::ExportDone) | barrier | end_of_program;
+    words[3] = xyzw | export_inst(ExportInst::ExportDone) | barrier | end_of_program;
 
     const ControlFlow flow = decoded(words);
     REQUIRE(flow.clauses.size() == 1);
@@ -133,7 +134,7 @@ TEST_CASE("loops indent, and a CALL's subroutine is found", "[latte][shader][cf]
     put(1, 4, cf(CfInst::LoopStartDx10) | barrier);
     put(2, 8, cf(CfInst::Tex) | barrier);
     put(3, 2, cf(CfInst::LoopEnd) | barrier);
-    put(4, exp0(0, 0, 0), xyzw | exp(ExportInst::ExportDone) | barrier | end_of_program);
+    put(4, exp0(0, 0, 0), xyzw | export_inst(ExportInst::ExportDone) | barrier | end_of_program);
     put(5, 10, alu(AluCfInst::Alu) | barrier);
     put(6, 0, cf(CfInst::Return) | barrier);
 
@@ -210,22 +211,24 @@ TEST_CASE("the common form's fields, as decaf prints them", "[latte][shader][cf]
 
 TEST_CASE("the exports' fields, as decaf prints them", "[latte][shader][cf]") {
     // A position export of two registers, R4 and R5, to POS1 and POS2.
-    CHECK(text(exp0(61, 1, 4), xyzw | (1U << 17) | exp(ExportInst::Export) | barrier) ==
+    CHECK(text(exp0(61, 1, 4), xyzw | (1U << 17) | export_inst(ExportInst::Export) | barrier) ==
           "EXP: POS1, R4.xyzw BURSTCNT(1)");
     // Constants and masked components, from a relative register.
     const u32 swizzle = 4U | (5U << 3) | (7U << 6) | (6U << 9);
-    CHECK(text(exp0(3, 2, 1) | (1U << 22), swizzle | exp(ExportInst::Export) | barrier) ==
+    CHECK(text(exp0(3, 2, 1) | (1U << 22), swizzle | export_inst(ExportInst::Export) | barrier) ==
           "EXP: PARAM3, R[AL + 1].01_?");
     // Stream-out: words, so the base is four bytes a unit.
     const u32 buffer = 4U | (3U << 12);
-    CHECK(text(exp0(4, 0, 3), buffer | (1U << 17) | exp(ExportInst::MemStream0) | barrier) ==
-          "MEM_STREAM0: WRITE(16), R3.xy__ ARRAY_SIZE(4) BURSTCNT(1)");
+    CHECK(
+        text(exp0(4, 0, 3), buffer | (1U << 17) | export_inst(ExportInst::MemStream0) | barrier) ==
+        "MEM_STREAM0: WRITE(16), R3.xy__ ARRAY_SIZE(4) BURSTCNT(1)");
     // The ring, indexed, with an element size: and scratch counts in vec4s.
-    CHECK(text(exp0(2, 1, 6) | (7U << 23) | (3U << 30), 0xFU << 12 | exp(ExportInst::MemRing)) ==
+    CHECK(text(exp0(2, 1, 6) | (7U << 23) | (3U << 30),
+               0xFU << 12 | export_inst(ExportInst::MemRing)) ==
           "MEM_RING: WRITE(8 + R7), R6.xyzw ARRAY_SIZE(0) ELEM_SIZE(3) NO_BARRIER");
-    CHECK(text(exp0(2, 0, 0), exp(ExportInst::MemScratch) | barrier) ==
+    CHECK(text(exp0(2, 0, 0), export_inst(ExportInst::MemScratch) | barrier) ==
           "MEM_SCRATCH: WRITE(32), R0.____ ARRAY_SIZE(0)");
-    CHECK(text(exp0(0, 2, 0), exp(ExportInst::MemStream1) | barrier) ==
+    CHECK(text(exp0(0, 2, 0), export_inst(ExportInst::MemStream1) | barrier) ==
           "MEM_STREAM1: INVALID_READ, R0.____ ARRAY_SIZE(0)");
 }
 
@@ -236,8 +239,8 @@ TEST_CASE("programs the later stages could not trust are refused", "[latte][shad
     // 0x1E is Evergreen's, and an ALU clause's 0xC is reserved.
     CHECK(refused({0, (0x1EU << 23) | end_of_program}).find("not an R700") != std::string::npos);
     CHECK(refused({0, alu(AluCfInst::AluExtended)}).find("not an R700") != std::string::npos);
-    CHECK(refused({0, exp(static_cast<ExportInst>(0x29)) | end_of_program}).find("not an R700") !=
-          std::string::npos);
+    CHECK(refused({0, export_inst(static_cast<ExportInst>(0x29)) | end_of_program})
+              .find("not an R700") != std::string::npos);
 
     // A clause and a jump outside the program.
     CHECK(refused({1, cf(CfInst::Vtx) | end_of_program}).find("past the end") != std::string::npos);

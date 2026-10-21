@@ -33,7 +33,7 @@ constexpr u32 end_of_program = 1U << 21;
 constexpr u32 xyzw = 0 | (1U << 3) | (2U << 6) | (3U << 9);
 constexpr u32 call_fs = 0x13U << 23;
 constexpr u32 exp_done = 0x28U << 23;
-constexpr u32 exp = 0x27U << 23;
+constexpr u32 exp_more = 0x27U << 23; // EXP; not `exp`, which <math.h> has
 
 [[nodiscard]] constexpr u32 exp0(u32 base, u32 type, u32 gpr) noexcept {
     return base | (type << 13) | (gpr << 15);
@@ -217,7 +217,7 @@ TEST_CASE("pixel exports go to the enabled targets, in order", "[latte][shader][
     registers.set(reg::cb_shader_mask, 0x0F0F); // targets 0 and 2
     // PIX0 and PIX1 from R3 and R4, as one burst; a third PIX goes nowhere.
     const std::vector<u32> ps{exp0(0, 0, 3),
-                              xyzw | (1U << 17) | exp | barrier,
+                              xyzw | (1U << 17) | exp_more | barrier,
                               exp0(2, 0, 5),
                               xyzw | exp_done | barrier | end_of_program};
     CHECK(pixel(ps, registers) == "pixel shader\n"
