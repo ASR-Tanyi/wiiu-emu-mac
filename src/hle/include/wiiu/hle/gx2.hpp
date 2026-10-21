@@ -40,15 +40,22 @@
 // the ring -- and the GPU, not the CPU, counts the swaps a copy lands
 // between.
 //
+// With a host GPU attached (`Gpu::attach_backend`), what the GPU draws stays
+// on it (ADR-006): the surfaces it renders to live in a surface cache as
+// textures, and the work on them is done there -- so far the clear. Without
+// one, as in most tests, all of it is done on guest memory, on the CPU.
+//
 // What is not here yet: swap interval 0's flip-without-waiting (it waits for
 // vsync like 1), the overrun callback a full display list asks for, and the
 // profiling and toss-stage modes `GX2Init` can ask for.
 #pragma once
 
 #include <wiiu/common/types.hpp>
+#include <wiiu/gpu/backend.hpp>
 #include <wiiu/latte/command_processor.hpp>
 #include <wiiu/latte/pm4.hpp>
 #include <wiiu/latte/registers.hpp>
+#include <wiiu/latte/surface_cache.hpp>
 #include <wiiu/latte/timeline.hpp>
 #include <wiiu/memory/memory.hpp>
 
@@ -404,9 +411,25 @@ public:
     /// flips take their frames by.
     [[nodiscard]] u32 swaps_reached() const noexcept { return swaps_reached_; }
 
+    // --- the host GPU (ADR-006) ---------------------------------------------
+
+    /// Do the GPU's work on `backend` from here on, or, with null, on guest
+    /// memory again. Either way the surface cache starts empty: the textures
+    /// it held are destroyed on the backend they were made on, so a backend
+    /// must be detached -- this with null -- before it goes.
+    void attach_backend(gpu::GpuBackend* backend);
+
+    [[nodiscard]] gpu::GpuBackend* backend() const noexcept { return backend_; }
+
+    /// The surfaces the GPU holds, or none without a backend.
+    [[nodiscard]] latte::SurfaceCache* surfaces() noexcept { return surfaces_.get(); }
+
+    [[nodiscard]] const latte::SurfaceCache* surfaces() const noexcept { return surfaces_.get(); }
+
     /// Back to before `GX2Init`, with nothing in flight: the register file
-    /// cleared and a fresh timeline started. The command processor's
-    /// listeners and counters are the emulator's, and stay.
+    /// cleared, a fresh timeline started, and the surface cache emptied. The
+    /// command processor's listeners and counters are the emulator's, and
+    /// stay, and so does the backend.
     void reset();
 
 private:
@@ -438,6 +461,10 @@ private:
     std::deque<u64> pending_swaps_;
     u32 swaps_reached_ = 0;
     std::set<std::string> reported_;
+
+    gpu::GpuBackend* backend_ = nullptr;
+    std::unique_ptr<latte::SurfaceCache> surfaces_;
+
     InitAttributes attributes_{};
     bool initialized_ = false;
     u32 main_core_ = 1;

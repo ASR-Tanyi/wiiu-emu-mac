@@ -48,6 +48,7 @@ wiiu_add_library(hle
     DEPS
         wiiu::common
         wiiu::cpu
+        wiiu::gpu
         wiiu::latte
         wiiu::loader
         wiiu::memory)

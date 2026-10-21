@@ -9,22 +9,31 @@
 // a copy lands in the frame the next swap shows, counted on the GPU's side,
 // so a copy inside a display list goes to the right frame too. And the depth
 // buffer's clear, which WHB does beside the colour one every frame: depth,
-// stencil or both, a packed stencil left alone by a clear of depth.
+// stencil or both, a packed stencil left alone by a clear of depth. And,
+// with a host GPU attached (ADR-006), the clear done there: the surface
+// made in the cache under the key a draw finds it by, guest memory left
+// alone, sRGB encoded as the CPU clear encodes it, and what the GPU does not
+// do yet still done on the CPU.
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/cpu/state.hpp>
+#include <wiiu/gpu/null_backend.hpp>
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/gx2.hpp>
 #include <wiiu/hle/gx2_surface.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/depth_buffer.hpp>
+#include <wiiu/latte/formats.hpp>
 #include <wiiu/latte/surface.hpp>
+#include <wiiu/latte/surface_cache.hpp>
 #include <wiiu/memory/map.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -499,4 +508,168 @@ TEST_CASE_METHOD(ScanOutFixture,
     CHECK(pixel(kDepthImage) == Pixel{0x00, 0x00, 0x00, 0x3F}); // 0.5f
     CHECK(os.gpu.registers().read(latte::reg::db_stencil_clear) == 0);
     CHECK(os.gpu.registers().read(latte::reg::db_depth_clear) == 0);
+}
+
+// --------------------------------------------------------------------------
+// On the GPU (ADR-006)
+// --------------------------------------------------------------------------
+
+namespace {
+
+/// The scan-out fixture with a host GPU attached: the null backend, which
+/// keeps the pixels a clear writes so they can be read back.
+struct GpuScanOutFixture : ScanOutFixture {
+    gpu::NullBackend backend;
+
+    GpuScanOutFixture() {
+        std::string error;
+        REQUIRE(backend.initialize(error));
+        os.gpu.attach_backend(&backend);
+        put_color_buffer(kRgba8, 1280, 720, 1);
+    }
+
+    ~GpuScanOutFixture() {
+        // The cache's textures go back to the backend before it goes.
+        os.gpu.attach_backend(nullptr);
+    }
+
+    GpuScanOutFixture(const GpuScanOutFixture&) = delete;
+    GpuScanOutFixture& operator=(const GpuScanOutFixture&) = delete;
+
+    /// A colour buffer at `kBuffer` with its registers worked out, as
+    /// `GX2InitColorBufferRegs` leaves it -- a surface's key comes from them.
+    gx2::ColorBuffer put_color_buffer(u32 format, u32 width, u32 height, u32 slices) {
+        gx2::ColorBuffer buffer =
+            color_buffer(slices > 1 ? 5 : 1, width, height, slices, format, kImage);
+        buffer.view_num_slices = slices;
+        const std::optional<gx2::ColorBufferRegisters> registers =
+            gx2::color_buffer_registers(buffer);
+        REQUIRE(registers.has_value());
+        buffer.cb_color_size = registers->size;
+        buffer.cb_color_info = registers->info;
+        buffer.cb_color_view = registers->view;
+        buffer.cb_color_mask = registers->mask;
+        std::array<u8, sizeof(gx2::ColorBuffer)> bytes{};
+        std::memcpy(bytes.data(), &buffer, sizeof(buffer));
+        REQUIRE(memory.write_bytes(kBuffer, bytes));
+        return buffer;
+    }
+
+    /// Every pixel of a cached RGBA8 surface, from the backend.
+    [[nodiscard]] std::vector<u8> read_back(const latte::ColorSurface& surface) {
+        std::vector<u8> pixels(std::size_t{surface.width} * surface.height * 4);
+        REQUIRE(backend.read_texture(surface.texture, pixels));
+        return pixels;
+    }
+};
+
+[[nodiscard]] Pixel at(const std::vector<u8>& pixels, std::size_t index) {
+    return Pixel{pixels[index * 4],
+                 pixels[(index * 4) + 1],
+                 pixels[(index * 4) + 2],
+                 pixels[(index * 4) + 3]};
+}
+
+} // namespace
+
+TEST_CASE_METHOD(GpuScanOutFixture,
+                 "with a GPU attached, a clear makes the colour buffer's surface and clears it "
+                 "there",
+                 "[hle][gx2][scanout][gpu]") {
+    call("GX2SetColorBuffer", {kBuffer, 0});
+    clear(kBlue);
+    swap_and_flush();
+    advance_to(gx2::vsync_tick(1));
+
+    // The texture is the surface now: guest memory is not written.
+    CHECK(pixel(kImage) == Pixel{0, 0, 0, 0});
+
+    // A draw would find it: the key from the registers GX2SetColorBuffer
+    // wrote is the key the clear made it under.
+    const latte::SurfaceCache& cache = *os.gpu.surfaces();
+    CHECK(cache.size() == 1);
+    const std::optional<latte::ColorSurface> surface =
+        cache.find(latte::ColorBufferKey::from(os.gpu.registers(), 0));
+    REQUIRE(surface.has_value());
+    CHECK(surface->width == 1280);
+    CHECK(surface->height == 720);
+
+    std::vector<u8> pixels = read_back(*surface);
+    CHECK(at(pixels, 0) == kBlue);
+    CHECK(at(pixels, (1280 * 720) - 1) == kBlue);
+    CHECK(backend.recorded("begin_render_pass 'GX2ClearColor' colors=1 [0:clear/store]"));
+
+    // The next frame clears the same texture.
+    clear(kRed);
+    swap_and_flush();
+    advance_to(gx2::vsync_tick(2));
+    CHECK(cache.size() == 1);
+    CHECK(cache.stats().misses == 1);
+    CHECK(cache.stats().hits == 1);
+    pixels = read_back(*surface);
+    CHECK(at(pixels, 0) == kRed);
+    CHECK(pixel(kImage) == Pixel{0, 0, 0, 0});
+    CHECK(backend.rejected() == 0);
+}
+
+TEST_CASE_METHOD(GpuScanOutFixture,
+                 "an sRGB surface stores its clear encoded, as the CPU clear does",
+                 "[hle][gx2][scanout][gpu]") {
+    constexpr u32 kSrgb = 0x41A;
+    const std::array<f32, 4> colour{0.5F, 0.25F, 0.75F, 1.0F};
+    const gx2::ColorBuffer buffer = put_color_buffer(kSrgb, 64, 64, 1);
+    call("GX2ClearColor", {kBuffer}, {colour[0], colour[1], colour[2], colour[3]});
+    call("GX2Flush", {});
+    advance_to(gx2::vsync_tick(1));
+
+    const std::optional<latte::ColorBufferKey> key = gx2::color_buffer_key(memory, buffer);
+    REQUIRE(key.has_value());
+    const std::optional<latte::ColorSurface> surface = os.gpu.surfaces()->find(*key);
+    REQUIRE(surface.has_value());
+    CHECK(surface->format == gpu::TextureFormat::RGBA8UnormSrgb);
+
+    // The CPU clear is the oracle (ADR-006).
+    const std::optional<latte::EncodedColor> encoded = latte::encode_color(kSrgb, colour);
+    REQUIRE(encoded.has_value());
+    const Pixel expected{
+        encoded->bytes[0], encoded->bytes[1], encoded->bytes[2], encoded->bytes[3]};
+    CHECK(expected == Pixel{0xBC, 0x89, 0xE1, 0xFF});
+    const std::vector<u8> pixels = read_back(*surface);
+    CHECK(at(pixels, 0) == expected);
+    CHECK(at(pixels, (64 * 64) - 1) == expected);
+
+    REQUIRE(gx2::clear_color_buffer(memory, buffer, colour).empty());
+    CHECK(pixel(kImage) == expected);
+}
+
+TEST_CASE_METHOD(GpuScanOutFixture,
+                 "a clear the GPU does not do yet is still done on guest memory",
+                 "[hle][gx2][scanout][gpu]") {
+    // UNORM_R8: a format the CPU clears and the cache does not hold yet.
+    put_color_buffer(0x001, 64, 64, 1);
+    clear(kRed);
+    call("GX2Flush", {});
+    advance_to(gx2::vsync_tick(1));
+    CHECK(memory.read<u8>(kImage) == 0xFF);
+    CHECK(os.gpu.surfaces()->size() == 0);
+    CHECK(os.gpu.surfaces()->stats().refused == 1);
+
+    // Two slices of an array: one slice a surface, so far.
+    const gx2::ColorBuffer array = put_color_buffer(kRgba8, 64, 64, 2);
+    clear(kBlue);
+    call("GX2Flush", {});
+    advance_to(gx2::vsync_tick(2));
+    const Elements elements(array);
+    CHECK(pixel(elements.at(0, 0, 0)) == kBlue);
+    CHECK(pixel(elements.at(63, 63, 1)) == kBlue);
+    CHECK(os.gpu.surfaces()->size() == 0);
+
+    // Detached, the GPU's work is all on guest memory again.
+    os.gpu.attach_backend(nullptr);
+    CHECK(os.gpu.surfaces() == nullptr);
+    put_color_buffer(kRgba8, 64, 64, 1);
+    clear(kRed);
+    call("GX2Flush", {});
+    advance_to(gx2::vsync_tick(3));
+    CHECK(pixel(kImage) == kRed);
 }

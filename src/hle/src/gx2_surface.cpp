@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -977,6 +978,65 @@ void gx2_set_depth_buffer(Call& call, u32 address) {
 }
 
 } // namespace
+
+std::optional<latte::ColorBufferKey> color_buffer_key(const memory::Memory& memory,
+                                                      const ColorBuffer& buffer) {
+    const std::optional<u32> base =
+        base_register(memory, buffer.surface, buffer.view_mip, "a colour buffer");
+    if (!base.has_value()) {
+        return std::nullopt;
+    }
+    return latte::ColorBufferKey::from(
+        *base, buffer.cb_color_size, buffer.cb_color_info, buffer.cb_color_view);
+}
+
+bool clear_color_surface(latte::SurfaceCache& cache,
+                         gpu::GpuBackend& backend,
+                         const memory::Memory& memory,
+                         const ColorBuffer& buffer,
+                         const std::array<f32, 4>& rgba,
+                         std::string& problem) {
+    // The cache holds one single-sampled slice a surface so far. A clear of
+    // anything else is done on guest memory, as before ADR-006.
+    if (buffer.surface.aa != 0) {
+        problem = "GX2ClearColor: a multisampled colour buffer is cleared on the CPU for now";
+        return false;
+    }
+    if (buffer.view_num_slices != 1) {
+        problem = fmt::format("GX2ClearColor: a clear of {} slices is done on the CPU for now",
+                              buffer.view_num_slices.value());
+        return false;
+    }
+    const std::optional<latte::ColorBufferKey> key = color_buffer_key(memory, buffer);
+    if (!key.has_value()) {
+        problem = "GX2ClearColor: the colour buffer has no memory the GPU can see";
+        return false;
+    }
+    std::string error;
+    const std::optional<latte::ColorSurface> surface = cache.color_buffer(*key, error);
+    if (!surface.has_value()) {
+        problem = fmt::format("GX2ClearColor: {}; cleared on the CPU instead", error);
+        return false;
+    }
+
+    // NaN clears to zero, as `encode_color` has it; out of range is clamped
+    // by the conversion to the format, on both sides.
+    const auto component = [](f32 value) { return std::isnan(value) ? 0.0F : value; };
+    gpu::RenderPassDesc pass;
+    pass.label = "GX2ClearColor";
+    pass.color_count = 1;
+    pass.colors[0].texture = surface->texture;
+    pass.colors[0].load = gpu::LoadAction::Clear;
+    pass.colors[0].store = gpu::StoreAction::Store;
+    pass.colors[0].clear = gpu::ClearColor{
+        component(rgba[0]), component(rgba[1]), component(rgba[2]), component(rgba[3])};
+    if (!backend.begin_render_pass(pass)) {
+        problem = "GX2ClearColor: the backend refused the clear's render pass";
+        return false;
+    }
+    backend.end_render_pass();
+    return true;
+}
 
 void register_gx2_surface(Registry& registry) {
     registry.add("gx2", "GX2CalcSurfaceSizeAndAlignment", gx2_calc_surface_size_and_alignment);

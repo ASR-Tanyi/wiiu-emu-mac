@@ -48,12 +48,22 @@
 // `copy_to_scan_frame` below, which is all of it that needs guest memory.
 // The snapshot keeps the title's virtual addresses: these packets are the
 // emulator's and no hardware reads them.
+//
+// With a host GPU attached (ADR-006) the clear is done there instead:
+// `clear_color_surface` makes the colour buffer's surface in the surface
+// cache, if it is not there yet, and clears it with a render pass. A clear
+// defines every pixel of what it clears, so nothing has to come from guest
+// memory first, and nothing goes back: from then on the texture is that
+// surface. `color_buffer_key` is how the clear finds it -- the same key a
+// draw finds the surface by from the registers `GX2SetColorBuffer` wrote.
 #pragma once
 
 #include <wiiu/common/endian.hpp>
 #include <wiiu/common/types.hpp>
+#include <wiiu/gpu/backend.hpp>
 #include <wiiu/hle/gx2.hpp>
 #include <wiiu/latte/surface.hpp>
+#include <wiiu/latte/surface_cache.hpp>
 #include <wiiu/memory/memory.hpp>
 
 #include <array>
@@ -283,6 +293,28 @@ inline constexpr u32 depth_buffer_words = sizeof(DepthBuffer) / 4;
 [[nodiscard]] std::string clear_color_buffer(memory::Memory& memory,
                                              const ColorBuffer& buffer,
                                              const std::array<f32, 4>& rgba);
+
+/// The key a colour buffer's surface has in the surface cache: the base
+/// `GX2SetColorBuffer` writes -- the viewed level's physical address, with
+/// the swizzle -- and the size, info and view registers the snapshot holds.
+/// Nothing, logged, for a level with no memory the GPU can see.
+[[nodiscard]] std::optional<latte::ColorBufferKey> color_buffer_key(const memory::Memory& memory,
+                                                                    const ColorBuffer& buffer);
+
+/// What `GX2ClearColor`'s packet does when a host GPU is attached: the
+/// colour buffer's surface, made in `cache` if it is not there yet, cleared
+/// to the colour by a render pass on `backend` -- linear, as a clear's colour
+/// is, so an sRGB surface stores it encoded, as `encode_color` does.
+///
+/// False, with `problem` saying why, for a clear the GPU does not do yet --
+/// a format or size the cache refuses, a multisampled buffer, more than one
+/// slice -- which the caller does on guest memory instead.
+[[nodiscard]] bool clear_color_surface(latte::SurfaceCache& cache,
+                                       gpu::GpuBackend& backend,
+                                       const memory::Memory& memory,
+                                       const ColorBuffer& buffer,
+                                       const std::array<f32, 4>& rgba,
+                                       std::string& problem);
 
 /// What `GX2ClearDepthStencilEx`'s packet does when it runs: depth, stencil
 /// or both -- as `flags` asks -- written into every element of the viewed

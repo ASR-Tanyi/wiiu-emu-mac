@@ -307,7 +307,19 @@ bool Gpu::vsync(u64 index) {
     return true;
 }
 
+void Gpu::attach_backend(gpu::GpuBackend* backend) {
+    // Destroyed on the backend that made them, before it is let go.
+    surfaces_.reset();
+    backend_ = backend;
+    if (backend_ != nullptr) {
+        surfaces_ = std::make_unique<latte::SurfaceCache>(*backend_);
+    }
+}
+
 void Gpu::reset() {
+    if (surfaces_ != nullptr) {
+        surfaces_->clear();
+    }
     registers_->reset();
     processor_.reset_state();
     timeline_ = latte::GpuTimeline{processor_, timeline_.latency()};
@@ -350,6 +362,13 @@ void Gpu::run_hle(const latte::pm4::Packet& packet) {
                                           std::bit_cast<f32>(payload[3])};
             const ColorBuffer buffer =
                 color_buffer_from_words(payload.subspan<4, color_buffer_words>());
+            if (backend_ != nullptr) {
+                std::string problem;
+                if (clear_color_surface(*surfaces_, *backend_, *memory_, buffer, rgba, problem)) {
+                    return;
+                }
+                report(problem);
+            }
             report(clear_color_buffer(*memory_, buffer, rgba));
             return;
         }

@@ -6,6 +6,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <utility>
 
@@ -489,11 +490,25 @@ void NullBackend::clear_pixels(TextureHandle handle, const ClearColor& color) {
         return static_cast<u8>((clamped * 255.0F) + 0.5F);
     };
 
+    // A clear's colour is linear. An sRGB attachment stores it encoded with
+    // the standard curve, red, green and blue, alpha as it is -- what Metal
+    // does, and what GX2's CPU clear does (`latte::encode_color`).
+    const bool srgb = pixels.format == TextureFormat::RGBA8UnormSrgb ||
+                      pixels.format == TextureFormat::BGRA8UnormSrgb;
+    const auto colour = [srgb, &quantize](f32 value) {
+        if (!srgb) {
+            return quantize(value);
+        }
+        const f32 clamped = value < 0.0F ? 0.0F : (value > 1.0F ? 1.0F : value);
+        return quantize(clamped <= 0.0031308F ? clamped * 12.92F
+                                              : (1.055F * std::pow(clamped, 1.0F / 2.4F)) - 0.055F);
+    };
+
     const bool bgra = pixels.format == TextureFormat::BGRA8Unorm ||
                       pixels.format == TextureFormat::BGRA8UnormSrgb;
-    const std::array<u8, 4> texel{bgra ? quantize(color.blue) : quantize(color.red),
-                                  quantize(color.green),
-                                  bgra ? quantize(color.red) : quantize(color.blue),
+    const std::array<u8, 4> texel{bgra ? colour(color.blue) : colour(color.red),
+                                  colour(color.green),
+                                  bgra ? colour(color.red) : colour(color.blue),
                                   quantize(color.alpha)};
 
     for (std::size_t offset = 0; offset + 4 <= pixels.bytes.size(); offset += 4) {

@@ -13,6 +13,7 @@
 #include <wiiu/common/log.hpp>
 #include <wiiu/gpu/backend.hpp>
 #include <wiiu/gpu/presenter.hpp>
+#include <wiiu/latte/formats.hpp>
 #include <wiiu/latte/msl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -22,8 +23,10 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <sys/mman.h>
+#include <tuple>
 #include <vector>
 
 using namespace wiiu;
@@ -586,6 +589,51 @@ TEST_CASE("a texture the GPU drew is shown without leaving the GPU", "[gpu][meta
 
         presenter.forget(scan);
         backend->destroy(scan);
+    }
+
+    backend->shutdown();
+}
+
+TEST_CASE("a GPU clear stores what GX2's CPU clear does", "[gpu][metal][surface]") {
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+
+    // ADR-006: with a GPU attached GX2ClearColor is a render pass, and the
+    // CPU clear (`latte::encode_color`) is the oracle it is held to. Unorm
+    // has to match exactly. sRGB is encoded by the hardware, which the
+    // graphics APIs let be off by up to 0.6 of a step -- so one either way.
+    const std::array<f32, 4> colour{0.5F, 0.25F, 0.75F, 1.0F};
+    for (const auto& [format, gx2_format, tolerance] :
+         {std::tuple{TextureFormat::RGBA8Unorm, 0x01AU, 0},
+          std::tuple{TextureFormat::RGBA8UnormSrgb, 0x41AU, 1}}) {
+        TextureDesc desc;
+        desc.width = 4;
+        desc.height = 4;
+        desc.format = format;
+        desc.usage = TextureUsage::RenderTarget;
+        desc.storage = Storage::Shared; // so it can be read back
+        desc.label = "colour buffer";
+        const TextureHandle target = backend->create_texture(desc);
+        REQUIRE(target.valid());
+
+        RenderPassDesc pass =
+            clear_pass(target, ClearColor{colour[0], colour[1], colour[2], colour[3]});
+        REQUIRE(backend->begin_render_pass(pass));
+        backend->end_render_pass();
+        backend->submit();
+
+        std::vector<u8> pixels(4U * 4U * 4U);
+        REQUIRE(backend->read_texture(target, pixels));
+        const std::optional<latte::EncodedColor> expected = latte::encode_color(gx2_format, colour);
+        REQUIRE(expected.has_value());
+        for (std::size_t channel = 0; channel < 4; ++channel) {
+            INFO(texture_format_name(format)
+                 << " channel " << channel << ": the GPU stored " << int{pixels[channel]}
+                 << ", the CPU clear " << int{expected->bytes[channel]});
+            CHECK(std::abs(int{pixels[channel]} - int{expected->bytes[channel]}) <= tolerance);
+        }
+        CHECK(pixels[60] == pixels[0]); // the last pixel too
+        CHECK(backend->command_errors() == 0);
+        backend->destroy(target);
     }
 
     backend->shutdown();
