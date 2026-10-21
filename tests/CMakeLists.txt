@@ -128,6 +128,7 @@ wiiu_add_test(latte
         latte/test_shader_ir.cpp
         latte/test_shader_program.cpp
         latte/test_surface.cpp
+        latte/test_surface_cache.cpp
         latte/test_timeline.cpp
     DEPS
         wiiu::latte)

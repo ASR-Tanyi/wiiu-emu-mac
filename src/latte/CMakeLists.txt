@@ -18,6 +18,7 @@ wiiu_add_library(latte
         src/shader_ir.cpp
         src/shader_program.cpp
         src/surface.cpp
+        src/surface_cache.cpp
         src/timeline.cpp
     HEADERS
         include/wiiu/latte/color_buffer.hpp
@@ -37,10 +38,12 @@ wiiu_add_library(latte
         include/wiiu/latte/shader_program.hpp
         include/wiiu/latte/shader_state.hpp
         include/wiiu/latte/surface.hpp
+        include/wiiu/latte/surface_cache.hpp
         include/wiiu/latte/timeline.hpp
         include/wiiu/latte/viewport.hpp
     DEPS
         wiiu::common
+        wiiu::gpu
         wiiu::memory
     PRIVATE_DEPS
         addrlib)
