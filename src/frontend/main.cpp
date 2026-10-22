@@ -10,6 +10,7 @@
 #include <wiiu/cpu/interpreter.hpp>
 #include <wiiu/gpu/backend.hpp>
 #include <wiiu/hle/coreinit.hpp>
+#include <wiiu/hle/gx2.hpp>
 #include <wiiu/hle/loader.hpp>
 #include <wiiu/hle/proc_ui.hpp>
 #include <wiiu/hle/recording.hpp>
@@ -48,7 +49,10 @@ options:
   -h, --help              show this message
   -r, --run FILE          load and run an RPX
       --window            open a window: alone, a test pattern; with --run,
-                          the title's screens (OSScreen today, GX2 later)
+                          the title's screens, OSScreen's or GX2's
+      --cpu-surfaces      with --run --window, do GX2's clears and scan-out
+                          copies on guest memory rather than the GPU, to
+                          compare the two (ADR-006)
       --frames N          with --window alone, stop after N frames
       --gpu-validation    run under Metal's API and shader validation
       --gpu-hud           show Metal's performance HUD over the window
@@ -85,6 +89,7 @@ struct Arguments {
     bool jit_check = false;
     bool gpu_validation = false;
     bool gpu_hud = false;
+    bool cpu_surfaces = false;
     wiiu::u64 capture_frame = 0;
     std::string capture_path = "wiiu-emu.gputrace";
     wiiu::u64 frames = 0; ///< zero means until the window is closed
@@ -193,6 +198,8 @@ bool parse_arguments(std::span<const std::string_view> argv, Arguments& args) {
             args.gpu_validation = true;
         } else if (arg == "--gpu-hud") {
             args.gpu_hud = true;
+        } else if (arg == "--cpu-surfaces") {
+            args.cpu_surfaces = true;
         } else if (arg == "--capture-frame") {
             std::string_view value;
             if (!next(value)) {
@@ -401,6 +408,36 @@ int run_window(const Arguments& args) {
     backend.destroy(pipeline);
     return 0;
 }
+
+/// GX2's GPU work done on the display's backend (ADR-006) for as long as
+/// this holds it. Given back before the display closes -- by `release`, or
+/// on the way out of an early return, since it is declared after the display
+/// -- because what GX2 made on the backend has to be destroyed on it.
+class GpuAttachment {
+public:
+    GpuAttachment() = default;
+
+    ~GpuAttachment() { release(); }
+
+    GpuAttachment(const GpuAttachment&) = delete;
+    GpuAttachment& operator=(const GpuAttachment&) = delete;
+
+    void attach(wiiu::hle::gx2::Gpu& gpu, wiiu::gpu::GpuBackend& backend) {
+        release();
+        gpu.attach_backend(&backend);
+        gpu_ = &gpu;
+    }
+
+    void release() {
+        if (gpu_ != nullptr) {
+            gpu_->attach_backend(nullptr);
+            gpu_ = nullptr;
+        }
+    }
+
+private:
+    wiiu::hle::gx2::Gpu* gpu_ = nullptr;
+};
 
 /// Hand OSScreen's flips to the display (6.8 -> 7.6), and GX2's.
 ///
@@ -687,6 +724,7 @@ int main(int argc, char** argv) {
     // to go. Declared after the coreinit context: the flip hook refers to it,
     // and it has to be torn down while that hook can no longer be called.
     wiiu::frontend::Display display;
+    GpuAttachment gpu_attachment;
     if (args.window) {
         std::string display_error;
         const std::string title =
@@ -697,6 +735,14 @@ int main(int argc, char** argv) {
             return 1;
         }
         connect_screens(coreinit, display);
+
+        // What GX2 draws stays on the GPU (ADR-006): clears and scan-out
+        // copies run on Metal, and flips hand the presenter textures.
+        if (args.cpu_surfaces) {
+            WIIU_LOG_INFO(Frontend, "GX2's clears and scan-out copies run on guest memory");
+        } else {
+            gpu_attachment.attach(coreinit.gpu, display.backend());
+        }
     }
 
     wiiu::cpu::CoreState state;
@@ -733,6 +779,7 @@ int main(int argc, char** argv) {
     // any other halt to the run loop. It is the one that is not a problem.
     const bool closed_by_user = coreinit.screens.stop_requested;
     coreinit.screens.on_flip = nullptr;
+    gpu_attachment.release();
     if (closed_by_user) {
         WIIU_LOG_INFO(Frontend,
                       "window closed after {} frames and {} instructions",
