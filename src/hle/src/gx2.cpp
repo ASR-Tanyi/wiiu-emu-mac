@@ -114,7 +114,9 @@ Gpu::Gpu()
 
 void Gpu::initialize(memory::Memory& memory, u32 main_core, const InitAttributes& attributes) {
     if (memory_ != &memory) {
-        guest_buffers_.reset(); // windows onto the memory there was
+        // Windows onto the memory there was, and copies made from it.
+        guest_buffers_.reset();
+        index_cache_.reset();
     }
     memory_ = &memory;
     processor_.set_memory(&memory);
@@ -327,6 +329,7 @@ void Gpu::attach_backend(gpu::GpuBackend* backend) {
     release_scan_textures();
     copier_.shutdown();
     guest_buffers_.reset();
+    index_cache_.reset();
     pipelines_.reset();
     surfaces_.reset();
     backend_ = backend;
@@ -349,8 +352,9 @@ void Gpu::reset() {
         surfaces_->clear();
     }
     // Pipelines hold nothing of the title's and stay; windows onto its
-    // memory do not.
+    // memory, and copies of its indices, do not.
     guest_buffers_.reset();
+    index_cache_.reset();
     draw_stats_ = {};
     registers_->reset();
     processor_.reset_state();
@@ -478,9 +482,8 @@ void Gpu::run_draw(const latte::DrawCommand& draw, const latte::RegisterFile& re
 bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
                       const latte::RegisterFile& registers,
                       std::string& problem) {
-    if (draw.kind != latte::DrawCommand::Kind::Auto) {
-        // GX2's indices are big-endian, and Metal's index fetch has no swap.
-        problem = "an indexed draw is not drawn yet: its indices want swapping first";
+    if (draw.kind == latte::DrawCommand::Kind::Immediate) {
+        problem = "a draw with its indices in the packet is not drawn yet";
         return false;
     }
     if (draw.count == 0 || draw.instances == 0) {
@@ -526,6 +529,19 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
         problem = "a draw's vertices: " + error;
         return false;
     }
+
+    // An indexed draw's indices, converted to the host's order (index_cache.hpp).
+    std::optional<latte::IndexBuffer> indices;
+    if (draw.kind == latte::DrawCommand::Kind::Indexed) {
+        if (index_cache_ == nullptr) {
+            index_cache_ = std::make_unique<latte::IndexCache>(*backend_, *memory_);
+        }
+        indices = index_cache_->indices(draw.index_address, draw.count, draw.index_type, error);
+        if (!indices.has_value()) {
+            problem = "an indexed draw's indices: " + error;
+            return false;
+        }
+    }
     const std::optional<gpu::Rect> scissor =
         latte::scissor(registers, surface->width, surface->height);
     if (!scissor.has_value()) {
@@ -547,7 +563,13 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
     backend_->set_scissor(*scissor);
     latte::bind_vertex_inputs(*backend_, inputs);
     gpu::DrawCall call;
-    call.vertex_count = draw.count;
+    if (indices.has_value()) {
+        call.index_buffer = indices->buffer;
+        call.index_count = draw.count;
+        call.index_is_32bit = indices->is_32bit;
+    } else {
+        call.vertex_count = draw.count;
+    }
     call.instance_count = draw.instances;
     call.first_vertex = registers.read(latte::reg::sq_vtx_base_vtx_loc);
     call.first_instance = registers.read(latte::reg::sq_vtx_start_inst_loc);

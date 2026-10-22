@@ -1080,9 +1080,20 @@ TEST_CASE("decaf's example triangle, drawn through GX2's own calls", "[gpu][meta
         call("GX2SetAttribBuffer", {0, 48, 16, kColours});
         call("GX2SetAttribBuffer", {1, 48, 16, kPositions});
 
-        // The frame: clear to blue, draw, copy to the TV, swap.
+        // The frame: clear to blue, draw, copy to the TV, swap. The draw
+        // either way GX2 has: auto-indexed, or from indices in the title's
+        // byte order, which are converted for Metal (latte/index_cache.hpp).
         call("GX2ClearColor", {kBuffer}, {0.0F, 0.0F, 1.0F, 1.0F});
-        call("GX2DrawEx", {4, 3, 0, 1});
+        SECTION("auto-indexed") {
+            call("GX2DrawEx", {4, 3, 0, 1});
+        }
+        SECTION("from GX2's big-endian 16-bit indices") {
+            constexpr ppcaddr_t kIndices = 0x10040200;
+            memory.write<u16>(kIndices, 0);
+            memory.write<u16>(kIndices + 2, 1);
+            memory.write<u16>(kIndices + 4, 2);
+            call("GX2DrawIndexedEx", {4, 3, 4, kIndices, 0, 1});
+        }
         call("GX2CopyColorBufferToScanBuffer", {kBuffer, 1});
         call("GX2SwapScanBuffers", {});
         call("GX2Flush", {});

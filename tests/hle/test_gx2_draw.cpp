@@ -11,8 +11,9 @@
 // cannot see. And with a GPU attached, the draw itself (8.11, ADR-006):
 // drawn into render target 0's surface -- the one a clear of the same buffer
 // made -- with the viewport and scissor, the attribute buffers bound from
-// guest memory and their fetch constants, the pipeline built once; what is
-// not drawn yet refused by name, and nothing drawn without a GPU.
+// guest memory and their fetch constants, the pipeline built once, an
+// indexed draw's indices converted to the host's order once; what is not
+// drawn yet refused by name, and nothing drawn without a GPU.
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/cpu/state.hpp>
@@ -611,12 +612,9 @@ TEST_CASE_METHOD(GpuDrawFixture,
 TEST_CASE_METHOD(GpuDrawFixture,
                  "a draw the GPU does not do yet is refused, and nothing is encoded",
                  "[hle][gx2][draw][gpu]") {
-    call("GX2DrawIndexedEx", {4, 3, 4, kIndices, 0, 1}); // indices want swapping
-    call("GX2DrawEx", {5, 3, 0, 1});                     // a fan
+    call("GX2DrawEx", {5, 3, 0, 1}); // a fan: its indices want rewriting
     run_gpu();
-    CHECK(os.gpu.draw_stats().refused == 2);
-    CHECK(os.gpu.problems().contains(
-        "an indexed draw is not drawn yet: its indices want swapping first"));
+    CHECK(os.gpu.draw_stats().refused == 1);
     CHECK(os.gpu.problems().contains("a draw of primitive type 0x5 is not drawn yet"));
 
     // A scissor that leaves the target draws nothing, and is not a problem.
@@ -627,6 +625,30 @@ TEST_CASE_METHOD(GpuDrawFixture,
 
     CHECK(os.gpu.draw_stats().drawn == 0);
     CHECK_FALSE(backend.recorded("draw vertices"));
+    CHECK(backend.rejected() == 0);
+}
+
+TEST_CASE_METHOD(GpuDrawFixture,
+                 "an indexed draw is drawn with its indices in the host's order",
+                 "[hle][gx2][draw][gpu]") {
+    // GX2_INDEX_TYPE_U16: big-endian, as the title writes them.
+    memory.write<u16>(kIndices, 0);
+    memory.write<u16>(kIndices + 2, 1);
+    memory.write<u16>(kIndices + 4, 2);
+    call("GX2ClearColor", {kColorBuffer}, {0.0F, 0.0F, 1.0F, 1.0F});
+    call("GX2DrawIndexedEx", {4, 3, 4, kIndices, 0, 1});
+    run_gpu();
+
+    CHECK(os.gpu.draw_stats().drawn == 1);
+    CHECK(backend.recorded("draw indexed 3 instances=1"));
+    REQUIRE(os.gpu.index_cache() != nullptr);
+    CHECK(os.gpu.index_cache()->stats().conversions == 1);
+
+    // Drawn again, the indices are found, not converted again.
+    call("GX2DrawIndexedEx", {4, 3, 4, kIndices, 0, 1});
+    run_gpu();
+    CHECK(os.gpu.draw_stats().drawn == 2);
+    CHECK(os.gpu.index_cache()->stats().hits == 1);
     CHECK(backend.rejected() == 0);
 }
 

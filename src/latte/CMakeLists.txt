@@ -14,6 +14,7 @@ wiiu_add_library(latte
         src/draw_state.cpp
         src/formats.cpp
         src/guest_buffers.cpp
+        src/index_cache.cpp
         src/msl.cpp
         src/pipeline_cache.cpp
         src/pm4.cpp
@@ -35,6 +36,7 @@ wiiu_add_library(latte
         include/wiiu/latte/draw.hpp
         include/wiiu/latte/formats.hpp
         include/wiiu/latte/guest_buffers.hpp
+        include/wiiu/latte/index_cache.hpp
         include/wiiu/latte/microcode.hpp
         include/wiiu/latte/msl.hpp
         include/wiiu/latte/pipeline_cache.hpp

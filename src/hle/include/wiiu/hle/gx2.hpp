@@ -57,6 +57,7 @@
 #include <wiiu/gpu/backend.hpp>
 #include <wiiu/latte/command_processor.hpp>
 #include <wiiu/latte/guest_buffers.hpp>
+#include <wiiu/latte/index_cache.hpp>
 #include <wiiu/latte/pipeline_cache.hpp>
 #include <wiiu/latte/pm4.hpp>
 #include <wiiu/latte/registers.hpp>
@@ -447,6 +448,12 @@ public:
 
     [[nodiscard]] const latte::SurfaceCache* surfaces() const noexcept { return surfaces_.get(); }
 
+    /// The indices indexed draws have been converted to, or none before the
+    /// first.
+    [[nodiscard]] const latte::IndexCache* index_cache() const noexcept {
+        return index_cache_.get();
+    }
+
     /// The pipelines draws have been made with, or none without a backend.
     [[nodiscard]] const latte::PipelineCache* pipelines() const noexcept {
         return pipelines_.get();
@@ -543,6 +550,7 @@ private:
     latte::SurfaceCopier copier_;
     std::unique_ptr<latte::PipelineCache> pipelines_;
     std::unique_ptr<latte::GuestBuffers> guest_buffers_; ///< made at the first draw
+    std::unique_ptr<latte::IndexCache> index_cache_;     ///< and at the first indexed one
     DrawStats draw_stats_;
     std::array<ScanTextures, scan_target_count> scan_textures_{};
     std::vector<gpu::TextureHandle> retired_textures_;
