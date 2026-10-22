@@ -74,6 +74,9 @@ public:
     void set_pipeline(PipelineHandle pipeline) override;
     void set_viewport(const Viewport& viewport) override;
     void set_scissor(const Rect& rect) override;
+    void set_cull_mode(CullMode mode) override;
+    void set_front_facing(Winding winding) override;
+    void set_blend_color(const ClearColor& color) override;
 
     void bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer, u64 offset) override;
     void bind_bytes(ShaderStage stage, u32 index, std::span<const u8> bytes) override;

@@ -14,6 +14,7 @@
 #include <wiiu/common/types.hpp>
 
 #include <array>
+#include <compare>
 #include <string_view>
 
 namespace wiiu::gpu {
@@ -221,6 +222,76 @@ struct ClearColor {
     f32 alpha = 1.0F;
 
     [[nodiscard]] bool operator==(const ClearColor&) const noexcept = default;
+};
+
+/// A blending factor: Metal's set, in Metal's order. Latte has these and
+/// two more, D3D9's "both" factors, which the translator has to express in
+/// these (8.11).
+enum class BlendFactor : u8 {
+    Zero,
+    One,
+    SourceColor,
+    OneMinusSourceColor,
+    SourceAlpha,
+    OneMinusSourceAlpha,
+    DestinationColor,
+    OneMinusDestinationColor,
+    DestinationAlpha,
+    OneMinusDestinationAlpha,
+    SourceAlphaSaturated,
+    BlendColor,
+    OneMinusBlendColor,
+    BlendAlpha,
+    OneMinusBlendAlpha,
+    Source1Color,
+    OneMinusSource1Color,
+    Source1Alpha,
+    OneMinusSource1Alpha,
+};
+
+enum class BlendOperation : u8 {
+    Add,
+    Subtract,        ///< source less destination
+    ReverseSubtract, ///< destination less source
+    Min,
+    Max,
+};
+
+/// Which channels a colour attachment writes, a bit each.
+namespace color_write {
+inline constexpr u8 red = 1U << 0;
+inline constexpr u8 green = 1U << 1;
+inline constexpr u8 blue = 1U << 2;
+inline constexpr u8 alpha = 1U << 3;
+inline constexpr u8 all = red | green | blue | alpha;
+} // namespace color_write
+
+/// How one colour attachment is written: blended or not, and which
+/// channels. Part of a pipeline, as Metal has it.
+struct BlendState {
+    bool enabled = false;
+    BlendFactor source_rgb = BlendFactor::One;
+    BlendFactor destination_rgb = BlendFactor::Zero;
+    BlendOperation rgb = BlendOperation::Add;
+    BlendFactor source_alpha = BlendFactor::One;
+    BlendFactor destination_alpha = BlendFactor::Zero;
+    BlendOperation alpha = BlendOperation::Add;
+    u8 write_mask = color_write::all;
+
+    auto operator<=>(const BlendState&) const = default;
+};
+
+/// Which faces a pass's draws skip.
+enum class CullMode : u8 {
+    None,
+    Front,
+    Back,
+};
+
+/// Which winding, in window coordinates, is a front face.
+enum class Winding : u8 {
+    Clockwise,
+    CounterClockwise,
 };
 
 struct Viewport {

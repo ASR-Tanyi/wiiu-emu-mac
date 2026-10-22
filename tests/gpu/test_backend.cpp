@@ -448,6 +448,46 @@ TEST_CASE_METHOD(BackendFixture, "pipelines and bindings belong to a pass", "[gp
     backend.end_render_pass();
 }
 
+TEST_CASE_METHOD(BackendFixture,
+                 "blending is the pipeline's, culling and the blend colour the pass's",
+                 "[gpu]") {
+    // A pipeline that blends: the factors reach the backend as given.
+    PipelineDesc desc;
+    desc.label = "blended";
+    desc.vertex_source = "vertex vertex_main ... fragment fragment_main";
+    desc.color_formats[0] = TextureFormat::RGBA8Unorm;
+    desc.blend[0] = BlendState{.enabled = true,
+                               .source_rgb = BlendFactor::SourceAlpha,
+                               .destination_rgb = BlendFactor::OneMinusSourceAlpha,
+                               .rgb = BlendOperation::Add,
+                               .source_alpha = BlendFactor::One,
+                               .destination_alpha = BlendFactor::Zero,
+                               .alpha = BlendOperation::Add,
+                               .write_mask = color_write::red | color_write::green};
+    std::string error;
+    const PipelineHandle pipeline = backend.create_pipeline(desc, error);
+    REQUIRE(pipeline.valid());
+    CHECK(backend.recorded("attachment 0: blend on rgb 4*5 op 0 alpha 1*0 op 0 mask 0x3"));
+
+    // An unblended pipeline with every channel says nothing more.
+    const PipelineHandle plain = simple_pipeline();
+    CHECK_FALSE(backend.recorded("pipeline " + std::to_string(plain.value()) + " attachment"));
+
+    // Encoder state: in a pass, like every binding.
+    backend.set_cull_mode(CullMode::Back);
+    CHECK(backend.rejected() == 1);
+    RenderPassDesc pass = simple_pass();
+    REQUIRE(backend.begin_render_pass(pass));
+    backend.set_cull_mode(CullMode::Back);
+    backend.set_front_facing(Winding::CounterClockwise);
+    backend.set_blend_color(ClearColor{0.25F, 0.5F, 0.75F, 1.0F});
+    backend.end_render_pass();
+    CHECK(backend.recorded("set_cull_mode back"));
+    CHECK(backend.recorded("set_front_facing ccw"));
+    CHECK(backend.recorded("set_blend_color 0.25 0.5 0.75 1"));
+    CHECK(backend.rejected() == 1);
+}
+
 TEST_CASE_METHOD(BackendFixture, "a binding index past the stage's table is refused", "[gpu]") {
     SamplerDesc sampler_desc;
     const SamplerHandle sampler = backend.create_sampler(sampler_desc);

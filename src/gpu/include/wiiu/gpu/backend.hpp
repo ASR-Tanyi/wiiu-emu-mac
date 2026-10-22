@@ -193,6 +193,10 @@ struct PipelineDesc {
     std::string fragment_entry = "fragment_main";
     PrimitiveType primitive = PrimitiveType::Triangles;
     std::array<TextureFormat, max_color_attachments> color_formats{};
+
+    /// How each colour attachment is written. Not blended, every channel,
+    /// unless said otherwise.
+    std::array<BlendState, max_color_attachments> blend{};
     u32 color_count = 1;
     TextureFormat depth_format = TextureFormat::Unknown;
     u32 sample_count = 1;
@@ -368,6 +372,15 @@ public:
     virtual void set_pipeline(PipelineHandle pipeline) = 0;
     virtual void set_viewport(const Viewport& viewport) = 0;
     virtual void set_scissor(const Rect& rect) = 0;
+
+    /// The rest of the rasterizer's state, which Metal keeps in the pass
+    /// rather than the pipeline: which faces are culled, which winding faces
+    /// the front, and the colour the blend-colour factors read. A pass
+    /// starts from Metal's defaults -- nothing culled, clockwise in front,
+    /// a blend colour of zero.
+    virtual void set_cull_mode(CullMode mode) = 0;
+    virtual void set_front_facing(Winding winding) = 0;
+    virtual void set_blend_color(const ClearColor& color) = 0;
 
     /// Bind by stage and index. Until ADR-003's argument buffers arrive with
     /// the MSL emitter (8.6, 8.12), index `n` is `[[buffer(n)]]`,

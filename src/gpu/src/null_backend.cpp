@@ -321,6 +321,26 @@ PipelineHandle NullBackend::create_pipeline(const PipelineDesc& desc, std::strin
                        id,
                        primitive_type_name(desc.primitive),
                        label_or(desc.label, "-")));
+    // How each attachment is written, where it is not Metal's default, as
+    // the numbers the enums have: a line each, for a test to look for.
+    for (u32 index = 0; index < desc.color_count; ++index) {
+        const BlendState& blend = desc.blend[index];
+        if (blend == BlendState{}) {
+            continue;
+        }
+        record(fmt::format("pipeline {} attachment {}: blend {} rgb {}*{} op {} alpha {}*{} op "
+                           "{} mask {:#x}",
+                           id,
+                           index,
+                           blend.enabled ? "on" : "off",
+                           static_cast<u32>(blend.source_rgb),
+                           static_cast<u32>(blend.destination_rgb),
+                           static_cast<u32>(blend.rgb),
+                           static_cast<u32>(blend.source_alpha),
+                           static_cast<u32>(blend.destination_alpha),
+                           static_cast<u32>(blend.alpha),
+                           blend.write_mask));
+    }
     return PipelineHandle{id};
 }
 
@@ -635,6 +655,31 @@ void NullBackend::set_scissor(const Rect& rect) {
         return;
     }
     record(fmt::format("set_scissor {}x{} at ({},{})", rect.width, rect.height, rect.x, rect.y));
+}
+
+void NullBackend::set_cull_mode(CullMode mode) {
+    if (!require_pass("set_cull_mode")) {
+        return;
+    }
+    record(fmt::format("set_cull_mode {}",
+                       mode == CullMode::Front  ? "front"
+                       : mode == CullMode::Back ? "back"
+                                                : "none"));
+}
+
+void NullBackend::set_front_facing(Winding winding) {
+    if (!require_pass("set_front_facing")) {
+        return;
+    }
+    record(fmt::format("set_front_facing {}", winding == Winding::Clockwise ? "cw" : "ccw"));
+}
+
+void NullBackend::set_blend_color(const ClearColor& color) {
+    if (!require_pass("set_blend_color")) {
+        return;
+    }
+    record(fmt::format(
+        "set_blend_color {} {} {} {}", color.red, color.green, color.blue, color.alpha));
 }
 
 void NullBackend::bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer, u64 offset) {

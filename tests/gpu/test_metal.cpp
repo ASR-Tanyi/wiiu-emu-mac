@@ -365,6 +365,123 @@ TEST_CASE("a triangle is rasterised where it should be", "[gpu][metal]") {
     backend->shutdown();
 }
 
+TEST_CASE("blending and the write mask are the pipeline's", "[gpu][metal]") {
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+
+    // The triangle over a blue clear, with each pipeline in turn; the pixel
+    // looked at is well inside it.
+    const auto draw = [&](const BlendState& blend,
+                          std::array<f32, 4> colour,
+                          std::optional<ClearColor> blend_color) {
+        PipelineDesc desc;
+        desc.label = "blended triangle";
+        desc.vertex_source = std::string{kTriangleShader};
+        desc.color_formats[0] = TextureFormat::BGRA8Unorm;
+        desc.blend[0] = blend;
+        std::string error;
+        const PipelineHandle pipeline = backend->create_pipeline(desc, error);
+        INFO(error);
+        REQUIRE(pipeline.valid());
+
+        const TextureHandle target = make_target(*backend);
+        const BufferHandle positions =
+            shared_buffer(*backend, std::array<f32, 6>{-1.0F, -1.0F, 1.0F, -1.0F, -1.0F, 1.0F});
+        const BufferHandle fill = shared_buffer(*backend, colour);
+        REQUIRE(backend->begin_render_pass(clear_pass(target, ClearColor{0.0F, 0.0F, 1.0F, 1.0F})));
+        backend->set_pipeline(pipeline);
+        if (blend_color.has_value()) {
+            backend->set_blend_color(*blend_color);
+        }
+        backend->bind_buffer(ShaderStage::Vertex, 0, positions, 0);
+        backend->bind_buffer(ShaderStage::Fragment, 0, fill, 0);
+        DrawCall call;
+        call.vertex_count = 3;
+        backend->draw(call);
+        backend->end_render_pass();
+        backend->submit();
+
+        std::vector<u8> pixels(static_cast<std::size_t>(kTarget) * kTarget * 4);
+        REQUIRE(backend->read_texture(target, pixels));
+        CHECK(backend->command_errors() == 0);
+        return at(pixels, 2, 40);
+    };
+    const auto near = [](u8 a, u8 b) { return (a > b ? a - b : b - a) <= 1; };
+
+    // Ordinary alpha blending: 40% green over the blue.
+    const BlendState alpha_blend{.enabled = true,
+                                 .source_rgb = BlendFactor::SourceAlpha,
+                                 .destination_rgb = BlendFactor::OneMinusSourceAlpha,
+                                 .rgb = BlendOperation::Add,
+                                 .source_alpha = BlendFactor::SourceAlpha,
+                                 .destination_alpha = BlendFactor::OneMinusSourceAlpha,
+                                 .alpha = BlendOperation::Add};
+    std::array<u8, 4> pixel = draw(alpha_blend, {0.0F, 1.0F, 0.0F, 0.4F}, std::nullopt);
+    INFO("BGRA " << int{pixel[0]} << " " << int{pixel[1]} << " " << int{pixel[2]});
+    CHECK(near(pixel[0], 153)); // blue: 0.6 of the clear
+    CHECK(near(pixel[1], 102)); // green: 0.4 of the source
+    CHECK(pixel[2] == 0);
+
+    // The constant colour, from the pass.
+    const BlendState constant{.enabled = true,
+                              .source_rgb = BlendFactor::BlendColor,
+                              .destination_rgb = BlendFactor::Zero};
+    pixel = draw(constant, {1.0F, 1.0F, 1.0F, 1.0F}, ClearColor{0.2F, 0.4F, 0.6F, 1.0F});
+    CHECK(near(pixel[0], 153)); // BGRA: 0.6, 0.4, 0.2
+    CHECK(near(pixel[1], 102));
+    CHECK(near(pixel[2], 51));
+
+    // Writing green alone: red stays the clear's zero, blue its one.
+    pixel =
+        draw(BlendState{.write_mask = color_write::green}, {1.0F, 1.0F, 0.0F, 1.0F}, std::nullopt);
+    CHECK(pixel == std::array<u8, 4>{255, 255, 0, 255});
+}
+
+TEST_CASE("a culled face is not drawn", "[gpu][metal]") {
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+    const PipelineHandle pipeline = triangle_pipeline(*backend);
+
+    // The same triangle -- counter-clockwise in clip space -- with back faces
+    // culled and each winding in front in turn: in exactly one of the two it
+    // is a back face. Which one is how Metal judges winding, and what the
+    // translator's mapping of Latte's PA_FACE rests on (8.11).
+    const auto drawn = [&](Winding front) {
+        const TextureHandle target = make_target(*backend);
+        const BufferHandle positions =
+            shared_buffer(*backend, std::array<f32, 6>{-1.0F, -1.0F, 1.0F, -1.0F, -1.0F, 1.0F});
+        const BufferHandle colour =
+            shared_buffer(*backend, std::array<f32, 4>{0.0F, 1.0F, 0.0F, 1.0F});
+        REQUIRE(backend->begin_render_pass(clear_pass(target, ClearColor{0.0F, 0.0F, 1.0F, 1.0F})));
+        backend->set_pipeline(pipeline);
+        backend->set_cull_mode(CullMode::Back);
+        backend->set_front_facing(front);
+        backend->bind_buffer(ShaderStage::Vertex, 0, positions, 0);
+        backend->bind_buffer(ShaderStage::Fragment, 0, colour, 0);
+        DrawCall call;
+        call.vertex_count = 3;
+        backend->draw(call);
+        backend->end_render_pass();
+        backend->submit();
+        std::vector<u8> pixels(static_cast<std::size_t>(kTarget) * kTarget * 4);
+        REQUIRE(backend->read_texture(target, pixels));
+        CHECK(backend->command_errors() == 0);
+        return at(pixels, 2, 40) == kGreen;
+    };
+    const bool clockwise_front = drawn(Winding::Clockwise);
+    const bool counter_clockwise_front = drawn(Winding::CounterClockwise);
+    INFO("drawn with clockwise in front: " << clockwise_front << "; with counter-clockwise: "
+                                           << counter_clockwise_front);
+    CHECK(clockwise_front != counter_clockwise_front);
+    // In window coordinates, y down, the triangle is clockwise; in clip
+    // space's orientation, y up, counter-clockwise. Which Metal goes by is
+    // what this reports. Cemu hands Latte's PA_FACE to Metal as it is, and
+    // its titles draw right, so the translator does the same; this is the
+    // fact to hold that against if a title's faces come out inside out.
+    WARN("Metal judged the clip-space counter-clockwise triangle "
+         << (counter_clockwise_front ? "counter-clockwise" : "clockwise"));
+
+    backend->shutdown();
+}
+
 TEST_CASE("an indexed draw reads its indices", "[gpu][metal]") {
     const std::unique_ptr<GpuBackend> backend = live_backend();
     const TextureHandle target = make_target(*backend);

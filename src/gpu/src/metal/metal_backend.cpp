@@ -223,6 +223,85 @@ using metal::Ref;
     return NS::String::string(copy.c_str(), NS::UTF8StringEncoding);
 }
 
+[[nodiscard]] MTL::BlendFactor to_metal(BlendFactor factor) noexcept {
+    switch (factor) {
+        case BlendFactor::Zero:
+            return MTL::BlendFactorZero;
+        case BlendFactor::One:
+            return MTL::BlendFactorOne;
+        case BlendFactor::SourceColor:
+            return MTL::BlendFactorSourceColor;
+        case BlendFactor::OneMinusSourceColor:
+            return MTL::BlendFactorOneMinusSourceColor;
+        case BlendFactor::SourceAlpha:
+            return MTL::BlendFactorSourceAlpha;
+        case BlendFactor::OneMinusSourceAlpha:
+            return MTL::BlendFactorOneMinusSourceAlpha;
+        case BlendFactor::DestinationColor:
+            return MTL::BlendFactorDestinationColor;
+        case BlendFactor::OneMinusDestinationColor:
+            return MTL::BlendFactorOneMinusDestinationColor;
+        case BlendFactor::DestinationAlpha:
+            return MTL::BlendFactorDestinationAlpha;
+        case BlendFactor::OneMinusDestinationAlpha:
+            return MTL::BlendFactorOneMinusDestinationAlpha;
+        case BlendFactor::SourceAlphaSaturated:
+            return MTL::BlendFactorSourceAlphaSaturated;
+        case BlendFactor::BlendColor:
+            return MTL::BlendFactorBlendColor;
+        case BlendFactor::OneMinusBlendColor:
+            return MTL::BlendFactorOneMinusBlendColor;
+        case BlendFactor::BlendAlpha:
+            return MTL::BlendFactorBlendAlpha;
+        case BlendFactor::OneMinusBlendAlpha:
+            return MTL::BlendFactorOneMinusBlendAlpha;
+        case BlendFactor::Source1Color:
+            return MTL::BlendFactorSource1Color;
+        case BlendFactor::OneMinusSource1Color:
+            return MTL::BlendFactorOneMinusSource1Color;
+        case BlendFactor::Source1Alpha:
+            return MTL::BlendFactorSource1Alpha;
+        case BlendFactor::OneMinusSource1Alpha:
+            return MTL::BlendFactorOneMinusSource1Alpha;
+    }
+    return MTL::BlendFactorOne;
+}
+
+[[nodiscard]] MTL::BlendOperation to_metal(BlendOperation operation) noexcept {
+    switch (operation) {
+        case BlendOperation::Add:
+            return MTL::BlendOperationAdd;
+        case BlendOperation::Subtract:
+            return MTL::BlendOperationSubtract;
+        case BlendOperation::ReverseSubtract:
+            return MTL::BlendOperationReverseSubtract;
+        case BlendOperation::Min:
+            return MTL::BlendOperationMin;
+        case BlendOperation::Max:
+            return MTL::BlendOperationMax;
+    }
+    return MTL::BlendOperationAdd;
+}
+
+/// Metal's write mask has red in its top bit and alpha in its bottom one,
+/// the other way round from `color_write`.
+[[nodiscard]] MTL::ColorWriteMask to_metal_write_mask(u8 mask) noexcept {
+    MTL::ColorWriteMask out = MTL::ColorWriteMaskNone;
+    if ((mask & color_write::red) != 0) {
+        out |= MTL::ColorWriteMaskRed;
+    }
+    if ((mask & color_write::green) != 0) {
+        out |= MTL::ColorWriteMaskGreen;
+    }
+    if ((mask & color_write::blue) != 0) {
+        out |= MTL::ColorWriteMaskBlue;
+    }
+    if ((mask & color_write::alpha) != 0) {
+        out |= MTL::ColorWriteMaskAlpha;
+    }
+    return out;
+}
+
 [[nodiscard]] MTL::PrimitiveType to_metal(PrimitiveType type) noexcept {
     switch (type) {
         case PrimitiveType::Points:
@@ -517,6 +596,9 @@ public:
     void set_pipeline(PipelineHandle pipeline) override;
     void set_viewport(const Viewport& viewport) override;
     void set_scissor(const Rect& rect) override;
+    void set_cull_mode(CullMode mode) override;
+    void set_front_facing(Winding winding) override;
+    void set_blend_color(const ClearColor& color) override;
 
     void bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer, u64 offset) override;
     void bind_bytes(ShaderStage stage, u32 index, std::span<const u8> bytes) override;
@@ -1462,8 +1544,20 @@ PipelineHandle MetalBackend::create_pipeline(const PipelineDesc& desc, std::stri
     descriptor->setVertexFunction(vertex.get());
     descriptor->setFragmentFunction(fragment.get());
     for (u32 index = 0; index < desc.color_count; ++index) {
-        descriptor->colorAttachments()->object(index)->setPixelFormat(
-            to_metal(desc.color_formats[index]));
+        MTL::RenderPipelineColorAttachmentDescriptor* const attachment =
+            descriptor->colorAttachments()->object(index);
+        attachment->setPixelFormat(to_metal(desc.color_formats[index]));
+        const BlendState& blend = desc.blend[index];
+        attachment->setWriteMask(to_metal_write_mask(blend.write_mask));
+        attachment->setBlendingEnabled(blend.enabled);
+        if (blend.enabled) {
+            attachment->setSourceRGBBlendFactor(to_metal(blend.source_rgb));
+            attachment->setDestinationRGBBlendFactor(to_metal(blend.destination_rgb));
+            attachment->setRgbBlendOperation(to_metal(blend.rgb));
+            attachment->setSourceAlphaBlendFactor(to_metal(blend.source_alpha));
+            attachment->setDestinationAlphaBlendFactor(to_metal(blend.destination_alpha));
+            attachment->setAlphaBlendOperation(to_metal(blend.alpha));
+        }
     }
     if (format_has_depth(desc.depth_format)) {
         descriptor->setDepthAttachmentPixelFormat(to_metal(desc.depth_format));
@@ -1500,6 +1594,38 @@ void MetalBackend::set_pipeline(PipelineHandle pipeline) {
     }
     encoder_->setRenderPipelineState(entry->second.state.get());
     pass_pipeline_ = &entry->second;
+}
+
+void MetalBackend::set_cull_mode(CullMode mode) {
+    if (!require_pass("set_cull_mode")) {
+        return;
+    }
+    switch (mode) {
+        case CullMode::None:
+            encoder_->setCullMode(MTL::CullModeNone);
+            return;
+        case CullMode::Front:
+            encoder_->setCullMode(MTL::CullModeFront);
+            return;
+        case CullMode::Back:
+            encoder_->setCullMode(MTL::CullModeBack);
+            return;
+    }
+}
+
+void MetalBackend::set_front_facing(Winding winding) {
+    if (!require_pass("set_front_facing")) {
+        return;
+    }
+    encoder_->setFrontFacingWinding(winding == Winding::Clockwise ? MTL::WindingClockwise
+                                                                  : MTL::WindingCounterClockwise);
+}
+
+void MetalBackend::set_blend_color(const ClearColor& color) {
+    if (!require_pass("set_blend_color")) {
+        return;
+    }
+    encoder_->setBlendColor(color.red, color.green, color.blue, color.alpha);
 }
 
 // Direct binding, until ADR-003's argument buffers arrive with the MSL
