@@ -561,6 +561,10 @@ public:
 
     void destroy(SamplerHandle handle) override { samplers_.erase(handle.value()); }
 
+    [[nodiscard]] DepthStencilHandle create_depth_stencil(const DepthStencilDesc& desc) override;
+
+    void destroy(DepthStencilHandle handle) override { depth_stencils_.erase(handle.value()); }
+
     void destroy(PipelineHandle handle) override {
         const auto entry = pipelines_.find(handle.value());
         if (entry == pipelines_.end()) {
@@ -599,6 +603,8 @@ public:
     void set_cull_mode(CullMode mode) override;
     void set_front_facing(Winding winding) override;
     void set_blend_color(const ClearColor& color) override;
+    void set_depth_stencil(DepthStencilHandle state) override;
+    void set_stencil_reference(u32 front, u32 back) override;
 
     void bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer, u64 offset) override;
     void bind_bytes(ShaderStage stage, u32 index, std::span<const u8> bytes) override;
@@ -708,6 +714,7 @@ private:
     /// mapping that would need updating twice.
     std::map<u32, TextureFormat> texture_formats_;
     std::map<u32, Ref<MTL::SamplerState>> samplers_;
+    std::map<u32, Ref<MTL::DepthStencilState>> depth_stencils_;
 
     FrameStats stats_;
     FrameStats last_stats_;
@@ -825,6 +832,7 @@ void MetalBackend::shutdown() {
     commands_.reset();
     pass_pipeline_ = nullptr;
     pipelines_.clear();
+    depth_stencils_.clear();
     buffers_.clear();
     textures_.clear();
     texture_formats_.clear();
@@ -1626,6 +1634,65 @@ void MetalBackend::set_blend_color(const ClearColor& color) {
         return;
     }
     encoder_->setBlendColor(color.red, color.green, color.blue, color.alpha);
+}
+
+// gpu::StencilOperation and gpu::CompareFunction are Metal's in Metal's order.
+static_assert(MTL::StencilOperationDecrementWrap == 7);
+static_assert(MTL::CompareFunctionAlways == 7);
+
+DepthStencilHandle MetalBackend::create_depth_stencil(const DepthStencilDesc& desc) {
+    if (!device_) {
+        return {};
+    }
+    const AutoreleasePool pool;
+    const Ref<MTL::DepthStencilDescriptor> descriptor{MTL::DepthStencilDescriptor::alloc()->init()};
+    descriptor->setDepthCompareFunction(static_cast<MTL::CompareFunction>(desc.depth_compare));
+    descriptor->setDepthWriteEnabled(desc.depth_write);
+    if (desc.stencil) {
+        for (const bool front : {true, false}) {
+            const StencilFace& face = front ? desc.front : desc.back;
+            const Ref<MTL::StencilDescriptor> stencil{MTL::StencilDescriptor::alloc()->init()};
+            stencil->setStencilCompareFunction(static_cast<MTL::CompareFunction>(face.compare));
+            stencil->setStencilFailureOperation(
+                static_cast<MTL::StencilOperation>(face.stencil_fail));
+            stencil->setDepthFailureOperation(static_cast<MTL::StencilOperation>(face.depth_fail));
+            stencil->setDepthStencilPassOperation(static_cast<MTL::StencilOperation>(face.pass));
+            stencil->setReadMask(face.read_mask);
+            stencil->setWriteMask(face.write_mask);
+            if (front) {
+                descriptor->setFrontFaceStencil(stencil.get());
+            } else {
+                descriptor->setBackFaceStencil(stencil.get());
+            }
+        }
+    }
+    Ref<MTL::DepthStencilState> state{device_->newDepthStencilState(descriptor.get())};
+    if (!state) {
+        WIIU_LOG_ERROR(Gpu, "metal: a depth-stencil state was not made");
+        return {};
+    }
+    const u32 id = next_id_++;
+    depth_stencils_.emplace(id, std::move(state));
+    return DepthStencilHandle{id};
+}
+
+void MetalBackend::set_depth_stencil(DepthStencilHandle state) {
+    if (!require_pass("set_depth_stencil")) {
+        return;
+    }
+    const auto entry = depth_stencils_.find(state.value());
+    if (entry == depth_stencils_.end()) {
+        refuse("set_depth_stencil with a handle that names no state");
+        return;
+    }
+    encoder_->setDepthStencilState(entry->second.get());
+}
+
+void MetalBackend::set_stencil_reference(u32 front, u32 back) {
+    if (!require_pass("set_stencil_reference")) {
+        return;
+    }
+    encoder_->setStencilReferenceValues(front, back);
 }
 
 // Direct binding, until ADR-003's argument buffers arrive with the MSL

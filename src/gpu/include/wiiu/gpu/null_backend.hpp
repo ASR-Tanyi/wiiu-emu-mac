@@ -54,6 +54,8 @@ public:
     void destroy(TextureHandle handle) override;
     void destroy(SamplerHandle handle) override;
     void destroy(PipelineHandle handle) override;
+    void destroy(DepthStencilHandle handle) override;
+    [[nodiscard]] DepthStencilHandle create_depth_stencil(const DepthStencilDesc& desc) override;
     void destroy(FenceHandle handle) override;
 
     [[nodiscard]] bool
@@ -77,6 +79,8 @@ public:
     void set_cull_mode(CullMode mode) override;
     void set_front_facing(Winding winding) override;
     void set_blend_color(const ClearColor& color) override;
+    void set_depth_stencil(DepthStencilHandle state) override;
+    void set_stencil_reference(u32 front, u32 back) override;
 
     void bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer, u64 offset) override;
     void bind_bytes(ShaderStage stage, u32 index, std::span<const u8> bytes) override;
@@ -163,8 +167,8 @@ private:
     FrameStats last_stats_;
     RenderPassDesc last_render_pass_;
 
-    std::array<u32, 5> next_id_{};
-    std::array<std::map<u32, std::string>, 5> live_;
+    std::array<u32, resource_kind_count> next_id_{};
+    std::array<std::map<u32, std::string>, resource_kind_count> live_;
 
     /// Buffer contents, so `write_buffer` and `buffer_contents` mean
     /// something and a test can check what the translator uploaded.

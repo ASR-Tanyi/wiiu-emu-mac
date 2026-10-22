@@ -302,10 +302,14 @@ public:
     [[nodiscard]] virtual PipelineHandle create_pipeline(const PipelineDesc& desc,
                                                          std::string& error) = 0;
 
+    /// A depth-stencil state, for `set_depth_stencil`.
+    [[nodiscard]] virtual DepthStencilHandle create_depth_stencil(const DepthStencilDesc& desc) = 0;
+
     virtual void destroy(BufferHandle handle) = 0;
     virtual void destroy(TextureHandle handle) = 0;
     virtual void destroy(SamplerHandle handle) = 0;
     virtual void destroy(PipelineHandle handle) = 0;
+    virtual void destroy(DepthStencilHandle handle) = 0;
 
     /// Copy into a `Shared` buffer. False if the handle is unknown or the
     /// write would run past the end.
@@ -381,6 +385,13 @@ public:
     virtual void set_cull_mode(CullMode mode) = 0;
     virtual void set_front_facing(Winding winding) = 0;
     virtual void set_blend_color(const ClearColor& color) = 0;
+
+    /// The depth and stencil tests for the draws that follow in this pass,
+    /// and the stencil reference values each face compares against. A pass
+    /// starts with Metal's defaults: no test, nothing written, references
+    /// zero.
+    virtual void set_depth_stencil(DepthStencilHandle state) = 0;
+    virtual void set_stencil_reference(u32 front, u32 back) = 0;
 
     /// Bind by stage and index. Until ADR-003's argument buffers arrive with
     /// the MSL emitter (8.6, 8.12), index `n` is `[[buffer(n)]]`,

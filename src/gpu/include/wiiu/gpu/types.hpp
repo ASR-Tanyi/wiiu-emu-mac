@@ -15,6 +15,7 @@
 
 #include <array>
 #include <compare>
+#include <cstddef>
 #include <string_view>
 
 namespace wiiu::gpu {
@@ -25,7 +26,10 @@ enum class ResourceKind : u8 {
     Sampler,
     Pipeline,
     Fence,
+    DepthStencil,
 };
+
+inline constexpr std::size_t resource_kind_count = 6;
 
 /// An opaque reference to something a backend owns.
 ///
@@ -58,6 +62,7 @@ using TextureHandle = Handle<ResourceKind::Texture>;
 using SamplerHandle = Handle<ResourceKind::Sampler>;
 using PipelineHandle = Handle<ResourceKind::Pipeline>;
 using FenceHandle = Handle<ResourceKind::Fence>;
+using DepthStencilHandle = Handle<ResourceKind::DepthStencil>;
 
 [[nodiscard]] std::string_view resource_kind_name(ResourceKind kind) noexcept;
 
@@ -190,6 +195,43 @@ enum class CompareFunction : u8 {
     NotEqual,
     GreaterEqual,
     Always,
+};
+
+/// What a stencil test does to the stored value. Metal's set, in Metal's
+/// order -- which is also Latte's (STENCILFAIL and the rest).
+enum class StencilOperation : u8 {
+    Keep,
+    Zero,
+    Replace,
+    IncrementClamp,
+    DecrementClamp,
+    Invert,
+    IncrementWrap,
+    DecrementWrap,
+};
+
+/// One face's stencil test.
+struct StencilFace {
+    CompareFunction compare = CompareFunction::Always;
+    StencilOperation stencil_fail = StencilOperation::Keep;
+    StencilOperation depth_fail = StencilOperation::Keep;
+    StencilOperation pass = StencilOperation::Keep;
+    u8 read_mask = 0xFF;
+    u8 write_mask = 0xFF;
+
+    auto operator<=>(const StencilFace&) const = default;
+};
+
+/// The depth and stencil tests: a state object of its own on Metal, made
+/// once and set in a pass. The defaults test nothing and write nothing.
+struct DepthStencilDesc {
+    CompareFunction depth_compare = CompareFunction::Always;
+    bool depth_write = false;
+    bool stencil = false; ///< without it the faces are ignored
+    StencilFace front;
+    StencilFace back;
+
+    auto operator<=>(const DepthStencilDesc&) const = default;
 };
 
 /// Primitive topology.

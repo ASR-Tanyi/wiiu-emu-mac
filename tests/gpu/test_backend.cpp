@@ -488,6 +488,40 @@ TEST_CASE_METHOD(BackendFixture,
     CHECK(backend.rejected() == 1);
 }
 
+TEST_CASE_METHOD(BackendFixture,
+                 "depth and stencil tests are states of their own, set in a pass",
+                 "[gpu]") {
+    DepthStencilDesc desc;
+    desc.depth_compare = CompareFunction::LessEqual;
+    desc.depth_write = true;
+    desc.stencil = true;
+    desc.front.compare = CompareFunction::Equal;
+    desc.front.pass = StencilOperation::IncrementClamp;
+    desc.back.write_mask = 0x0F;
+    const DepthStencilHandle state = backend.create_depth_stencil(desc);
+    REQUIRE(state.valid());
+    CHECK(backend.recorded("create_depth_stencil " + std::to_string(state.value()) +
+                           " depth 3 write on stencil on"));
+    CHECK(backend.recorded("front: compare 2 fail 0 depth-fail 0 pass 3 read 0xff write 0xff"));
+    CHECK(backend.recorded("back: compare 7 fail 0 depth-fail 0 pass 0 read 0xff write 0x0f"));
+    CHECK(backend.live_count(ResourceKind::DepthStencil) == 1);
+
+    // An encoder call, like the rest.
+    backend.set_depth_stencil(state);
+    CHECK(backend.rejected() == 1);
+    RenderPassDesc pass = simple_pass();
+    REQUIRE(backend.begin_render_pass(pass));
+    backend.set_depth_stencil(state);
+    backend.set_stencil_reference(1, 2);
+    backend.end_render_pass();
+    CHECK(backend.recorded("set_depth_stencil " + std::to_string(state.value())));
+    CHECK(backend.recorded("set_stencil_reference 1 2"));
+    CHECK(backend.rejected() == 1);
+
+    backend.destroy(state);
+    CHECK(backend.live_count(ResourceKind::DepthStencil) == 0);
+}
+
 TEST_CASE_METHOD(BackendFixture, "a binding index past the stage's table is refused", "[gpu]") {
     SamplerDesc sampler_desc;
     const SamplerHandle sampler = backend.create_sampler(sampler_desc);

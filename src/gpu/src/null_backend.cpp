@@ -360,6 +360,36 @@ void NullBackend::destroy(PipelineHandle handle) {
     kill(ResourceKind::Pipeline, handle.value(), "pipeline");
 }
 
+DepthStencilHandle NullBackend::create_depth_stencil(const DepthStencilDesc& desc) {
+    const u32 id = next_id(ResourceKind::DepthStencil);
+    live_[index_of(ResourceKind::DepthStencil)].emplace(id, "depth-stencil state");
+    record(fmt::format("create_depth_stencil {} depth {} write {} stencil {}",
+                       id,
+                       static_cast<u32>(desc.depth_compare),
+                       desc.depth_write ? "on" : "off",
+                       desc.stencil ? "on" : "off"));
+    if (desc.stencil) {
+        for (const auto& [name, face] :
+             {std::pair{"front", desc.front}, std::pair{"back", desc.back}}) {
+            record(fmt::format("depth-stencil {} {}: compare {} fail {} depth-fail {} pass {} read "
+                               "{:#04x} write {:#04x}",
+                               id,
+                               name,
+                               static_cast<u32>(face.compare),
+                               static_cast<u32>(face.stencil_fail),
+                               static_cast<u32>(face.depth_fail),
+                               static_cast<u32>(face.pass),
+                               face.read_mask,
+                               face.write_mask));
+        }
+    }
+    return DepthStencilHandle{id};
+}
+
+void NullBackend::destroy(DepthStencilHandle handle) {
+    kill(ResourceKind::DepthStencil, handle.value(), "depth-stencil state");
+}
+
 void NullBackend::destroy(FenceHandle handle) {
     kill(ResourceKind::Fence, handle.value(), "fence");
 }
@@ -680,6 +710,24 @@ void NullBackend::set_blend_color(const ClearColor& color) {
     }
     record(fmt::format(
         "set_blend_color {} {} {} {}", color.red, color.green, color.blue, color.alpha));
+}
+
+void NullBackend::set_depth_stencil(DepthStencilHandle state) {
+    if (!require_pass("set_depth_stencil")) {
+        return;
+    }
+    if (!live(ResourceKind::DepthStencil, state.value())) {
+        reject(fmt::format("set_depth_stencil {}: not a live handle", state.value()));
+        return;
+    }
+    record(fmt::format("set_depth_stencil {}", state.value()));
+}
+
+void NullBackend::set_stencil_reference(u32 front, u32 back) {
+    if (!require_pass("set_stencil_reference")) {
+        return;
+    }
+    record(fmt::format("set_stencil_reference {} {}", front, back));
 }
 
 void NullBackend::bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer, u64 offset) {

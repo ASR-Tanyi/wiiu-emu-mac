@@ -482,6 +482,95 @@ TEST_CASE("a culled face is not drawn", "[gpu][metal]") {
     backend->shutdown();
 }
 
+TEST_CASE("depth and stencil tests keep what they should", "[gpu][metal]") {
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+
+    // The triangle again, at depth 0.75, over a depth buffer cleared to 0.5
+    // and a stencil buffer cleared to zero.
+    constexpr std::string_view kDeepTriangle = R"msl(
+#include <metal_stdlib>
+using namespace metal;
+
+struct Out {
+    float4 position [[position]];
+};
+
+vertex Out vertex_main(uint id [[vertex_id]], const device float2* positions [[buffer(0)]]) {
+    Out out;
+    out.position = float4(positions[id], 0.75, 1.0);
+    return out;
+}
+
+fragment float4 fragment_main(Out in [[stage_in]]) {
+    return float4(0.0, 1.0, 0.0, 1.0);
+}
+)msl";
+    PipelineDesc pipeline_desc;
+    pipeline_desc.label = "deep triangle";
+    pipeline_desc.vertex_source = std::string{kDeepTriangle};
+    pipeline_desc.color_formats[0] = TextureFormat::BGRA8Unorm;
+    pipeline_desc.depth_format = TextureFormat::Depth32FloatStencil8;
+    std::string error;
+    const PipelineHandle pipeline = backend->create_pipeline(pipeline_desc, error);
+    INFO(error);
+    REQUIRE(pipeline.valid());
+
+    TextureDesc depth_desc;
+    depth_desc.width = kTarget;
+    depth_desc.height = kTarget;
+    depth_desc.format = TextureFormat::Depth32FloatStencil8;
+    depth_desc.usage = TextureUsage::RenderTarget;
+    depth_desc.storage = Storage::Private;
+    depth_desc.label = "depth";
+    const TextureHandle depth = backend->create_texture(depth_desc);
+    REQUIRE(depth.valid());
+    const BufferHandle positions =
+        shared_buffer(*backend, std::array<f32, 6>{-1.0F, -1.0F, 1.0F, -1.0F, -1.0F, 1.0F});
+
+    const auto drawn = [&](const DepthStencilDesc& tests, u32 reference) {
+        const DepthStencilHandle state = backend->create_depth_stencil(tests);
+        REQUIRE(state.valid());
+        const TextureHandle target = make_target(*backend);
+        RenderPassDesc pass = clear_pass(target, ClearColor{0.0F, 0.0F, 1.0F, 1.0F});
+        pass.depth_stencil.texture = depth;
+        pass.depth_stencil.load = LoadAction::Clear;
+        pass.depth_stencil.store = StoreAction::DontCare;
+        pass.depth_stencil.clear_depth = 0.5F;
+        pass.depth_stencil.clear_stencil = 0;
+        REQUIRE(backend->begin_render_pass(pass));
+        backend->set_pipeline(pipeline);
+        backend->set_depth_stencil(state);
+        backend->set_stencil_reference(reference, reference);
+        backend->bind_buffer(ShaderStage::Vertex, 0, positions, 0);
+        DrawCall call;
+        call.vertex_count = 3;
+        backend->draw(call);
+        backend->end_render_pass();
+        backend->submit();
+        std::vector<u8> pixels(static_cast<std::size_t>(kTarget) * kTarget * 4);
+        REQUIRE(backend->read_texture(target, pixels));
+        CHECK(backend->command_errors() == 0);
+        backend->destroy(state);
+        return at(pixels, 2, 40) == kGreen;
+    };
+
+    DepthStencilDesc tests;
+    tests.depth_compare = CompareFunction::Less; // 0.75 < 0.5: no
+    CHECK_FALSE(drawn(tests, 0));
+    tests.depth_compare = CompareFunction::Greater;
+    CHECK(drawn(tests, 0));
+
+    // The stencil: equal to the reference, against the cleared zero.
+    tests.depth_compare = CompareFunction::Always;
+    tests.stencil = true;
+    tests.front.compare = CompareFunction::Equal;
+    tests.back.compare = CompareFunction::Equal;
+    CHECK_FALSE(drawn(tests, 1));
+    CHECK(drawn(tests, 0));
+
+    backend->shutdown();
+}
+
 TEST_CASE("an indexed draw reads its indices", "[gpu][metal]") {
     const std::unique_ptr<GpuBackend> backend = live_backend();
     const TextureHandle target = make_target(*backend);

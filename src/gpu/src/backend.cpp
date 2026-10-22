@@ -29,6 +29,8 @@ std::string_view resource_kind_name(ResourceKind kind) noexcept {
             return "pipeline";
         case ResourceKind::Fence:
             return "fence";
+        case ResourceKind::DepthStencil:
+            return "depth-stencil state";
     }
     return "?";
 }
