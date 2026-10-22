@@ -12,8 +12,9 @@
 // drawn into render target 0's surface -- the one a clear of the same buffer
 // made -- with the viewport and scissor, the attribute buffers bound from
 // guest memory and their fetch constants, the pipeline built once, an
-// indexed draw's indices converted to the host's order once; what is not
-// drawn yet refused by name, and nothing drawn without a GPU.
+// indexed draw's indices converted to the host's order once, the blending
+// and culling GX2's colour and polygon calls set; what is not drawn yet
+// refused by name, and nothing drawn without a GPU.
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/cpu/state.hpp>
@@ -649,6 +650,41 @@ TEST_CASE_METHOD(GpuDrawFixture,
     run_gpu();
     CHECK(os.gpu.draw_stats().drawn == 2);
     CHECK(os.gpu.index_cache()->stats().hits == 1);
+    CHECK(backend.rejected() == 0);
+}
+
+TEST_CASE_METHOD(GpuDrawFixture,
+                 "a draw is blended and culled as GX2's colour and polygon calls say",
+                 "[hle][gx2][draw][gpu]") {
+    // WHB's alpha blending on target 0, the constant colour, and back faces
+    // culled with clockwise in front.
+    call("GX2SetColorControl", {0xCC, 0x1, 0, 1});
+    call("GX2SetBlendControl", {0, 4, 5, 0, 0, 0, 0, 0}); // SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ADD
+    call("GX2SetBlendConstantColor", {}, {0.25F, 0.5F, 0.75F, 1.0F});
+    call("GX2SetCullOnlyControl", {1, 0, 1});
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+
+    CHECK(os.gpu.draw_stats().drawn == 1);
+    CHECK(backend.recorded("attachment 0: blend on rgb 4*5 op 0 alpha 4*5 op 0 mask 0xf"));
+    CHECK(backend.recorded("set_cull_mode back"));
+    CHECK(backend.recorded("set_front_facing cw"));
+    CHECK(backend.recorded("set_blend_color 0.25 0.5 0.75 1"));
+
+    // Both faces culled: there is nothing to draw, and nothing is encoded.
+    backend.clear_events();
+    call("GX2SetCullOnlyControl", {0, 1, 1});
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    CHECK(os.gpu.draw_stats().empty == 1);
+    CHECK_FALSE(backend.recorded("draw vertices"));
+
+    // A logic op is refused by name.
+    call("GX2SetCullOnlyControl", {0, 0, 0});
+    call("GX2SetColorControl", {0x66, 0x0, 0, 1});
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    CHECK(os.gpu.problems().contains("a draw's blending: logic op (ROP3 0x66) is not drawn yet"));
     CHECK(backend.rejected() == 0);
 }
 

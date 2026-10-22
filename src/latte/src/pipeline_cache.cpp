@@ -22,6 +22,7 @@ gpu::PipelineHandle PipelineCache::pipeline(const PipelineKey& key, std::string&
     desc.fragment_entry = std::string{msl::fragment_entry};
     desc.primitive = key.primitive;
     desc.color_formats[0] = key.color_format;
+    desc.blend[0] = key.blend;
     desc.color_count = 1;
 
     Entry entry;

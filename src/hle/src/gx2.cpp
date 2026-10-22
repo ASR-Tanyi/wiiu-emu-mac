@@ -505,6 +505,22 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
         return false;
     }
 
+    // How it is written and rasterized (draw_state.hpp).
+    const std::optional<gpu::BlendState> blend = latte::blend_state(registers, 0, error);
+    if (!blend.has_value()) {
+        problem = "a draw's blending: " + error;
+        return false;
+    }
+    const std::optional<latte::RasterState> raster = latte::raster_state(registers, error);
+    if (!raster.has_value()) {
+        problem = "a draw's rasterizer state: " + error;
+        return false;
+    }
+    if (raster->cull_all && (*primitive == gpu::PrimitiveType::Triangles ||
+                             *primitive == gpu::PrimitiveType::TriangleStrip)) {
+        return false; // every face culled: nothing to draw
+    }
+
     latte::DrawShaders shaders;
     if (!latte::build_draw_shaders(registers, *memory_, shaders, error)) {
         problem = "a draw's shaders: " + error;
@@ -514,7 +530,8 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
         pipelines_->pipeline(latte::PipelineKey{.vertex_msl = shaders.vertex_msl,
                                                 .pixel_msl = shaders.pixel_msl,
                                                 .color_format = surface->format,
-                                                .primitive = *primitive},
+                                                .primitive = *primitive,
+                                                .blend = *blend},
                              error);
     if (!pipeline.valid()) {
         problem = "a draw's pipeline did not build: " + error;
@@ -561,6 +578,11 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
     backend_->set_pipeline(pipeline);
     backend_->set_viewport(latte::viewport(registers));
     backend_->set_scissor(*scissor);
+    backend_->set_cull_mode(raster->cull);
+    backend_->set_front_facing(raster->front);
+    if (blend->enabled) {
+        backend_->set_blend_color(latte::blend_color(registers));
+    }
     latte::bind_vertex_inputs(*backend_, inputs);
     gpu::DrawCall call;
     if (indices.has_value()) {

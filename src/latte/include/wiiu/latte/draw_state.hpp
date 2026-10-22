@@ -17,6 +17,27 @@
 // GX2SetScissor writes, cut to the render target: Metal refuses a scissor
 // that leaves it. One that leaves nothing draws nothing.
 //
+// **Blending** is target n's CB_BLENDn_CONTROL, when CB_COLOR_CONTROL's
+// blend-enable bit n is set -- each target's own register, whatever
+// PER_MRT_BLEND says, as GX2 writes them and Cemu reads them. The factors and
+// combine functions are decaf's and Cemu's (which agree) mapped to Metal's
+// as Cemu's Metal renderer maps them, but for D3D9's two "both" factors,
+// which Cemu leaves as zero: BOTH_SRC_ALPHA as the source factor means
+// source alpha for the source and one less it for the destination, and
+// BOTH_INV_SRC_ALPHA the other way about -- D3D9's definition. Without
+// SEPARATE_ALPHA_BLEND alpha blends as colour does. The channels written are
+// target n's nibble of CB_TARGET_MASK, none when CB_COLOR_CONTROL's special
+// op turns colour writes off. Refused: a ROP3 other than a plain copy (Metal
+// pipelines have no logic ops), the other special ops, and numbers Latte
+// has no factor or function for.
+//
+// **Culling** is PA_SU_SC_MODE_CNTL's: the culled faces and the winding of
+// the front, handed to Metal as they are (Cemu's choice; the Metal tests
+// report which way Metal judges winding). Both faces culled culls every
+// polygon, which Metal's cull mode cannot say, so a draw of triangles is not
+// encoded at all. Polygon mode -- drawing triangles as points or lines -- is
+// refused for now.
+//
 // **Primitives** map where Metal has them. Fans, loops, polygons, quad strips
 // and the adjacency types need their indices rewritten, which is not done
 // yet; quads and RECTS map to the backend's own names for them, which only
@@ -28,6 +49,7 @@
 #include <wiiu/latte/registers.hpp>
 
 #include <optional>
+#include <string>
 
 namespace wiiu::latte {
 
@@ -42,5 +64,24 @@ namespace wiiu::latte {
 /// if that leaves nothing.
 [[nodiscard]] std::optional<gpu::Rect>
 scissor(const RegisterFile& registers, u32 width, u32 height) noexcept;
+
+/// How render target `target` is written. Nothing, with `error` saying
+/// what, for state not expressed yet.
+[[nodiscard]] std::optional<gpu::BlendState>
+blend_state(const RegisterFile& registers, u32 target, std::string& error);
+
+/// CB_BLEND_RED to _ALPHA: the colour the constant factors read.
+[[nodiscard]] gpu::ClearColor blend_color(const RegisterFile& registers) noexcept;
+
+/// The rasterizer's face state.
+struct RasterState {
+    gpu::CullMode cull = gpu::CullMode::None;
+    gpu::Winding front = gpu::Winding::CounterClockwise;
+    bool cull_all = false; ///< both faces: no polygon is drawn
+};
+
+/// PA_SU_SC_MODE_CNTL's culling. Nothing, with `error`, for polygon mode.
+[[nodiscard]] std::optional<RasterState> raster_state(const RegisterFile& registers,
+                                                      std::string& error);
 
 } // namespace wiiu::latte

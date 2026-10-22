@@ -1201,8 +1201,17 @@ TEST_CASE("decaf's example triangle, drawn through GX2's own calls", "[gpu][meta
         // either way GX2 has: auto-indexed, or from indices in the title's
         // byte order, which are converted for Metal (latte/index_cache.hpp).
         call("GX2ClearColor", {kBuffer}, {0.0F, 0.0F, 1.0F, 1.0F});
+        std::array<u8, 4> green{0, 255, 0, 255};
         SECTION("auto-indexed") {
             call("GX2DrawEx", {4, 3, 0, 1});
+        }
+        SECTION("blended, as GX2SetBlendControl says") {
+            // 40% green over the blue: alpha blending on target 0.
+            put_floats(kColours, {0, 1, 0, 0.4F, 0, 1, 0, 0.4F, 0, 1, 0, 0.4F});
+            call("GX2SetColorControl", {0xCC, 0x1, 0, 1});
+            call("GX2SetBlendControl", {0, 4, 5, 0, 0, 0, 0, 0});
+            call("GX2DrawEx", {4, 3, 0, 1});
+            green = {0, 102, 153, 194}; // alpha: 0.4 * 0.4 + 0.6
         }
         SECTION("from GX2's big-endian 16-bit indices") {
             constexpr ppcaddr_t kIndices = 0x10040200;
@@ -1231,14 +1240,26 @@ TEST_CASE("decaf's example triangle, drawn through GX2's own calls", "[gpu][meta
             const std::size_t at = ((std::size_t{y} * 1280) + x) * 4;
             return std::array<u8, 4>{pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]};
         };
-        constexpr std::array<u8, 4> green{0, 255, 0, 255};
         constexpr std::array<u8, 4> blue{0, 0, 255, 255};
+        // Within a step: blending rounds as the hardware likes.
+        const auto near = [](const std::array<u8, 4>& a, const std::array<u8, 4>& b) {
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                if ((a[i] > b[i] ? a[i] - b[i] : b[i] - a[i]) > 1) {
+                    return false;
+                }
+            }
+            return true;
+        };
         // Clip space's -1 is the bottom of the viewport, so the lower-left
         // half is green; the rest is the clear. (Points well away from the
         // diagonal, where x + y in clip space is zero.)
-        CHECK(rgba(10, 709) == green);
-        CHECK(rgba(10, 360) == green);
-        CHECK(rgba(600, 600) == green);
+        for (const auto& [x, y] :
+             {std::pair{10U, 709U}, std::pair{10U, 360U}, std::pair{600U, 600U}}) {
+            const std::array<u8, 4> pixel = rgba(x, y);
+            INFO("(" << x << ", " << y << ") is " << int{pixel[0]} << " " << int{pixel[1]} << " "
+                     << int{pixel[2]} << " " << int{pixel[3]});
+            CHECK(near(pixel, green));
+        }
         CHECK(rgba(1269, 10) == blue);
         CHECK(rgba(900, 100) == blue);
         CHECK(rgba(700, 300) == blue);
