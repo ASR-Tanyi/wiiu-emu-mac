@@ -8,24 +8,35 @@
 // address, and the initiator's tessellation mode; the predicate bit on the
 // draw packet (Cemu's); the Ex2 forms putting the base instance back; and
 // the calls refusing an index type that is not one, or indices the GPU
-// cannot see.
+// cannot see. And with a GPU attached, the draw itself (8.11, ADR-006):
+// drawn into render target 0's surface -- the one a clear of the same buffer
+// made -- with the viewport and scissor, the attribute buffers bound from
+// guest memory and their fetch constants, the pipeline built once; what is
+// not drawn yet refused by name, and nothing drawn without a GPU.
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/cpu/state.hpp>
+#include <wiiu/gpu/null_backend.hpp>
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/gx2.hpp>
 #include <wiiu/hle/gx2_draw.hpp>
 #include <wiiu/hle/gx2_fetch_shader.hpp>
 #include <wiiu/hle/gx2_shader.hpp>
+#include <wiiu/hle/gx2_surface.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/command_processor.hpp>
 #include <wiiu/latte/draw.hpp>
 #include <wiiu/latte/draw_shaders.hpp>
+#include <wiiu/latte/msl.hpp>
 #include <wiiu/latte/pm4.hpp>
+#include <wiiu/latte/surface_cache.hpp>
 #include <wiiu/memory/map.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <bit>
+#include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <string>
@@ -201,7 +212,9 @@ struct DrawFixture {
     coreinit::Context os;
     std::vector<SeenDraw> draws;
 
-    DrawFixture() {
+    /// With `watch_draws`, draws come here instead of to GX2's own
+    /// listener, which draws them on the GPU when one is attached.
+    explicit DrawFixture(bool watch_draws = true) {
         std::string error;
         REQUIRE(memory.initialize(memory::default_regions(), error));
         wiiu::log::set_all_levels(wiiu::log::Level::Off);
@@ -211,17 +224,22 @@ struct DrawFixture {
         state.timebase = 10'000;
         static_cast<void>(os.scheduler.adopt_main(state, kMain));
         call("GX2Init", {0});
-        os.gpu.processor().set_draw_listener(
-            [this](const DrawCommand& command, const latte::RegisterFile& file) {
-                draws.push_back(seen(command, file));
-            });
+        if (watch_draws) {
+            os.gpu.processor().set_draw_listener(
+                [this](const DrawCommand& command, const latte::RegisterFile& file) {
+                    draws.push_back(seen(command, file));
+                });
+        }
     }
 
-    u32 call(std::string_view name, std::vector<u32> arguments) {
+    u32 call(std::string_view name, std::vector<u32> arguments, std::vector<f32> floats = {}) {
         Function* const function = registry.find("gx2", name);
         REQUIRE(function != nullptr);
         for (std::size_t i = 0; i < arguments.size(); ++i) {
             state.gpr[3 + i] = arguments[i];
+        }
+        for (std::size_t i = 0; i < floats.size(); ++i) {
+            state.fpr[1 + i].ps0 = static_cast<f64>(floats[i]);
         }
         Call context{.state = state, .memory = memory};
         function->handler(context);
@@ -336,11 +354,9 @@ void put_program(memory::Memory& memory, ppcaddr_t address, const std::vector<u3
     REQUIRE(memory.write_bytes(address, bytes));
 }
 
-} // namespace
-
-TEST_CASE_METHOD(DrawFixture,
-                 "decaf's example triangle, from GX2's calls to MSL at the draw",
-                 "[hle][gx2][draw][translator]") {
+/// decaf's example triangle's shaders, bound through GX2's own calls.
+void bind_example_shaders(DrawFixture& f) {
+    memory::Memory& memory = f.memory;
     // The fetch shader, from GX2's own generator: aColour at location 0 from
     // buffer 0, aPosition at 1 from buffer 1, four floats each.
     gx2::AttribStream colour{};
@@ -354,8 +370,8 @@ TEST_CASE_METHOD(DrawFixture,
     position.buffer = 1;
     REQUIRE(gx2::write_guest(memory, kAttribs, colour));
     REQUIRE(gx2::write_guest(memory, kAttribs + sizeof(gx2::AttribStream), position));
-    call("GX2InitFetchShaderEx", {kFetchStruct, kFetchProgram, 2, kAttribs, 0, 0});
-    call("GX2SetFetchShader", {kFetchStruct});
+    f.call("GX2InitFetchShaderEx", {kFetchStruct, kFetchProgram, 2, kAttribs, 0, 0});
+    f.call("GX2SetFetchShader", {kFetchStruct});
 
     // decaf's example vertex and pixel shaders (latte-assembler's
     // resources): their programs, and their headers' register values.
@@ -379,7 +395,7 @@ TEST_CASE_METHOD(DrawFixture,
     vs.size = 24;
     vs.data = kVertexProgram;
     REQUIRE(gx2::write_guest(memory, kVertexStruct, vs));
-    call("GX2SetVertexShader", {kVertexStruct});
+    f.call("GX2SetVertexShader", {kVertexStruct});
 
     put_program(memory, kPixelProgram, {0, xyzw | (0x28U << 23) | (1U << 31) | (1U << 21)});
     gx2::PixelShader ps{};
@@ -391,7 +407,15 @@ TEST_CASE_METHOD(DrawFixture,
     ps.size = 8;
     ps.data = kPixelProgram;
     REQUIRE(gx2::write_guest(memory, kPixelStruct, ps));
-    call("GX2SetPixelShader", {kPixelStruct});
+    f.call("GX2SetPixelShader", {kPixelStruct});
+}
+
+} // namespace
+
+TEST_CASE_METHOD(DrawFixture,
+                 "decaf's example triangle, from GX2's calls to MSL at the draw",
+                 "[hle][gx2][draw][translator]") {
+    bind_example_shaders(*this);
 
     // The translator runs at the draw, with the registers as they stand.
     bool built = false;
@@ -467,4 +491,151 @@ TEST_CASE_METHOD(DrawFixture,
     CHECK_FALSE(built);
     CHECK(error.find("the vertex shader at physical") != std::string::npos);
     CHECK(error.find("ALU clauses") != std::string::npos);
+}
+
+// --------------------------------------------------------------------------
+// Drawn on the GPU (8.11, ADR-006)
+// --------------------------------------------------------------------------
+
+namespace {
+
+constexpr ppcaddr_t kColorBuffer = 0x10030000;
+constexpr ppcaddr_t kColorImage = 0x10100000;
+constexpr ppcaddr_t kColours = 0x10040000;
+constexpr ppcaddr_t kPositions = 0x10040100;
+
+/// Floats as a title writes them: big-endian.
+void put_floats(memory::Memory& memory, ppcaddr_t address, std::initializer_list<f32> values) {
+    for (const f32 value : values) {
+        memory.write<u32>(address, std::bit_cast<u32>(value));
+        address += 4;
+    }
+}
+
+/// decaf's example frame, with a GPU attached: a 64x64 colour buffer at
+/// render target 0 and the viewport and scissor over it, the example's
+/// shaders, and its triangle -- green, over the lower-left half -- in two
+/// attribute buffers.
+struct GpuDrawFixture : DrawFixture {
+    gpu::NullBackend backend;
+
+    GpuDrawFixture() : DrawFixture(false) {
+        std::string error;
+        REQUIRE(backend.initialize(error));
+        os.gpu.attach_backend(&backend);
+
+        gx2::ColorBuffer buffer{};
+        buffer.surface.dim = 1;
+        buffer.surface.width = 64;
+        buffer.surface.height = 64;
+        buffer.surface.depth = 1;
+        buffer.surface.mip_levels = 1;
+        buffer.surface.format = 0x01A;
+        buffer.surface.use = gx2::surface_use_texture | gx2::surface_use_color_buffer;
+        buffer.view_num_slices = 1;
+        REQUIRE(gx2::calc_surface_size_and_alignment(buffer.surface));
+        buffer.surface.image = kColorImage;
+        const std::optional<gx2::ColorBufferRegisters> registers =
+            gx2::color_buffer_registers(buffer);
+        REQUIRE(registers.has_value());
+        buffer.cb_color_size = registers->size;
+        buffer.cb_color_info = registers->info;
+        buffer.cb_color_view = registers->view;
+        REQUIRE(gx2::write_guest(memory, kColorBuffer, buffer));
+        call("GX2SetColorBuffer", {kColorBuffer, 0});
+        call("GX2SetViewport", {}, {0.0F, 0.0F, 64.0F, 64.0F, 0.0F, 1.0F});
+        call("GX2SetScissor", {0, 0, 64, 64});
+
+        bind_example_shaders(*this);
+        put_floats(memory, kColours, {0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1});
+        put_floats(memory, kPositions, {-1, -1, 0, 1, 1, -1, 0, 1, -1, 1, 0, 1});
+        call("GX2SetAttribBuffer", {0, 48, 16, kColours});
+        call("GX2SetAttribBuffer", {1, 48, 16, kPositions});
+    }
+
+    ~GpuDrawFixture() {
+        // What the GPU holds goes back to the backend before it goes.
+        os.gpu.attach_backend(nullptr);
+    }
+
+    GpuDrawFixture(const GpuDrawFixture&) = delete;
+    GpuDrawFixture& operator=(const GpuDrawFixture&) = delete;
+};
+
+} // namespace
+
+TEST_CASE_METHOD(GpuDrawFixture,
+                 "with a GPU attached, a draw is drawn into render target 0's surface",
+                 "[hle][gx2][draw][gpu]") {
+    call("GX2ClearColor", {kColorBuffer}, {0.0F, 0.0F, 1.0F, 1.0F});
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+
+    INFO(backend.events().size() << " events");
+    CHECK(os.gpu.draw_stats().drawn == 1);
+    CHECK(os.gpu.draw_stats().refused == 0);
+    // Into the surface the clear made, on top of the clear.
+    const std::optional<latte::ColorSurface> surface =
+        os.gpu.surfaces()->find(latte::ColorBufferKey::from(os.gpu.registers(), 0));
+    REQUIRE(surface.has_value());
+    CHECK(os.gpu.surfaces()->size() == 1);
+    CHECK(backend.last_render_pass().colors[0].texture == surface->texture);
+    CHECK(backend.recorded("begin_render_pass 'draw' colors=1 [0:load/store]"));
+    CHECK(backend.recorded("set_viewport 64x64 at (0,0)"));
+    CHECK(backend.recorded("set_scissor 64x64 at (0,0)"));
+    CHECK(backend.recorded("bind_buffer vertex [1] = "));
+    CHECK(backend.recorded("bind_buffer vertex [2] = "));
+    CHECK(backend.recorded("draw vertices 3 instances=1"));
+
+    // The fetch constants: both buffers' strides and sizes.
+    latte::msl::FetchConstants constants{};
+    REQUIRE(backend.last_bytes().size() == sizeof(constants));
+    std::memcpy(&constants, backend.last_bytes().data(), sizeof(constants));
+    CHECK(constants.stride[0] == 16);
+    CHECK(constants.size[0] == 48);
+    CHECK(constants.stride[1] == 16);
+    CHECK(constants.size[1] == 48);
+
+    // Guest memory is not where the picture is.
+    CHECK(memory.read<u32>(kColorImage) == 0);
+
+    // The next frame's draw finds its pipeline.
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    CHECK(os.gpu.draw_stats().drawn == 2);
+    CHECK(os.gpu.pipelines()->stats().builds == 1);
+    CHECK(os.gpu.pipelines()->stats().hits == 1);
+    CHECK(backend.rejected() == 0);
+}
+
+TEST_CASE_METHOD(GpuDrawFixture,
+                 "a draw the GPU does not do yet is refused, and nothing is encoded",
+                 "[hle][gx2][draw][gpu]") {
+    call("GX2DrawIndexedEx", {4, 3, 4, kIndices, 0, 1}); // indices want swapping
+    call("GX2DrawEx", {5, 3, 0, 1});                     // a fan
+    run_gpu();
+    CHECK(os.gpu.draw_stats().refused == 2);
+    CHECK(os.gpu.problems().contains(
+        "an indexed draw is not drawn yet: its indices want swapping first"));
+    CHECK(os.gpu.problems().contains("a draw of primitive type 0x5 is not drawn yet"));
+
+    // A scissor that leaves the target draws nothing, and is not a problem.
+    call("GX2SetScissor", {100, 100, 10, 10});
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    CHECK(os.gpu.draw_stats().empty == 1);
+
+    CHECK(os.gpu.draw_stats().drawn == 0);
+    CHECK_FALSE(backend.recorded("draw vertices"));
+    CHECK(backend.rejected() == 0);
+}
+
+TEST_CASE("without a GPU nothing draws", "[hle][gx2][draw][gpu]") {
+    DrawFixture f(false);
+    bind_example_shaders(f);
+    f.call("GX2DrawEx", {4, 3, 0, 1});
+    f.run_gpu();
+    CHECK(f.os.gpu.draw_stats().drawn == 0);
+    CHECK(f.os.gpu.draw_stats().refused == 0);
+    CHECK(f.os.gpu.pipelines() == nullptr);
 }

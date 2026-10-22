@@ -8,7 +8,11 @@
 #include <wiiu/hle/gx2_state.hpp>
 #include <wiiu/hle/gx2_surface.hpp>
 #include <wiiu/hle/registry.hpp>
+#include <wiiu/latte/draw.hpp>
+#include <wiiu/latte/draw_shaders.hpp>
+#include <wiiu/latte/draw_state.hpp>
 #include <wiiu/latte/pm4.hpp>
+#include <wiiu/latte/vertex_inputs.hpp>
 #include <wiiu/memory/map.hpp>
 
 #include <fmt/format.h>
@@ -102,9 +106,16 @@ Gpu::Gpu()
     : registers_(std::make_unique<latte::RegisterFile>()), processor_(*registers_),
       timeline_(processor_) {
     processor_.set_hle_listener([this](const latte::pm4::Packet& packet) { run_hle(packet); });
+    processor_.set_draw_listener(
+        [this](const latte::DrawCommand& draw, const latte::RegisterFile& registers) {
+            run_draw(draw, registers);
+        });
 }
 
 void Gpu::initialize(memory::Memory& memory, u32 main_core, const InitAttributes& attributes) {
+    if (memory_ != &memory) {
+        guest_buffers_.reset(); // windows onto the memory there was
+    }
     memory_ = &memory;
     processor_.set_memory(&memory);
     main_core_ = main_core;
@@ -315,12 +326,15 @@ void Gpu::attach_backend(gpu::GpuBackend* backend) {
     // Destroyed on the backend that made them, before it is let go.
     release_scan_textures();
     copier_.shutdown();
+    guest_buffers_.reset();
+    pipelines_.reset();
     surfaces_.reset();
     backend_ = backend;
     if (backend_ == nullptr) {
         return;
     }
     surfaces_ = std::make_unique<latte::SurfaceCache>(*backend_);
+    pipelines_ = std::make_unique<latte::PipelineCache>(*backend_);
     std::string error;
     if (!copier_.initialize(*backend_, error)) {
         // Clears still run on the GPU; copies of what they made cannot, and
@@ -334,6 +348,10 @@ void Gpu::reset() {
     if (surfaces_ != nullptr) {
         surfaces_->clear();
     }
+    // Pipelines hold nothing of the title's and stay; windows onto its
+    // memory do not.
+    guest_buffers_.reset();
+    draw_stats_ = {};
     registers_->reset();
     processor_.reset_state();
     timeline_ = latte::GpuTimeline{processor_, timeline_.latency()};
@@ -439,6 +457,103 @@ void Gpu::run_hle(const latte::pm4::Packet& packet) {
                 fmt::format("an emulator packet {:#04x} GX2 does not write", packet.header.opcode));
             return;
     }
+}
+
+void Gpu::run_draw(const latte::DrawCommand& draw, const latte::RegisterFile& registers) {
+    if (backend_ == nullptr || memory_ == nullptr) {
+        // Without a GPU nothing draws: guest memory has no rasteriser.
+        return;
+    }
+    std::string problem;
+    if (draw_on_gpu(draw, registers, problem)) {
+        ++draw_stats_.drawn;
+    } else if (problem.empty()) {
+        ++draw_stats_.empty;
+    } else {
+        ++draw_stats_.refused;
+        report(problem);
+    }
+}
+
+bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
+                      const latte::RegisterFile& registers,
+                      std::string& problem) {
+    if (draw.kind != latte::DrawCommand::Kind::Auto) {
+        // GX2's indices are big-endian, and Metal's index fetch has no swap.
+        problem = "an indexed draw is not drawn yet: its indices want swapping first";
+        return false;
+    }
+    if (draw.count == 0 || draw.instances == 0) {
+        return false;
+    }
+    const std::optional<gpu::PrimitiveType> primitive = latte::primitive_type(draw.primitive);
+    if (!primitive.has_value() || gpu::needs_primitive_emulation(*primitive)) {
+        problem = fmt::format("a draw of primitive type {:#x} is not drawn yet", draw.primitive);
+        return false;
+    }
+
+    // Render target 0, as GX2SetColorBuffer left it: the surface a clear of
+    // the same buffer made, or a new one.
+    std::string error;
+    const std::optional<latte::ColorSurface> surface =
+        surfaces_->color_buffer(latte::ColorBufferKey::from(registers, 0), error);
+    if (!surface.has_value()) {
+        problem = "a draw into render target 0: " + error;
+        return false;
+    }
+
+    latte::DrawShaders shaders;
+    if (!latte::build_draw_shaders(registers, *memory_, shaders, error)) {
+        problem = "a draw's shaders: " + error;
+        return false;
+    }
+    const gpu::PipelineHandle pipeline =
+        pipelines_->pipeline(latte::PipelineKey{.vertex_msl = shaders.vertex_msl,
+                                                .pixel_msl = shaders.pixel_msl,
+                                                .color_format = surface->format,
+                                                .primitive = *primitive},
+                             error);
+    if (!pipeline.valid()) {
+        problem = "a draw's pipeline did not build: " + error;
+        return false;
+    }
+
+    if (guest_buffers_ == nullptr) {
+        guest_buffers_ = std::make_unique<latte::GuestBuffers>(*backend_, *memory_);
+    }
+    latte::VertexInputs inputs;
+    if (!latte::vertex_inputs(registers, shaders.vertex_ir, *guest_buffers_, inputs, error)) {
+        problem = "a draw's vertices: " + error;
+        return false;
+    }
+    const std::optional<gpu::Rect> scissor =
+        latte::scissor(registers, surface->width, surface->height);
+    if (!scissor.has_value()) {
+        return false;
+    }
+
+    gpu::RenderPassDesc pass;
+    pass.label = "draw";
+    pass.color_count = 1;
+    pass.colors[0].texture = surface->texture;
+    pass.colors[0].load = gpu::LoadAction::Load;
+    pass.colors[0].store = gpu::StoreAction::Store;
+    if (!backend_->begin_render_pass(pass)) {
+        problem = "the backend refused a draw's render pass";
+        return false;
+    }
+    backend_->set_pipeline(pipeline);
+    backend_->set_viewport(latte::viewport(registers));
+    backend_->set_scissor(*scissor);
+    latte::bind_vertex_inputs(*backend_, inputs);
+    gpu::DrawCall call;
+    call.vertex_count = draw.count;
+    call.instance_count = draw.instances;
+    call.first_vertex = registers.read(latte::reg::sq_vtx_base_vtx_loc);
+    call.first_instance = registers.read(latte::reg::sq_vtx_start_inst_loc);
+    backend_->draw(call);
+    backend_->end_render_pass();
+    return true;
 }
 
 bool Gpu::copy_on_gpu(ScanTarget target, u32 index, const ColorBuffer& buffer) {

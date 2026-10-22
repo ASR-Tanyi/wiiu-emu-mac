@@ -42,10 +42,11 @@
 //
 // With a host GPU attached (`Gpu::attach_backend`), what the GPU draws stays
 // on it (ADR-006): the surfaces it renders to live in a surface cache as
-// textures, and the work on them is done there -- the clear, and the scan-out
+// textures, and the work on them is done there -- the clear, the scan-out
 // copy of a surface the GPU holds, which fills a scan frame's texture rather
-// than its bytes; a flip then hands the frontend that texture. Without one,
-// as in most tests, all of it is done on guest memory, on the CPU.
+// than its bytes (a flip then hands the frontend that texture), and draws,
+// into render target 0's surface. Without one, as in most tests, the clear
+// and the copy are done on guest memory, on the CPU, and nothing draws.
 //
 // What is not here yet: swap interval 0's flip-without-waiting (it waits for
 // vsync like 1), the overrun callback a full display list asks for, and the
@@ -55,6 +56,8 @@
 #include <wiiu/common/types.hpp>
 #include <wiiu/gpu/backend.hpp>
 #include <wiiu/latte/command_processor.hpp>
+#include <wiiu/latte/guest_buffers.hpp>
+#include <wiiu/latte/pipeline_cache.hpp>
 #include <wiiu/latte/pm4.hpp>
 #include <wiiu/latte/registers.hpp>
 #include <wiiu/latte/surface_cache.hpp>
@@ -302,6 +305,13 @@ struct SwapStatus {
     [[nodiscard]] u32 pending() const noexcept { return swaps - flips; }
 };
 
+/// What became of the draws the GPU reached with a host GPU attached.
+struct DrawStats {
+    u64 drawn = 0;
+    u64 refused = 0; ///< something about them is not drawn yet; said once each
+    u64 empty = 0;   ///< nothing to draw: no vertices, or a scissor outside the target
+};
+
 /// The GPU as GX2 sees it: the buffers being written, the timeline they go
 /// to, and the register file and command processor behind that.
 class Gpu {
@@ -437,6 +447,18 @@ public:
 
     [[nodiscard]] const latte::SurfaceCache* surfaces() const noexcept { return surfaces_.get(); }
 
+    /// The pipelines draws have been made with, or none without a backend.
+    [[nodiscard]] const latte::PipelineCache* pipelines() const noexcept {
+        return pipelines_.get();
+    }
+
+    [[nodiscard]] const DrawStats& draw_stats() const noexcept { return draw_stats_; }
+
+    /// Every problem the GPU's work has run into, each once, as logged --
+    /// a refused draw, a copy that could not be done. For the tests, and
+    /// for a bug report.
+    [[nodiscard]] const std::set<std::string>& problems() const noexcept { return reported_; }
+
     /// What frame `flip_index` of `target` holds, as a texture, when the copy
     /// that last filled it ran on the GPU -- then that texture, not the
     /// frame's bytes in guest memory, is what a flip of it shows. None when
@@ -459,6 +481,15 @@ private:
     /// Log a problem with a packet the first time it is seen: a copy that
     /// cannot be done fails the same way every frame.
     void report(const std::string& problem);
+
+    /// A draw packet as it runs: drawn on the GPU when there is one.
+    void run_draw(const latte::DrawCommand& draw, const latte::RegisterFile& registers);
+
+    /// The draw itself. False, with `problem` saying what is not drawn yet,
+    /// or with it empty when there was nothing to draw.
+    bool draw_on_gpu(const latte::DrawCommand& draw,
+                     const latte::RegisterFile& registers,
+                     std::string& problem);
 
     /// A scan-out copy into frame `index` of `target`, on the GPU, if the GPU
     /// holds the colour buffer's surface. False if it does not, and the copy
@@ -510,6 +541,9 @@ private:
     gpu::GpuBackend* backend_ = nullptr;
     std::unique_ptr<latte::SurfaceCache> surfaces_;
     latte::SurfaceCopier copier_;
+    std::unique_ptr<latte::PipelineCache> pipelines_;
+    std::unique_ptr<latte::GuestBuffers> guest_buffers_; ///< made at the first draw
+    DrawStats draw_stats_;
     std::array<ScanTextures, scan_target_count> scan_textures_{};
     std::vector<gpu::TextureHandle> retired_textures_;
 

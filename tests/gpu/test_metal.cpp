@@ -16,6 +16,8 @@
 #include <wiiu/gpu/presenter.hpp>
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/gx2.hpp>
+#include <wiiu/hle/gx2_fetch_shader.hpp>
+#include <wiiu/hle/gx2_shader.hpp>
 #include <wiiu/hle/gx2_surface.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/formats.hpp>
@@ -29,9 +31,11 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <string>
@@ -913,6 +917,203 @@ TEST_CASE("GX2's clear and scan-out copy run on the GPU, and the flip shows them
         CHECK(wrong == 0);
         // Guest memory never saw it.
         CHECK(memory.read<u32>(kTvScan) == 0);
+        CHECK(backend->command_errors() == 0);
+
+        os.gpu.attach_backend(nullptr);
+    }
+    backend->shutdown();
+}
+
+TEST_CASE("decaf's example triangle, drawn through GX2's own calls", "[gpu][metal][gx2][draw]") {
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+    {
+        // The whole road: GX2's calls write PM4, the packets retire on the
+        // guest's clock, the draw's shaders are found and translated, its
+        // vertices read in place from guest memory, and it is drawn on Metal
+        // into the surface a clear made; the scan-out copy takes that to the
+        // TV's frame, and the flip hands the frame over.
+        constexpr ppcaddr_t kBuffer = 0x10005000;
+        constexpr ppcaddr_t kImage = 0x10100000;
+        constexpr ppcaddr_t kTvScan = memory::mem1_base + 0x100000;
+        constexpr u32 kFrameBytes = 1280 * 720 * 4;
+        constexpr ppcaddr_t kFetchStruct = 0x10020000;
+        constexpr ppcaddr_t kFetchProgram = 0x10020100;
+        constexpr ppcaddr_t kAttribs = 0x10020400;
+        constexpr ppcaddr_t kVertexStruct = 0x10021000;
+        constexpr ppcaddr_t kVertexProgram = 0x10021400;
+        constexpr ppcaddr_t kPixelStruct = 0x10022000;
+        constexpr ppcaddr_t kPixelProgram = 0x10022400;
+        constexpr ppcaddr_t kColours = 0x10040000;
+        constexpr ppcaddr_t kPositions = 0x10040100;
+
+        memory::Memory memory;
+        std::string error;
+        REQUIRE(memory.initialize(memory::default_regions(), error));
+        cpu::CoreState state;
+        hle::Registry registry;
+        hle::coreinit::Context os;
+        hle::coreinit::register_all(registry, os);
+        os.memory = &memory;
+        state.core_id = 1;
+        state.timebase = 10'000;
+        static_cast<void>(os.scheduler.adopt_main(state, 0x10001000));
+        std::vector<hle::coreinit::ScreenFlip> shown;
+        os.screens.on_flip = [&shown](const hle::coreinit::ScreenFlip& flip,
+                                      const memory::Memory&) {
+            shown.push_back(flip);
+            return true;
+        };
+        os.gpu.attach_backend(backend.get());
+
+        const auto call =
+            [&](std::string_view name, std::vector<u32> arguments, std::vector<f32> floats = {}) {
+                hle::Function* const function = registry.find("gx2", name);
+                REQUIRE(function != nullptr);
+                for (std::size_t i = 0; i < arguments.size(); ++i) {
+                    state.gpr[3 + i] = arguments[i];
+                }
+                for (std::size_t i = 0; i < floats.size(); ++i) {
+                    state.fpr[1 + i].ps0 = static_cast<f64>(floats[i]);
+                }
+                hle::Call context{.state = state, .memory = memory};
+                function->handler(context);
+            };
+        // Programs as the GPU reads them, little-endian; vertex data as the
+        // title writes it, big-endian.
+        const auto put_program = [&](ppcaddr_t address, std::initializer_list<u32> words) {
+            for (const u32 word : words) {
+                const std::array<u8, 4> bytes{static_cast<u8>(word),
+                                              static_cast<u8>(word >> 8),
+                                              static_cast<u8>(word >> 16),
+                                              static_cast<u8>(word >> 24)};
+                REQUIRE(memory.write_bytes(address, bytes));
+                address += 4;
+            }
+        };
+        const auto put_floats = [&](ppcaddr_t address, std::initializer_list<f32> values) {
+            for (const f32 value : values) {
+                memory.write<u32>(address, std::bit_cast<u32>(value));
+                address += 4;
+            }
+        };
+
+        call("GX2Init", {0});
+        call("GX2SetTVBuffer", {kTvScan, 2 * kFrameBytes, 3, 0x01A, 2}); // 720p, RGBA8, double
+        call("GX2SetTVEnable", {1});
+
+        // WHB's TV colour buffer, bound as render target 0, with the
+        // viewport and scissor over it.
+        hle::gx2::ColorBuffer buffer{};
+        buffer.surface.dim = 1;
+        buffer.surface.width = 1280;
+        buffer.surface.height = 720;
+        buffer.surface.depth = 1;
+        buffer.surface.mip_levels = 1;
+        buffer.surface.format = 0x01A;
+        buffer.surface.use = hle::gx2::surface_use_texture | hle::gx2::surface_use_color_buffer;
+        buffer.view_num_slices = 1;
+        REQUIRE(hle::gx2::calc_surface_size_and_alignment(buffer.surface));
+        buffer.surface.image = kImage;
+        const auto registers = hle::gx2::color_buffer_registers(buffer);
+        REQUIRE(registers.has_value());
+        buffer.cb_color_size = registers->size;
+        buffer.cb_color_info = registers->info;
+        buffer.cb_color_view = registers->view;
+        REQUIRE(hle::gx2::write_guest(memory, kBuffer, buffer));
+        call("GX2SetColorBuffer", {kBuffer, 0});
+        call("GX2SetViewport", {}, {0.0F, 0.0F, 1280.0F, 720.0F, 0.0F, 1.0F});
+        call("GX2SetScissor", {0, 0, 1280, 720});
+
+        // decaf's example shaders (latte-assembler's resources), the fetch
+        // shader from GX2's own generator: colour from buffer 0, position
+        // from buffer 1, four big-endian floats each.
+        hle::gx2::AttribStream colour{};
+        colour.location = 0;
+        colour.buffer = 0;
+        colour.format = 0x813; // GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32
+        colour.mask = 0x00010203;
+        colour.endian_swap = 3;
+        hle::gx2::AttribStream position = colour;
+        position.location = 1;
+        position.buffer = 1;
+        REQUIRE(hle::gx2::write_guest(memory, kAttribs, colour));
+        REQUIRE(hle::gx2::write_guest(memory, kAttribs + sizeof(hle::gx2::AttribStream), position));
+        call("GX2InitFetchShaderEx", {kFetchStruct, kFetchProgram, 2, kAttribs, 0, 0});
+        call("GX2SetFetchShader", {kFetchStruct});
+
+        constexpr u32 xyzw = 0x688;
+        put_program(kVertexProgram,
+                    {0,
+                     0x13U << 23,
+                     60U | (1U << 13) | (2U << 15),
+                     xyzw | (0x28U << 23) | (1U << 31),
+                     (2U << 13) | (1U << 15),
+                     xyzw | (0x28U << 23) | (1U << 21)});
+        hle::gx2::VertexShader vs{};
+        vs.sq_pgm_resources_vs = 3U | (1U << 8);
+        vs.num_spi_vs_out_id = 1;
+        vs.spi_vs_out_id[0] = 0xFFFFFF00;
+        vs.sq_vtx_semantic_clear = 0xFFFFFFFC;
+        vs.num_sq_vtx_semantic = 2;
+        vs.sq_vtx_semantic[0] = 0;
+        vs.sq_vtx_semantic[1] = 1;
+        vs.size = 24;
+        vs.data = kVertexProgram;
+        REQUIRE(hle::gx2::write_guest(memory, kVertexStruct, vs));
+        call("GX2SetVertexShader", {kVertexStruct});
+
+        put_program(kPixelProgram, {0, xyzw | (0x28U << 23) | (1U << 31) | (1U << 21)});
+        hle::gx2::PixelShader ps{};
+        ps.sq_pgm_resources_ps = 1;
+        ps.spi_ps_in_control_0 = 1;
+        ps.num_spi_ps_input_cntl = 1;
+        ps.spi_ps_input_cntls[0] = 0 | (1U << 8);
+        ps.cb_shader_mask = 0xF;
+        ps.size = 8;
+        ps.data = kPixelProgram;
+        REQUIRE(hle::gx2::write_guest(memory, kPixelStruct, ps));
+        call("GX2SetPixelShader", {kPixelStruct});
+
+        // Green, over the lower-left half.
+        put_floats(kColours, {0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1});
+        put_floats(kPositions, {-1, -1, 0, 1, 1, -1, 0, 1, -1, 1, 0, 1});
+        call("GX2SetAttribBuffer", {0, 48, 16, kColours});
+        call("GX2SetAttribBuffer", {1, 48, 16, kPositions});
+
+        // The frame: clear to blue, draw, copy to the TV, swap.
+        call("GX2ClearColor", {kBuffer}, {0.0F, 0.0F, 1.0F, 1.0F});
+        call("GX2DrawEx", {4, 3, 0, 1});
+        call("GX2CopyColorBufferToScanBuffer", {kBuffer, 1});
+        call("GX2SwapScanBuffers", {});
+        call("GX2Flush", {});
+        state.timebase = hle::gx2::vsync_tick(1);
+        static_cast<void>(os.scheduler.reschedule(state));
+
+        for (const std::string& problem : os.gpu.problems()) {
+            UNSCOPED_INFO("GX2: " << problem);
+        }
+        CHECK(os.gpu.draw_stats().drawn == 1);
+        REQUIRE(shown.size() == 1);
+        REQUIRE(shown[0].texture.valid());
+        backend->submit();
+
+        std::vector<u8> pixels(kFrameBytes);
+        REQUIRE(backend->read_texture(shown[0].texture, pixels));
+        const auto rgba = [&pixels](u32 x, u32 y) {
+            const std::size_t at = ((std::size_t{y} * 1280) + x) * 4;
+            return std::array<u8, 4>{pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]};
+        };
+        constexpr std::array<u8, 4> green{0, 255, 0, 255};
+        constexpr std::array<u8, 4> blue{0, 0, 255, 255};
+        // Clip space's -1 is the bottom of the viewport, so the lower-left
+        // half is green; the rest is the clear. (Points well away from the
+        // diagonal, where x + y in clip space is zero.)
+        CHECK(rgba(10, 709) == green);
+        CHECK(rgba(10, 360) == green);
+        CHECK(rgba(600, 600) == green);
+        CHECK(rgba(1269, 10) == blue);
+        CHECK(rgba(900, 100) == blue);
+        CHECK(rgba(700, 300) == blue);
         CHECK(backend->command_errors() == 0);
 
         os.gpu.attach_backend(nullptr);
