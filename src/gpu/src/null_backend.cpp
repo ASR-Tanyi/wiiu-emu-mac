@@ -642,6 +642,18 @@ bool NullBackend::begin_render_pass(const RenderPassDesc& desc) {
                             load_action_name(desc.colors[index].load),
                             store_action_name(desc.colors[index].store));
     }
+    if (desc.depth_stencil.texture.valid()) {
+        const DepthStencilAttachment& depth = desc.depth_stencil;
+        const LoadAction stencil_load =
+            depth.stencil_load == LoadAction::Unspecified ? depth.load : depth.stencil_load;
+        const StoreAction stencil_store =
+            depth.stencil_store == StoreAction::Unspecified ? depth.store : depth.stencil_store;
+        line += fmt::format(" [depth:{}/{} stencil:{}/{}]",
+                            load_action_name(depth.load),
+                            store_action_name(depth.store),
+                            load_action_name(stencil_load),
+                            store_action_name(stencil_store));
+    }
     record(std::move(line));
     return true;
 }

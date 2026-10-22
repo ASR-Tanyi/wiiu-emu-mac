@@ -56,7 +56,9 @@
 // memory first, and nothing goes back: from then on the texture is that
 // surface. `color_buffer_key` is how the clear finds it -- the same key a
 // draw finds the surface by from the registers `GX2SetColorBuffer` wrote.
-// The scan-out copy of a surface the GPU holds is done there too
+// The depth buffer's clear is done there the same way
+// (`clear_depth_stencil_surface`), keyed by `depth_buffer_key`. The scan-out
+// copy of a surface the GPU holds is done there too
 // (`copy_surface_to_scan`), into a texture standing for the scan frame; of
 // one it does not hold, on guest memory, as before.
 #pragma once
@@ -319,6 +321,28 @@ inline constexpr u32 depth_buffer_words = sizeof(DepthBuffer) / 4;
                                        const ColorBuffer& buffer,
                                        const std::array<f32, 4>& rgba,
                                        std::string& problem);
+
+/// The key a depth buffer's surface has in the surface cache: the base
+/// `GX2SetDepthBuffer` writes and the size, info and view registers the
+/// snapshot holds. Nothing, logged, for a level with no memory the GPU can
+/// see.
+[[nodiscard]] std::optional<latte::DepthBufferKey> depth_buffer_key(const memory::Memory& memory,
+                                                                    const DepthBuffer& buffer);
+
+/// What `GX2ClearDepthStencilEx`'s packet does when a host GPU is attached:
+/// the depth buffer's surface, made in `cache` if it is not there yet,
+/// cleared by a render pass -- depth, stencil or both, as `flags` asks, the
+/// other loaded as it was; a surface just made has nothing to keep, and is
+/// cleared whole. False, with `problem` saying why, for a clear the GPU does
+/// not do yet, which the caller does on guest memory instead.
+[[nodiscard]] bool clear_depth_stencil_surface(latte::SurfaceCache& cache,
+                                               gpu::GpuBackend& backend,
+                                               const memory::Memory& memory,
+                                               const DepthBuffer& buffer,
+                                               f32 depth,
+                                               u8 stencil,
+                                               u32 flags,
+                                               std::string& problem);
 
 /// The surface the GPU holds for this colour buffer, if it holds one
 /// (ADR-006): what decides whether a scan-out copy runs on the GPU or on

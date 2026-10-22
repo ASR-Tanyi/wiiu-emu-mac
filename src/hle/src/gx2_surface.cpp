@@ -1038,6 +1038,79 @@ bool clear_color_surface(latte::SurfaceCache& cache,
     return true;
 }
 
+std::optional<latte::DepthBufferKey> depth_buffer_key(const memory::Memory& memory,
+                                                      const DepthBuffer& buffer) {
+    const std::optional<u32> base =
+        base_register(memory, buffer.surface, buffer.view_mip, "a depth buffer");
+    if (!base.has_value()) {
+        return std::nullopt;
+    }
+    return latte::DepthBufferKey::from(
+        *base, buffer.db_depth_size, buffer.db_depth_info, buffer.db_depth_view);
+}
+
+bool clear_depth_stencil_surface(latte::SurfaceCache& cache,
+                                 gpu::GpuBackend& backend,
+                                 const memory::Memory& memory,
+                                 const DepthBuffer& buffer,
+                                 f32 depth,
+                                 u8 stencil,
+                                 u32 flags,
+                                 std::string& problem) {
+    const bool depth_cleared = (flags & clear_depth) != 0;
+    const bool stencil_cleared = (flags & clear_stencil) != 0;
+    if (!depth_cleared && !stencil_cleared) {
+        return true; // nothing asked, here or on guest memory
+    }
+    if (buffer.surface.aa != 0) {
+        problem =
+            "GX2ClearDepthStencilEx: a multisampled depth buffer is cleared on the CPU for now";
+        return false;
+    }
+    if (buffer.view_num_slices != 1) {
+        problem =
+            fmt::format("GX2ClearDepthStencilEx: a clear of {} slices is done on the CPU for now",
+                        buffer.view_num_slices.value());
+        return false;
+    }
+    const std::optional<latte::DepthBufferKey> key = depth_buffer_key(memory, buffer);
+    if (!key.has_value()) {
+        problem = "GX2ClearDepthStencilEx: the depth buffer has no memory the GPU can see";
+        return false;
+    }
+    // A surface made now holds nothing worth loading.
+    const bool fresh = !cache.find(*key).has_value();
+    std::string error;
+    const std::optional<latte::DepthSurface> surface = cache.depth_buffer(*key, error);
+    if (!surface.has_value()) {
+        problem = fmt::format("GX2ClearDepthStencilEx: {}; cleared on the CPU instead", error);
+        return false;
+    }
+
+    gpu::RenderPassDesc pass;
+    pass.label = "GX2ClearDepthStencilEx";
+    pass.color_count = 0;
+    gpu::DepthStencilAttachment& attachment = pass.depth_stencil;
+    attachment.texture = surface->texture;
+    attachment.load = depth_cleared || fresh ? gpu::LoadAction::Clear : gpu::LoadAction::Load;
+    attachment.store = gpu::StoreAction::Store;
+    if (surface->has_stencil) {
+        attachment.stencil_load =
+            stencil_cleared || fresh ? gpu::LoadAction::Clear : gpu::LoadAction::Load;
+        attachment.stencil_store = gpu::StoreAction::Store;
+    }
+    // Metal's depth is [0, 1], as a unorm depth's is; NaN clears to zero, as
+    // the CPU clear has it.
+    attachment.clear_depth = std::isnan(depth) ? 0.0F : std::clamp(depth, 0.0F, 1.0F);
+    attachment.clear_stencil = stencil;
+    if (!backend.begin_render_pass(pass)) {
+        problem = "GX2ClearDepthStencilEx: the backend refused the clear's render pass";
+        return false;
+    }
+    backend.end_render_pass();
+    return true;
+}
+
 std::optional<latte::ColorSurface> held_color_surface(const latte::SurfaceCache& cache,
                                                       const memory::Memory& memory,
                                                       const ColorBuffer& buffer) {

@@ -150,8 +150,17 @@ struct ColorAttachment {
 
 struct DepthStencilAttachment {
     TextureHandle texture;
+
+    /// The depth's actions, and the stencil's unless it has its own.
     LoadAction load = LoadAction::Unspecified;
     StoreAction store = StoreAction::Unspecified;
+
+    /// The stencil's own, where they differ from the depth's -- a clear of
+    /// one and not the other, which GX2ClearDepthStencilEx asks for.
+    /// Unspecified here means "as the depth's", not "unset".
+    LoadAction stencil_load = LoadAction::Unspecified;
+    StoreAction stencil_store = StoreAction::Unspecified;
+
     f32 clear_depth = 1.0F;
     u32 clear_stencil = 0;
 };

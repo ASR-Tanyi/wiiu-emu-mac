@@ -1400,8 +1400,14 @@ bool MetalBackend::begin_render_pass(const RenderPassDesc& desc) {
             MTL::RenderPassStencilAttachmentDescriptor* const attachment =
                 descriptor->stencilAttachment();
             attachment->setTexture(depth);
-            attachment->setLoadAction(to_metal(desc.depth_stencil.load));
-            attachment->setStoreAction(to_metal(desc.depth_stencil.store));
+            // The stencil's own actions where it has them (backend.hpp).
+            const DepthStencilAttachment& actions = desc.depth_stencil;
+            attachment->setLoadAction(to_metal(actions.stencil_load == LoadAction::Unspecified
+                                                   ? actions.load
+                                                   : actions.stencil_load));
+            attachment->setStoreAction(to_metal(actions.stencil_store == StoreAction::Unspecified
+                                                    ? actions.store
+                                                    : actions.stencil_store));
             attachment->setClearStencil(desc.depth_stencil.clear_stencil);
         }
     }

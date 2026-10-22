@@ -111,6 +111,116 @@ std::optional<ColorSurface> SurfaceCache::color_buffer(const ColorBufferKey& key
     return surface;
 }
 
+DepthBufferKey DepthBufferKey::from(u32 base, u32 size, u32 info, u32 view) noexcept {
+    const DbDepthInfo fields{.raw = info};
+    return DepthBufferKey{.base = base,
+                          .size = size,
+                          .format = static_cast<u32>(fields.format.value()),
+                          .array_mode = static_cast<u32>(fields.array_mode.value()),
+                          .slice = DbDepthView{.raw = view}.slice_start};
+}
+
+DepthBufferKey DepthBufferKey::from(const RegisterFile& registers) noexcept {
+    return from(registers.read(reg::db_depth_base),
+                registers.read(reg::db_depth_size),
+                registers.read(reg::db_depth_info),
+                registers.read(reg::db_depth_view));
+}
+
+// DB_DEPTH_SIZE is laid out as CB_COLOR_SIZE is.
+u32 DepthBufferKey::width() const noexcept {
+    return (DbDepthSize{.raw = size}.pitch_tile_max + 1) * 8;
+}
+
+u32 DepthBufferKey::height() const noexcept {
+    const DbDepthSize fields{.raw = size};
+    const u32 pitch_tiles = fields.pitch_tile_max + 1;
+    return ((fields.slice_tile_max + 1) / pitch_tiles) * 8;
+}
+
+bool DepthBufferKey::has_stencil() const noexcept {
+    switch (static_cast<DbFormat>(format)) {
+        case DbFormat::Depth8_24:
+        case DbFormat::Depth8_24Float:
+        case DbFormat::DepthX24_8_32Float:
+            return true;
+        default:
+            return false;
+    }
+}
+
+std::optional<gpu::TextureFormat> depth_texture_format(const DepthBufferKey& key) {
+    switch (static_cast<DbFormat>(key.format)) {
+        case DbFormat::Depth16:
+        case DbFormat::DepthX8_24:
+        case DbFormat::DepthX8_24Float:
+        case DbFormat::Depth32Float:
+            return gpu::TextureFormat::Depth32Float;
+        case DbFormat::Depth8_24:
+        case DbFormat::Depth8_24Float:
+        case DbFormat::DepthX24_8_32Float:
+            return gpu::TextureFormat::Depth32FloatStencil8;
+        case DbFormat::Invalid:
+            break;
+    }
+    return std::nullopt;
+}
+
+std::optional<DepthSurface> SurfaceCache::depth_buffer(const DepthBufferKey& key,
+                                                       std::string& error) {
+    if (const auto found = depths_.find(key); found != depths_.end()) {
+        ++stats_.hits;
+        return found->second;
+    }
+    const std::optional<gpu::TextureFormat> format = depth_texture_format(key);
+    if (!format.has_value()) {
+        ++stats_.refused;
+        error = fmt::format("a depth buffer of depth format {} is not one there is", key.format);
+        return std::nullopt;
+    }
+    const u32 width = key.width();
+    const u32 height = key.height();
+    if (height == 0 || width > max_side || height > max_side) {
+        ++stats_.refused;
+        error = fmt::format("a depth buffer {} by {} pixels (DB_DEPTH_SIZE {:#x}) makes no texture",
+                            width,
+                            height,
+                            key.size);
+        return std::nullopt;
+    }
+
+    gpu::TextureDesc desc;
+    desc.width = width;
+    desc.height = height;
+    desc.format = *format;
+    desc.usage = gpu::TextureUsage::RenderTarget | gpu::TextureUsage::Sampled;
+    desc.storage = gpu::Storage::Private;
+    desc.label = "depth buffer";
+    const gpu::TextureHandle texture = backend_->create_texture(desc);
+    if (!texture.valid()) {
+        ++stats_.refused;
+        error =
+            fmt::format("the backend made no {} by {} texture for a depth buffer", width, height);
+        return std::nullopt;
+    }
+
+    ++stats_.misses;
+    const DepthSurface surface{.texture = texture,
+                               .format = *format,
+                               .width = width,
+                               .height = height,
+                               .has_stencil = key.has_stencil()};
+    depths_.emplace(key, surface);
+    return surface;
+}
+
+std::optional<DepthSurface> SurfaceCache::find(const DepthBufferKey& key) const {
+    if (const auto found = depths_.find(key); found != depths_.end()) {
+        return found->second;
+    }
+    return std::nullopt;
+}
+
 std::optional<ColorSurface> SurfaceCache::find(const ColorBufferKey& key) const {
     if (const auto found = colors_.find(key); found != colors_.end()) {
         return found->second;
@@ -123,6 +233,10 @@ void SurfaceCache::clear() {
         backend_->destroy(surface.texture);
     }
     colors_.clear();
+    for (const auto& [key, surface] : depths_) {
+        backend_->destroy(surface.texture);
+    }
+    depths_.clear();
 }
 
 } // namespace wiiu::latte

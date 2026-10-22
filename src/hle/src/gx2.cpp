@@ -417,6 +417,20 @@ void Gpu::run_hle(const latte::pm4::Packet& packet) {
             }
             const DepthBuffer buffer =
                 depth_buffer_from_words(payload.subspan<3, depth_buffer_words>());
+            if (backend_ != nullptr) {
+                std::string problem;
+                if (clear_depth_stencil_surface(*surfaces_,
+                                                *backend_,
+                                                *memory_,
+                                                buffer,
+                                                std::bit_cast<f32>(payload[1]),
+                                                static_cast<u8>(payload[2]),
+                                                payload[0],
+                                                problem)) {
+                    return;
+                }
+                report(problem);
+            }
             report(clear_depth_stencil_buffer(*memory_,
                                               buffer,
                                               std::bit_cast<f32>(payload[1]),

@@ -3,10 +3,10 @@
 // A Metal pipeline is the two shaders compiled and linked for one colour
 // format, one class of primitive and one way of blending, and compiling is
 // the slow part of a draw by a long way: a title draws with the same few
-// shaders thousands of times a frame. So a pipeline is built the first time a combination is
-// drawn with and found after that -- and so is a failure: a shader the
-// compiler refuses is refused once, with its error kept, rather than
-// compiled again every draw (P5's counters say how often each happens).
+// shaders thousands of times a frame. So a pipeline is built the first time
+// a combination is drawn with and found after that -- and so is a failure: a
+// shader the compiler refuses is refused once, with its error kept, rather
+// than compiled again every draw (P5's counters say how often each happens).
 //
 // The key is the shaders' MSL itself, which is exactly what decides what
 // gets compiled; 8.10 proper will key by a hash of the programs and their

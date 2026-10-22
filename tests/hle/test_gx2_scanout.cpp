@@ -13,8 +13,9 @@
 // with a host GPU attached (ADR-006), the clear done there: the surface
 // made in the cache under the key a draw finds it by, guest memory left
 // alone, sRGB encoded as the CPU clear encodes it, and what the GPU does not
-// do yet still done on the CPU; and the scan-out copy of a surface the GPU
-// holds done there too, into a texture for the frame that the flip hands on.
+// do yet still done on the CPU; the scan-out copy of a surface the GPU holds
+// done there too, into a texture for the frame that the flip hands on; and
+// the depth clear, depth and stencil each cleared or kept as asked.
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/cpu/state.hpp>
@@ -785,4 +786,77 @@ TEST_CASE_METHOD(GpuScanOutFixture,
     os.gpu.attach_backend(nullptr);
     CHECK_FALSE(os.gpu.scan_texture_shown(gx2::ScanTarget::Tv, 0).valid());
     CHECK(backend.live_count(gpu::ResourceKind::Texture) == 0); // all of it given back
+}
+
+TEST_CASE_METHOD(GpuScanOutFixture,
+                 "with a GPU attached, a depth clear makes the depth buffer's surface and clears "
+                 "it there",
+                 "[hle][gx2][scanout][gpu]") {
+    // WHB's depth buffer, D24_S8 as a float: depth and stencil.
+    gx2::DepthBuffer buffer = depth_buffer(1280, 720, 0x811, kDepthImage);
+    const std::optional<gx2::DepthBufferRegisters> registers = gx2::depth_buffer_registers(buffer);
+    REQUIRE(registers.has_value());
+    buffer.db_depth_size = registers->size;
+    buffer.db_depth_view = registers->view;
+    buffer.db_depth_info = registers->info;
+    std::array<u8, sizeof(gx2::DepthBuffer)> bytes{};
+    std::memcpy(bytes.data(), &buffer, sizeof(buffer));
+    REQUIRE(memory.write_bytes(kDepth, bytes));
+    call("GX2SetDepthBuffer", {kDepth});
+
+    // WHB's every frame: depth and stencil.
+    call("GX2ClearDepthStencilEx", {kDepth, 0x5A, gx2::clear_depth | gx2::clear_stencil}, {1.0F});
+    call("GX2Flush", {});
+    advance_to(gx2::vsync_tick(1));
+
+    // A draw finds it by the registers GX2SetDepthBuffer wrote.
+    const std::optional<latte::DepthSurface> surface =
+        os.gpu.surfaces()->find(latte::DepthBufferKey::from(os.gpu.registers()));
+    REQUIRE(surface.has_value());
+    CHECK(surface->format == gpu::TextureFormat::Depth32FloatStencil8);
+    CHECK(surface->has_stencil);
+    CHECK(surface->width == 1280);
+    CHECK(surface->height >= 720);
+    CHECK(backend.recorded("begin_render_pass 'GX2ClearDepthStencilEx' colors=0 "
+                           "[depth:clear/store stencil:clear/store]"));
+    CHECK(backend.last_render_pass().depth_stencil.clear_depth == 1.0F);
+    CHECK(backend.last_render_pass().depth_stencil.clear_stencil == 0x5A);
+    // The texture is the depth buffer now: guest memory is not written.
+    CHECK(pixel(kDepthImage) == Pixel{0, 0, 0, 0});
+
+    // Depth alone: the stencil is kept.
+    backend.clear_events();
+    call("GX2ClearDepthStencilEx", {kDepth, 0, gx2::clear_depth}, {0.5F});
+    call("GX2Flush", {});
+    advance_to(gx2::vsync_tick(2));
+    CHECK(backend.recorded("[depth:clear/store stencil:load/store]"));
+    CHECK(os.gpu.surfaces()->size() == 1);
+    CHECK(backend.rejected() == 0);
+}
+
+TEST_CASE_METHOD(GpuScanOutFixture,
+                 "a depth buffer without a stencil is cleared without one",
+                 "[hle][gx2][scanout][gpu]") {
+    // FLOAT_R32: depth alone.
+    gx2::DepthBuffer buffer = depth_buffer(256, 64, 0x80E, kDepthImage);
+    const std::optional<gx2::DepthBufferRegisters> registers = gx2::depth_buffer_registers(buffer);
+    REQUIRE(registers.has_value());
+    buffer.db_depth_size = registers->size;
+    buffer.db_depth_view = registers->view;
+    buffer.db_depth_info = registers->info;
+    std::array<u8, sizeof(gx2::DepthBuffer)> bytes{};
+    std::memcpy(bytes.data(), &buffer, sizeof(buffer));
+    REQUIRE(memory.write_bytes(kDepth, bytes));
+
+    call("GX2ClearDepthStencilEx", {kDepth, 0, gx2::clear_depth}, {1.0F});
+    call("GX2Flush", {});
+    advance_to(gx2::vsync_tick(1));
+    const std::optional<latte::DepthBufferKey> key = gx2::depth_buffer_key(memory, buffer);
+    REQUIRE(key.has_value());
+    const std::optional<latte::DepthSurface> surface = os.gpu.surfaces()->find(*key);
+    REQUIRE(surface.has_value());
+    CHECK(surface->format == gpu::TextureFormat::Depth32Float);
+    CHECK_FALSE(surface->has_stencil);
+    CHECK(pixel(kDepthImage) == Pixel{0, 0, 0, 0});
+    CHECK(backend.rejected() == 0);
 }

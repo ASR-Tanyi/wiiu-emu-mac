@@ -4,7 +4,9 @@
 // the register file alike; the texture's size from CB_COLOR_SIZE; one
 // texture per surface, counted as hits and misses; the formats not rendered
 // to yet refused and counted; and that a cached surface is a render target
-// the backend clears, which is what GX2's clear will become (ADR-006).
+// the backend clears, which is what GX2's clear will become (ADR-006). And
+// depth buffers, by their own registers, as 32-bit float depth on Metal with
+// a stencil where the format has one.
 
 #include <wiiu/gpu/null_backend.hpp>
 #include <wiiu/latte/surface_cache.hpp>
@@ -169,4 +171,70 @@ TEST_CASE_METHOD(Fixture,
     CHECK(pixels[0] == 0xFF); // RGBA: red
     CHECK(pixels[1] == 0x00);
     CHECK(pixels[3] == 0xFF);
+}
+
+TEST_CASE("a depth buffer's identity, size and format come from its registers",
+          "[latte][surface]") {
+    // DB_DEPTH_INFO: format in the low three bits, tile mode at 15.
+    const auto info = [](DbFormat format) {
+        return static_cast<u32>(format) | (static_cast<u32>(TileMode::Tiled2DThin1) << 15);
+    };
+    const DepthBufferKey key =
+        DepthBufferKey::from(0x2000, size_register(1280, 720), info(DbFormat::Depth8_24Float), 0);
+    CHECK(key.width() == 1280);
+    CHECK(key.height() == 720);
+    CHECK(key.has_stencil());
+    CHECK(key.array_mode == static_cast<u32>(TileMode::Tiled2DThin1));
+
+    RegisterFile registers;
+    REQUIRE(registers.write(reg::db_depth_base, 0x2000));
+    REQUIRE(registers.write(reg::db_depth_size, size_register(1280, 720)));
+    REQUIRE(registers.write(reg::db_depth_info, info(DbFormat::Depth8_24Float)));
+    CHECK(DepthBufferKey::from(registers) == key);
+
+    // Apple's GPUs have no 24-bit depth: 32-bit float, with a stencil where
+    // the format has one.
+    const auto format = [&](DbFormat db) {
+        return depth_texture_format(
+            DepthBufferKey::from(0x2000, size_register(64, 64), info(db), 0));
+    };
+    CHECK(format(DbFormat::Depth16) == gpu::TextureFormat::Depth32Float);
+    CHECK(format(DbFormat::DepthX8_24) == gpu::TextureFormat::Depth32Float);
+    CHECK(format(DbFormat::Depth8_24) == gpu::TextureFormat::Depth32FloatStencil8);
+    CHECK(format(DbFormat::Depth8_24Float) == gpu::TextureFormat::Depth32FloatStencil8);
+    CHECK(format(DbFormat::Depth32Float) == gpu::TextureFormat::Depth32Float);
+    CHECK(format(DbFormat::DepthX24_8_32Float) == gpu::TextureFormat::Depth32FloatStencil8);
+    CHECK_FALSE(format(DbFormat::Invalid).has_value());
+}
+
+TEST_CASE_METHOD(Fixture, "depth buffers are cached beside colour buffers", "[latte][surface]") {
+    const DepthBufferKey depth = DepthBufferKey::from(
+        0x3000, size_register(64, 32), static_cast<u32>(DbFormat::Depth32Float), 0);
+    std::string error;
+    const std::optional<DepthSurface> first = cache->depth_buffer(depth, error);
+    INFO(error);
+    REQUIRE(first.has_value());
+    CHECK(first->format == gpu::TextureFormat::Depth32Float);
+    CHECK_FALSE(first->has_stencil);
+    CHECK(first->width == 64);
+    CHECK(first->height == 32);
+    CHECK(cache->depth_buffer(depth, error)->texture == first->texture);
+    CHECK(cache->find(depth).has_value());
+
+    const std::optional<ColorSurface> color = cache->color_buffer(
+        ColorBufferKey::from(0x3000, size_register(64, 32), info_register(CbNumberType::Unorm), 0),
+        error);
+    REQUIRE(color.has_value());
+    CHECK(cache->size() == 2);
+    CHECK(cache->stats().misses == 2);
+    CHECK(cache->stats().hits == 1);
+
+    // Not a depth format: refused, and counted.
+    CHECK_FALSE(
+        cache->depth_buffer(DepthBufferKey::from(0x3000, size_register(64, 32), 0, 0), error)
+            .has_value());
+    CHECK(cache->stats().refused == 1);
+
+    cache->clear();
+    CHECK(cache->size() == 0);
 }

@@ -568,6 +568,50 @@ fragment float4 fragment_main(Out in [[stage_in]]) {
     CHECK_FALSE(drawn(tests, 1));
     CHECK(drawn(tests, 0));
 
+    // The stencil kept while the depth is cleared, as GX2ClearDepthStencilEx
+    // asks for with only its depth flag: stencil 3 stored by one pass, depth
+    // cleared and stencil loaded by the next.
+    {
+        RenderPassDesc first;
+        first.label = "stencil to 3";
+        first.color_count = 0;
+        first.depth_stencil.texture = depth;
+        first.depth_stencil.load = LoadAction::Clear;
+        first.depth_stencil.store = StoreAction::Store;
+        first.depth_stencil.clear_depth = 0.5F;
+        first.depth_stencil.clear_stencil = 3;
+        REQUIRE(backend->begin_render_pass(first));
+        backend->end_render_pass();
+    }
+    const auto kept = [&](u32 reference) {
+        const DepthStencilHandle state = backend->create_depth_stencil(tests);
+        REQUIRE(state.valid());
+        const TextureHandle target = make_target(*backend);
+        RenderPassDesc pass = clear_pass(target, ClearColor{0.0F, 0.0F, 1.0F, 1.0F});
+        pass.depth_stencil.texture = depth;
+        pass.depth_stencil.load = LoadAction::Clear;
+        pass.depth_stencil.store = StoreAction::Store;
+        pass.depth_stencil.stencil_load = LoadAction::Load;
+        pass.depth_stencil.clear_depth = 1.0F;
+        REQUIRE(backend->begin_render_pass(pass));
+        backend->set_pipeline(pipeline);
+        backend->set_depth_stencil(state);
+        backend->set_stencil_reference(reference, reference);
+        backend->bind_buffer(ShaderStage::Vertex, 0, positions, 0);
+        DrawCall call;
+        call.vertex_count = 3;
+        backend->draw(call);
+        backend->end_render_pass();
+        backend->submit();
+        std::vector<u8> pixels(static_cast<std::size_t>(kTarget) * kTarget * 4);
+        REQUIRE(backend->read_texture(target, pixels));
+        CHECK(backend->command_errors() == 0);
+        backend->destroy(state);
+        return at(pixels, 2, 40) == kGreen;
+    };
+    CHECK(kept(3));
+    CHECK_FALSE(kept(0));
+
     backend->shutdown();
 }
 
