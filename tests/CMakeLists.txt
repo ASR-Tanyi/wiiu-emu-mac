@@ -183,6 +183,7 @@ wiiu_add_test(hle
         hle/test_gx2_buffers.cpp
         hle/test_gx2_fetch_shader.cpp
         hle/test_gx2_scanout.cpp
+        hle/test_gx2_sampler.cpp
         hle/test_gx2_shader.cpp
         hle/test_gx2_context.cpp
         hle/test_gx2_draw.cpp
