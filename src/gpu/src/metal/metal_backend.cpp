@@ -519,6 +519,7 @@ public:
     void set_scissor(const Rect& rect) override;
 
     void bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer, u64 offset) override;
+    void bind_bytes(ShaderStage stage, u32 index, std::span<const u8> bytes) override;
     void bind_texture(ShaderStage stage, u32 index, TextureHandle texture) override;
     void bind_sampler(ShaderStage stage, u32 index, SamplerHandle sampler) override;
 
@@ -1534,6 +1535,34 @@ void MetalBackend::bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer
             break;
     }
     refuse("bind_buffer to a compute stage inside a render pass");
+}
+
+void MetalBackend::bind_bytes(ShaderStage stage, u32 index, std::span<const u8> bytes) {
+    if (!require_pass("bind_bytes")) {
+        return;
+    }
+    if (index >= max_bound_buffers || bytes.empty() || bytes.size() > max_bound_bytes) {
+        refuse("bind_bytes past the table, or of no bytes or more than set*Bytes takes");
+        return;
+    }
+    switch (stage) {
+        case ShaderStage::Vertex:
+            encoder_->setVertexBytes(bytes.data(), bytes.size(), index);
+            return;
+        case ShaderStage::Fragment:
+            encoder_->setFragmentBytes(bytes.data(), bytes.size(), index);
+            return;
+        case ShaderStage::Object:
+            encoder_->setObjectBytes(bytes.data(), bytes.size(), index);
+            return;
+        case ShaderStage::Mesh:
+            encoder_->setMeshBytes(bytes.data(), bytes.size(), index);
+            return;
+        case ShaderStage::Compute:
+        case ShaderStage::Count:
+            break;
+    }
+    refuse("bind_bytes to a compute stage inside a render pass");
 }
 
 void MetalBackend::bind_texture(ShaderStage stage, u32 index, TextureHandle texture) {

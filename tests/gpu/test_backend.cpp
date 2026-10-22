@@ -18,6 +18,7 @@
 #include <array>
 #include <cstdlib>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -459,6 +460,31 @@ TEST_CASE_METHOD(BackendFixture, "a binding index past the stage's table is refu
     CHECK(backend.rejected() == 0);
     backend.bind_sampler(ShaderStage::Fragment, max_bound_samplers, sampler);
     CHECK(backend.rejected() == 1);
+    backend.end_render_pass();
+}
+
+TEST_CASE_METHOD(BackendFixture, "a few bytes of constants are bound with the draw", "[gpu]") {
+    const std::array<u8, 16> constants{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+
+    // An encoder call, like every binding.
+    backend.bind_bytes(ShaderStage::Fragment, 0, constants);
+    CHECK(backend.rejected() == 1);
+
+    RenderPassDesc pass = simple_pass();
+    REQUIRE(backend.begin_render_pass(pass));
+    backend.bind_bytes(ShaderStage::Fragment, 0, constants);
+    CHECK(backend.recorded("bind_bytes fragment [0] 16 bytes"));
+    CHECK(backend.last_bytes() == std::vector<u8>(constants.begin(), constants.end()));
+    CHECK(backend.rejected() == 1);
+
+    // Metal's own limits: the buffer table, and four kilobytes.
+    backend.bind_bytes(ShaderStage::Vertex, max_bound_buffers, constants);
+    CHECK(backend.rejected() == 2);
+    const std::vector<u8> too_many(max_bound_bytes + 1, 0);
+    backend.bind_bytes(ShaderStage::Vertex, 0, too_many);
+    CHECK(backend.rejected() == 3);
+    backend.bind_bytes(ShaderStage::Vertex, 0, std::span<const u8>{});
+    CHECK(backend.rejected() == 4);
     backend.end_render_pass();
 }
 

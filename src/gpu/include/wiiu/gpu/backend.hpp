@@ -374,6 +374,19 @@ public:
     /// `[[texture(n)]]` or `[[sampler(n)]]` in that stage's function, up to
     /// `max_bound_buffers`, `max_bound_textures` and `max_bound_samplers`.
     virtual void bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer, u64 offset) = 0;
+
+    /// A few bytes of constants at buffer index `index` -- `[[buffer(n)]]`,
+    /// the same table `bind_buffer` binds into -- copied into the pass when
+    /// called, up to `max_bound_bytes`: Metal's `set*Bytes`.
+    ///
+    /// The difference from a buffer filled with `write_buffer` is when the
+    /// bytes are read. A `Shared` buffer is read when the GPU runs the draw,
+    /// so rewriting it for the next draw changes what the last one sees if
+    /// both are in one command buffer; these are taken now, so each draw has
+    /// its own. Per-draw constants -- a copy's sizes, a draw's fetch strides
+    /// (8.11) -- belong here.
+    virtual void bind_bytes(ShaderStage stage, u32 index, std::span<const u8> bytes) = 0;
+
     virtual void bind_texture(ShaderStage stage, u32 index, TextureHandle texture) = 0;
     virtual void bind_sampler(ShaderStage stage, u32 index, SamplerHandle sampler) = 0;
 

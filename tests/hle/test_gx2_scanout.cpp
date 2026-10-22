@@ -13,7 +13,8 @@
 // with a host GPU attached (ADR-006), the clear done there: the surface
 // made in the cache under the key a draw finds it by, guest memory left
 // alone, sRGB encoded as the CPU clear encodes it, and what the GPU does not
-// do yet still done on the CPU.
+// do yet still done on the CPU; and the scan-out copy of a surface the GPU
+// holds done there too, into a texture for the frame that the flip hands on.
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/cpu/state.hpp>
@@ -30,6 +31,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstring>
@@ -555,6 +557,21 @@ struct GpuScanOutFixture : ScanOutFixture {
         return buffer;
     }
 
+    /// The colour buffer at `address`, as the title's memory holds it.
+    [[nodiscard]] gx2::ColorBuffer color_buffer_at(ppcaddr_t address) {
+        gx2::ColorBuffer buffer{};
+        REQUIRE(gx2::read_guest(memory, address, buffer));
+        return buffer;
+    }
+
+    /// The sizes the last surface copy was given: picture, then target.
+    [[nodiscard]] std::array<u32, 4> copy_sizes() const {
+        std::array<u32, 4> sizes{};
+        REQUIRE(backend.last_bytes().size() == sizeof(sizes));
+        std::memcpy(sizes.data(), backend.last_bytes().data(), sizeof(sizes));
+        return sizes;
+    }
+
     /// Every pixel of a cached RGBA8 surface, from the backend.
     [[nodiscard]] std::vector<u8> read_back(const latte::ColorSurface& surface) {
         std::vector<u8> pixels(std::size_t{surface.width} * surface.height * 4);
@@ -672,4 +689,100 @@ TEST_CASE_METHOD(GpuScanOutFixture,
     call("GX2Flush", {});
     advance_to(gx2::vsync_tick(3));
     CHECK(pixel(kImage) == kRed);
+}
+
+TEST_CASE_METHOD(GpuScanOutFixture,
+                 "a copy of a surface the GPU holds fills the frame's texture, which the flip "
+                 "shows",
+                 "[hle][gx2][scanout][gpu]") {
+    for (u32 frame = 1; frame <= 3; ++frame) {
+        clear(frame == 2 ? kRed : kBlue);
+        call("GX2CopyColorBufferToScanBuffer", {kBuffer, kScanTv});
+        swap_and_flush();
+        advance_to(gx2::vsync_tick(frame));
+    }
+    REQUIRE(shown.size() == 3);
+
+    // Each flip shows its frame's texture, the two of a double buffer in turn.
+    CHECK(shown[0].texture.valid());
+    CHECK(shown[1].texture.valid());
+    CHECK(shown[1].texture != shown[0].texture);
+    CHECK(shown[2].texture == shown[0].texture);
+    CHECK(backend.recorded("1280x720 format=rgba8_unorm storage=shared label=TV scan frame 0"));
+    CHECK(backend.recorded("1280x720 format=rgba8_unorm storage=shared label=TV scan frame 1"));
+
+    // Copied on the GPU, from the surface the clear made, picture to frame.
+    const std::optional<latte::ColorSurface> surface =
+        os.gpu.surfaces()->find(*gx2::color_buffer_key(memory, color_buffer_at(kBuffer)));
+    REQUIRE(surface.has_value());
+    CHECK(backend.recorded("begin_render_pass 'surface copy' colors=1 [0:dont_care/store]"));
+    CHECK(backend.recorded("bind_texture fragment [0] = " +
+                           std::to_string(surface->texture.value())));
+    CHECK(copy_sizes() == std::array<u32, 4>{1280, 720, 1280, 720});
+
+    // Guest memory is neither read nor written: not the colour buffer, not
+    // the scan buffer.
+    CHECK(pixel(kImage) == Pixel{0, 0, 0, 0});
+    CHECK(pixel(kTvScan) == Pixel{0, 0, 0, 0});
+    CHECK(pixel(kTvScan + kFrameBytes) == Pixel{0, 0, 0, 0});
+    CHECK(backend.rejected() == 0);
+}
+
+TEST_CASE_METHOD(GpuScanOutFixture,
+                 "a picture is copied at its own size, not its texture's",
+                 "[hle][gx2][scanout][gpu]") {
+    // The GamePad's 854 pixels, in a colour buffer whose pitch is padded: the
+    // texture is as wide as the pitch, and the copy reads the picture alone,
+    // scaling it to the TV's frame.
+    put_color_buffer(kRgba8, 854, 480, 1);
+    clear(kBlue);
+    call("GX2CopyColorBufferToScanBuffer", {kBuffer, kScanTv});
+    swap_and_flush();
+    advance_to(gx2::vsync_tick(1));
+
+    const std::optional<latte::ColorSurface> surface =
+        os.gpu.surfaces()->find(*gx2::color_buffer_key(memory, color_buffer_at(kBuffer)));
+    REQUIRE(surface.has_value());
+    CHECK(surface->width > 854);
+    CHECK(copy_sizes() == std::array<u32, 4>{854, 480, 1280, 720});
+    REQUIRE(shown.size() == 1);
+    CHECK(shown[0].texture.valid());
+}
+
+TEST_CASE_METHOD(GpuScanOutFixture,
+                 "a copy of a surface the GPU does not hold still fills guest memory",
+                 "[hle][gx2][scanout][gpu]") {
+    // Pixels the title wrote itself, with no clear: guest memory is the
+    // surface, so the copy reads it there and the flip shows the bytes.
+    const gx2::ColorBuffer buffer = color_buffer_at(kBuffer);
+    std::vector<u8> red(buffer.surface.image_size);
+    for (std::size_t i = 0; i + 4 <= red.size(); i += 4) {
+        std::copy(kRed.begin(), kRed.end(), red.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+    REQUIRE(memory.write_bytes(kImage, red));
+    call("GX2CopyColorBufferToScanBuffer", {kBuffer, kScanTv});
+    swap_and_flush();
+    advance_to(gx2::vsync_tick(1));
+    REQUIRE(shown.size() == 1);
+    CHECK_FALSE(shown[0].texture.valid());
+    CHECK(pixel(kTvScan) == kRed);
+    CHECK(os.gpu.surfaces()->size() == 0);
+
+    // Once a clear has put the surface on the GPU, its copies go there, frame
+    // by frame -- including into the frame the CPU filled before.
+    for (u32 frame = 2; frame <= 3; ++frame) {
+        clear(kBlue);
+        call("GX2CopyColorBufferToScanBuffer", {kBuffer, kScanTv});
+        swap_and_flush();
+        advance_to(gx2::vsync_tick(frame));
+    }
+    REQUIRE(shown.size() == 3);
+    CHECK(shown[1].texture.valid());
+    CHECK(shown[2].texture.valid());
+    CHECK(pixel(kTvScan) == kRed); // the bytes the CPU copied, no longer shown
+
+    // Detached, the frames are bytes again.
+    os.gpu.attach_backend(nullptr);
+    CHECK_FALSE(os.gpu.scan_texture_shown(gx2::ScanTarget::Tv, 0).valid());
+    CHECK(backend.live_count(gpu::ResourceKind::Texture) == 0); // all of it given back
 }

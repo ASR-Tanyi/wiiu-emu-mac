@@ -297,6 +297,10 @@ inline constexpr u32 max_color_attachments = 8;
 /// bound for. ADR-003 moves the guest's resources into argument buffers with
 /// the MSL emitter (8.6, 8.12); the indices stay, the ceilings go.
 inline constexpr u32 max_bound_buffers = 31;
+
+/// The most `bind_bytes` takes at once: Metal's limit for `set*Bytes`, past
+/// which it wants a buffer.
+inline constexpr u32 max_bound_bytes = 4096;
 inline constexpr u32 max_bound_textures = 128;
 inline constexpr u32 max_bound_samplers = 16;
 

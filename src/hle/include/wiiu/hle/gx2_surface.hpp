@@ -56,6 +56,9 @@
 // memory first, and nothing goes back: from then on the texture is that
 // surface. `color_buffer_key` is how the clear finds it -- the same key a
 // draw finds the surface by from the registers `GX2SetColorBuffer` wrote.
+// The scan-out copy of a surface the GPU holds is done there too
+// (`copy_surface_to_scan`), into a texture standing for the scan frame; of
+// one it does not hold, on guest memory, as before.
 #pragma once
 
 #include <wiiu/common/endian.hpp>
@@ -64,6 +67,7 @@
 #include <wiiu/hle/gx2.hpp>
 #include <wiiu/latte/surface.hpp>
 #include <wiiu/latte/surface_cache.hpp>
+#include <wiiu/latte/surface_copy.hpp>
 #include <wiiu/memory/memory.hpp>
 
 #include <array>
@@ -315,6 +319,25 @@ inline constexpr u32 depth_buffer_words = sizeof(DepthBuffer) / 4;
                                        const ColorBuffer& buffer,
                                        const std::array<f32, 4>& rgba,
                                        std::string& problem);
+
+/// The surface the GPU holds for this colour buffer, if it holds one
+/// (ADR-006): what decides whether a scan-out copy runs on the GPU or on
+/// guest memory.
+[[nodiscard]] std::optional<latte::ColorSurface> held_color_surface(
+    const latte::SurfaceCache& cache, const memory::Memory& memory, const ColorBuffer& buffer);
+
+/// What `GX2CopyColorBufferToScanBuffer`'s packet does for a surface the GPU
+/// holds: the viewed level's picture -- its own size, inside the texture the
+/// registers padded -- copied by `copier` into `target`, the scan frame's
+/// texture, as `copy_to_scan_frame` copies it into guest memory: the same
+/// formats agreeing, scaled by nearest pixel, the bytes kept. False, with
+/// `problem` saying why, for a copy refused before anything is encoded.
+[[nodiscard]] bool copy_surface_to_scan(latte::SurfaceCopier& copier,
+                                        const latte::ColorSurface& surface,
+                                        const ColorBuffer& buffer,
+                                        const ScanBuffer& scan,
+                                        const latte::CopyTarget& target,
+                                        std::string& problem);
 
 /// What `GX2ClearDepthStencilEx`'s packet does when it runs: depth, stencil
 /// or both -- as `flags` asks -- written into every element of the viewed

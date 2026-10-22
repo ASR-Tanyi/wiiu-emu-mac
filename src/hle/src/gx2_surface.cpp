@@ -1038,6 +1038,49 @@ bool clear_color_surface(latte::SurfaceCache& cache,
     return true;
 }
 
+std::optional<latte::ColorSurface> held_color_surface(const latte::SurfaceCache& cache,
+                                                      const memory::Memory& memory,
+                                                      const ColorBuffer& buffer) {
+    const std::optional<latte::ColorBufferKey> key = color_buffer_key(memory, buffer);
+    if (!key.has_value()) {
+        return std::nullopt;
+    }
+    return cache.find(*key);
+}
+
+bool copy_surface_to_scan(latte::SurfaceCopier& copier,
+                          const latte::ColorSurface& surface,
+                          const ColorBuffer& buffer,
+                          const ScanBuffer& scan,
+                          const latte::CopyTarget& target,
+                          std::string& problem) {
+    // The CPU copy's rule: one colour format, one element size. Every surface
+    // the GPU holds is 8_8_8_8, four bytes an element.
+    const u32 format = buffer.surface.format;
+    if (latte::color_format(format) != latte::color_format(scan.surface_format) ||
+        latte::bytes_per_element(format) != latte::bytes_per_element(scan.surface_format)) {
+        problem = fmt::format("GX2CopyColorBufferToScanBuffer: copying format {:#x} into a scan "
+                              "buffer of format {:#x} is not supported yet",
+                              format,
+                              scan.surface_format);
+        return false;
+    }
+
+    // The picture is the viewed level's own size; the texture, the padded
+    // size its registers describe, is at least as large.
+    const latte::Extent extent = latte::level_extent(surface_desc(buffer.surface, buffer.view_mip));
+    const latte::CopySource source{.texture = surface.texture,
+                                   .format = surface.format,
+                                   .width = std::min(extent.width, surface.width),
+                                   .height = std::min(extent.height, surface.height)};
+    std::string error;
+    if (!copier.copy(source, target, error)) {
+        problem = "GX2CopyColorBufferToScanBuffer: " + error;
+        return false;
+    }
+    return true;
+}
+
 void register_gx2_surface(Registry& registry) {
     registry.add("gx2", "GX2CalcSurfaceSizeAndAlignment", gx2_calc_surface_size_and_alignment);
     registry.add("gx2", "GX2InitColorBufferRegs", gx2_init_color_buffer_regs);

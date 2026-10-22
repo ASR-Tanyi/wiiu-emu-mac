@@ -76,6 +76,7 @@ public:
     void set_scissor(const Rect& rect) override;
 
     void bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer, u64 offset) override;
+    void bind_bytes(ShaderStage stage, u32 index, std::span<const u8> bytes) override;
     void bind_texture(ShaderStage stage, u32 index, TextureHandle texture) override;
     void bind_sampler(ShaderStage stage, u32 index, SamplerHandle sampler) override;
 
@@ -103,6 +104,10 @@ public:
     /// Calls that were refused: an unknown handle, a pass that failed
     /// validation, a write past the end of a buffer. Should be zero.
     [[nodiscard]] u64 rejected() const noexcept { return rejected_; }
+
+    /// What the last `bind_bytes` was given, so a test can read the
+    /// constants a draw was handed.
+    [[nodiscard]] const std::vector<u8>& last_bytes() const noexcept { return last_bytes_; }
 
     [[nodiscard]] const RenderPassDesc& last_render_pass() const noexcept {
         return last_render_pass_;
@@ -147,6 +152,7 @@ private:
     PipelineHandle pass_pipeline_;
 
     std::vector<std::string> events_;
+    std::vector<u8> last_bytes_;
     u64 rejected_ = 0;
     u64 frame_index_ = 0;
 

@@ -104,6 +104,7 @@ wiiu_add_test(gpu
     SOURCES ${WIIU_GPU_TEST_SOURCES}
     DEPS
         wiiu::gpu
+        wiiu::hle
         wiiu::latte)
 
 if(WIIU_PLATFORM_APPLE)
@@ -129,6 +130,7 @@ wiiu_add_test(latte
         latte/test_shader_program.cpp
         latte/test_surface.cpp
         latte/test_surface_cache.cpp
+        latte/test_surface_copy.cpp
         latte/test_timeline.cpp
     DEPS
         wiiu::latte)

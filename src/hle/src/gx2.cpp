@@ -307,16 +307,30 @@ bool Gpu::vsync(u64 index) {
     return true;
 }
 
+Gpu::~Gpu() {
+    attach_backend(nullptr);
+}
+
 void Gpu::attach_backend(gpu::GpuBackend* backend) {
     // Destroyed on the backend that made them, before it is let go.
+    release_scan_textures();
+    copier_.shutdown();
     surfaces_.reset();
     backend_ = backend;
-    if (backend_ != nullptr) {
-        surfaces_ = std::make_unique<latte::SurfaceCache>(*backend_);
+    if (backend_ == nullptr) {
+        return;
+    }
+    surfaces_ = std::make_unique<latte::SurfaceCache>(*backend_);
+    std::string error;
+    if (!copier_.initialize(*backend_, error)) {
+        // Clears still run on the GPU; copies of what they made cannot, and
+        // say so when asked for.
+        WIIU_LOG_ERROR(Gx2, "the GPU's surface copy is unavailable: {}", error);
     }
 }
 
 void Gpu::reset() {
+    release_scan_textures();
     if (surfaces_ != nullptr) {
         surfaces_->clear();
     }
@@ -410,7 +424,13 @@ void Gpu::run_hle(const latte::pm4::Packet& packet) {
             }
             const ColorBuffer buffer =
                 color_buffer_from_words(payload.subspan<1, color_buffer_words>());
+            // The frame `scan_frame` chose, by its place in the rotation.
+            const u32 index = swaps_reached_ % scan_buffer_count(scan.buffering_mode);
+            if (backend_ != nullptr && copy_on_gpu(*target, index, buffer)) {
+                return;
+            }
             report(copy_to_scan_frame(*memory_, buffer, scan, *frame));
+            mark_scan_frame(*target, index, false);
             return;
         }
 
@@ -419,6 +439,113 @@ void Gpu::run_hle(const latte::pm4::Packet& packet) {
                 fmt::format("an emulator packet {:#04x} GX2 does not write", packet.header.opcode));
             return;
     }
+}
+
+bool Gpu::copy_on_gpu(ScanTarget target, u32 index, const ColorBuffer& buffer) {
+    const std::optional<latte::ColorSurface> surface =
+        held_color_surface(*surfaces_, *memory_, buffer);
+    if (!surface.has_value()) {
+        return false;
+    }
+    // From here the copy is the GPU's: guest memory under the surface is
+    // stale, so a copy from it would show the wrong picture. A copy that
+    // cannot be done leaves the frame as it was.
+    const ScanBuffer& scan = scan_buffer(target);
+    const gpu::TextureHandle texture = scan_texture(target, index);
+    if (!texture.valid()) {
+        report(fmt::format("GX2CopyColorBufferToScanBuffer: the backend made no {}x{} texture "
+                           "for the {}'s frame",
+                           scan.geometry.width,
+                           scan.geometry.height,
+                           scan_target_name(target)));
+        return true;
+    }
+    std::string problem;
+    if (!copy_surface_to_scan(copier_,
+                              *surface,
+                              buffer,
+                              scan,
+                              latte::CopyTarget{texture, scan.geometry.width, scan.geometry.height},
+                              problem)) {
+        report(problem);
+        return true;
+    }
+    mark_scan_frame(target, index, true);
+    return true;
+}
+
+bool Gpu::ScanTextures::describe(const ScanBuffer& scan) const noexcept {
+    return frames.size() == scan_buffer_count(scan.buffering_mode) &&
+           width == scan.geometry.width && height == scan.geometry.height;
+}
+
+gpu::TextureHandle Gpu::scan_texture(ScanTarget target, u32 index) {
+    const ScanBuffer& scan = scan_buffer(target);
+    ScanTextures& textures = scan_textures_[static_cast<u32>(target)];
+    if (!textures.describe(scan)) {
+        for (const gpu::TextureHandle texture : textures.frames) {
+            if (texture.valid()) {
+                retired_textures_.push_back(texture);
+            }
+        }
+        const u32 count = scan_buffer_count(scan.buffering_mode);
+        textures = ScanTextures{.frames = std::vector<gpu::TextureHandle>(count),
+                                .on_gpu = std::vector<bool>(count, false),
+                                .width = scan.geometry.width,
+                                .height = scan.geometry.height};
+    }
+    if (index >= textures.frames.size()) {
+        return {};
+    }
+    gpu::TextureHandle& texture = textures.frames[index];
+    if (!texture.valid()) {
+        // Shared, though only the GPU writes it and only the presenter reads
+        // it: on unified memory that costs nothing worth measuring, and it is
+        // what lets a test, or the headless runner (10.5), read a frame back.
+        const std::string label = fmt::format("{} scan frame {}", scan_target_name(target), index);
+        gpu::TextureDesc desc;
+        desc.width = scan.geometry.width;
+        desc.height = scan.geometry.height;
+        desc.format = latte::SurfaceCopier::target_format;
+        desc.usage = gpu::TextureUsage::RenderTarget | gpu::TextureUsage::Sampled;
+        desc.storage = gpu::Storage::Shared;
+        desc.label = label;
+        texture = backend_->create_texture(desc);
+    }
+    return texture;
+}
+
+void Gpu::mark_scan_frame(ScanTarget target, u32 index, bool on_gpu) {
+    ScanTextures& textures = scan_textures_[static_cast<u32>(target)];
+    if (textures.describe(scan_buffer(target)) && index < textures.on_gpu.size()) {
+        textures.on_gpu[index] = on_gpu;
+    }
+}
+
+gpu::TextureHandle Gpu::scan_texture_shown(ScanTarget target, u32 flip_index) const noexcept {
+    const ScanTextures& textures = scan_textures_[static_cast<u32>(target)];
+    if (textures.frames.empty() || !textures.describe(scan_buffer(target))) {
+        return {};
+    }
+    const std::size_t index = flip_index % textures.frames.size();
+    return textures.on_gpu[index] ? textures.frames[index] : gpu::TextureHandle{};
+}
+
+void Gpu::release_scan_textures() {
+    if (backend_ != nullptr) {
+        for (const ScanTextures& textures : scan_textures_) {
+            for (const gpu::TextureHandle texture : textures.frames) {
+                if (texture.valid()) {
+                    backend_->destroy(texture);
+                }
+            }
+        }
+        for (const gpu::TextureHandle texture : retired_textures_) {
+            backend_->destroy(texture);
+        }
+    }
+    scan_textures_ = {};
+    retired_textures_.clear();
 }
 
 void Gpu::report(const std::string& problem) {
@@ -492,6 +619,7 @@ void present_flip(coreinit::Context& context) {
             .geometry = {buffer.geometry.width, buffer.geometry.height, buffer.geometry.pitch},
             .enabled = buffer.enabled,
             .flip_count = flips,
+            .texture = context.gpu.scan_texture_shown(target, flips - 1),
         };
         if (!context.screens.on_flip(flip, *context.memory)) {
             // The window was closed. There is no guest call to halt the core

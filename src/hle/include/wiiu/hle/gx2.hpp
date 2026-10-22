@@ -42,8 +42,10 @@
 //
 // With a host GPU attached (`Gpu::attach_backend`), what the GPU draws stays
 // on it (ADR-006): the surfaces it renders to live in a surface cache as
-// textures, and the work on them is done there -- so far the clear. Without
-// one, as in most tests, all of it is done on guest memory, on the CPU.
+// textures, and the work on them is done there -- the clear, and the scan-out
+// copy of a surface the GPU holds, which fills a scan frame's texture rather
+// than its bytes; a flip then hands the frontend that texture. Without one,
+// as in most tests, all of it is done on guest memory, on the CPU.
 //
 // What is not here yet: swap interval 0's flip-without-waiting (it waits for
 // vsync like 1), the overrun callback a full display list asks for, and the
@@ -56,6 +58,7 @@
 #include <wiiu/latte/pm4.hpp>
 #include <wiiu/latte/registers.hpp>
 #include <wiiu/latte/surface_cache.hpp>
+#include <wiiu/latte/surface_copy.hpp>
 #include <wiiu/latte/timeline.hpp>
 #include <wiiu/memory/memory.hpp>
 
@@ -81,6 +84,8 @@ struct Context;
 } // namespace coreinit
 
 namespace gx2 {
+
+struct ColorBuffer; // gx2_surface.hpp
 
 /// The scheduler timer the GPU's timeline retires on. One id, re-armed at
 /// each next deadline; below the IOS completion ids, and above every guest
@@ -303,6 +308,10 @@ class Gpu {
 public:
     Gpu();
 
+    /// The GPU's textures go back to the backend they were made on, which
+    /// therefore has to outlive this -- or be detached first.
+    ~Gpu();
+
     Gpu(const Gpu&) = delete;
     Gpu& operator=(const Gpu&) = delete;
 
@@ -414,9 +423,11 @@ public:
     // --- the host GPU (ADR-006) ---------------------------------------------
 
     /// Do the GPU's work on `backend` from here on, or, with null, on guest
-    /// memory again. Either way the surface cache starts empty: the textures
-    /// it held are destroyed on the backend they were made on, so a backend
-    /// must be detached -- this with null -- before it goes.
+    /// memory again. Either way the surface cache starts empty and the scan
+    /// frames' textures are gone: what the GPU held is destroyed on the
+    /// backend it was made on, so a backend must be detached -- this with
+    /// null -- before it goes, and whoever was showing a scan texture must
+    /// stop first.
     void attach_backend(gpu::GpuBackend* backend);
 
     [[nodiscard]] gpu::GpuBackend* backend() const noexcept { return backend_; }
@@ -425,6 +436,13 @@ public:
     [[nodiscard]] latte::SurfaceCache* surfaces() noexcept { return surfaces_.get(); }
 
     [[nodiscard]] const latte::SurfaceCache* surfaces() const noexcept { return surfaces_.get(); }
+
+    /// What frame `flip_index` of `target` holds, as a texture, when the copy
+    /// that last filled it ran on the GPU -- then that texture, not the
+    /// frame's bytes in guest memory, is what a flip of it shows. None when
+    /// guest memory holds it, or nothing has filled it.
+    [[nodiscard]] gpu::TextureHandle scan_texture_shown(ScanTarget target,
+                                                        u32 flip_index) const noexcept;
 
     /// Back to before `GX2Init`, with nothing in flight: the register file
     /// cleared, a fresh timeline started, and the surface cache emptied. The
@@ -441,6 +459,33 @@ private:
     /// Log a problem with a packet the first time it is seen: a copy that
     /// cannot be done fails the same way every frame.
     void report(const std::string& problem);
+
+    /// A scan-out copy into frame `index` of `target`, on the GPU, if the GPU
+    /// holds the colour buffer's surface. False if it does not, and the copy
+    /// is guest memory's to do.
+    bool copy_on_gpu(ScanTarget target, u32 index, const ColorBuffer& buffer);
+
+    /// Frame `index` of `target` as a texture, made on first use, as large
+    /// as the scan buffer's picture. A scan buffer set anew gets new
+    /// textures; the old ones may still be on screen, so they are kept until
+    /// the GPU's textures all go.
+    gpu::TextureHandle scan_texture(ScanTarget target, u32 index);
+
+    /// Note where frame `index` of `target` was last filled.
+    void mark_scan_frame(ScanTarget target, u32 index, bool on_gpu);
+
+    /// Destroy every scan texture, the retired ones too.
+    void release_scan_textures();
+
+    /// A scan buffer's frames as textures.
+    struct ScanTextures {
+        std::vector<gpu::TextureHandle> frames;
+        std::vector<bool> on_gpu; ///< filled last by a copy on the GPU
+        u32 width = 0;
+        u32 height = 0;
+
+        [[nodiscard]] bool describe(const ScanBuffer& scan) const noexcept;
+    };
 
     // Heap-held: 256 KiB of registers does not belong inside a Context that
     // tests put on the stack.
@@ -464,6 +509,9 @@ private:
 
     gpu::GpuBackend* backend_ = nullptr;
     std::unique_ptr<latte::SurfaceCache> surfaces_;
+    latte::SurfaceCopier copier_;
+    std::array<ScanTextures, scan_target_count> scan_textures_{};
+    std::vector<gpu::TextureHandle> retired_textures_;
 
     InitAttributes attributes_{};
     bool initialized_ = false;

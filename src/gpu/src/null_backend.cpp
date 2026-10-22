@@ -649,6 +649,20 @@ void NullBackend::bind_buffer(ShaderStage stage, u32 index, BufferHandle buffer,
         "bind_buffer {} [{}] = {} +{}", shader_stage_name(stage), index, buffer.value(), offset));
 }
 
+void NullBackend::bind_bytes(ShaderStage stage, u32 index, std::span<const u8> bytes) {
+    if (!require_pass("bind_bytes") || !check_binding("bind_bytes", index, max_bound_buffers)) {
+        return;
+    }
+    if (bytes.empty() || bytes.size() > max_bound_bytes) {
+        reject(fmt::format(
+            "bind_bytes: {} bytes, where Metal takes 1 to {}", bytes.size(), max_bound_bytes));
+        return;
+    }
+    last_bytes_.assign(bytes.begin(), bytes.end());
+    record(
+        fmt::format("bind_bytes {} [{}] {} bytes", shader_stage_name(stage), index, bytes.size()));
+}
+
 void NullBackend::bind_texture(ShaderStage stage, u32 index, TextureHandle texture) {
     if (!require_pass("bind_texture") ||
         !check_binding("bind_texture", index, max_bound_textures)) {

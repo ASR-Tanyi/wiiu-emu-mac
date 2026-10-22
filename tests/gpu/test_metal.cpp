@@ -11,13 +11,22 @@
 // one the compatibility runner (10.5) will boot titles through.
 
 #include <wiiu/common/log.hpp>
+#include <wiiu/cpu/state.hpp>
 #include <wiiu/gpu/backend.hpp>
 #include <wiiu/gpu/presenter.hpp>
+#include <wiiu/hle/coreinit.hpp>
+#include <wiiu/hle/gx2.hpp>
+#include <wiiu/hle/gx2_surface.hpp>
+#include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/formats.hpp>
 #include <wiiu/latte/msl.hpp>
+#include <wiiu/latte/surface_copy.hpp>
+#include <wiiu/memory/map.hpp>
+#include <wiiu/memory/memory.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -25,8 +34,10 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <sys/mman.h>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 using namespace wiiu;
@@ -636,6 +647,247 @@ TEST_CASE("a GPU clear stores what GX2's CPU clear does", "[gpu][metal][surface]
         backend->destroy(target);
     }
 
+    backend->shutdown();
+}
+
+namespace {
+
+/// A `Shared` RGBA8 texture holding `bytes`, rows packed, for a copy to read.
+[[nodiscard]] TextureHandle source_texture(GpuBackend& backend,
+                                           TextureFormat format,
+                                           u32 width,
+                                           u32 height,
+                                           const std::vector<u8>& bytes) {
+    TextureDesc desc;
+    desc.width = width;
+    desc.height = height;
+    desc.format = format;
+    desc.usage = TextureUsage::Sampled;
+    desc.storage = Storage::Shared;
+    desc.label = "copy source";
+    const TextureHandle texture = backend.create_texture(desc);
+    REQUIRE(texture.valid());
+    REQUIRE(backend.write_texture(texture, Rect{0, 0, width, height}, bytes, width * 4));
+    return texture;
+}
+
+/// A `Shared` RGBA8 UNORM render target, for a copy to write and a test to
+/// read back.
+[[nodiscard]] TextureHandle copy_target(GpuBackend& backend, u32 width, u32 height) {
+    TextureDesc desc;
+    desc.width = width;
+    desc.height = height;
+    desc.format = latte::SurfaceCopier::target_format;
+    desc.usage = TextureUsage::RenderTarget;
+    desc.storage = Storage::Shared;
+    desc.label = "copy target";
+    const TextureHandle texture = backend.create_texture(desc);
+    REQUIRE(texture.valid());
+    return texture;
+}
+
+} // namespace
+
+TEST_CASE("a surface copy keeps every byte, sRGB or not", "[gpu][metal][surface][copy]") {
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+    {
+        latte::SurfaceCopier copier;
+        std::string error;
+        REQUIRE(copier.initialize(*backend, error));
+
+        // All 256 values in every channel, each channel in a different order.
+        std::vector<u8> bytes(256U * 4U);
+        for (u32 i = 0; i < 256; ++i) {
+            bytes[(i * 4) + 0] = static_cast<u8>(i);
+            bytes[(i * 4) + 1] = static_cast<u8>(255 - i);
+            bytes[(i * 4) + 2] = static_cast<u8>(i * 7);
+            bytes[(i * 4) + 3] = static_cast<u8>(i ^ 0xA5);
+        }
+
+        for (const TextureFormat format :
+             {TextureFormat::RGBA8Unorm, TextureFormat::RGBA8UnormSrgb}) {
+            const TextureHandle source = source_texture(*backend, format, 256, 1, bytes);
+            const TextureHandle target = copy_target(*backend, 256, 1);
+            REQUIRE(copier.copy(latte::CopySource{source, format, 256, 1},
+                                latte::CopyTarget{target, 256, 1},
+                                error));
+            backend->submit();
+
+            std::vector<u8> out(bytes.size());
+            REQUIRE(backend->read_texture(target, out));
+            std::size_t wrong = 0;
+            std::size_t first = out.size();
+            for (std::size_t i = 0; i < out.size(); ++i) {
+                if (out[i] != bytes[i]) {
+                    ++wrong;
+                    first = std::min(first, i);
+                }
+            }
+            INFO(texture_format_name(format)
+                 << ": " << wrong << " bytes changed"
+                 << (wrong == 0 ? std::string{}
+                                : ", the first at " + std::to_string(first) + ": " +
+                                      std::to_string(bytes[first]) + " became " +
+                                      std::to_string(out[first])));
+            CHECK(wrong == 0);
+            CHECK(backend->command_errors() == 0);
+            backend->destroy(source);
+            backend->destroy(target);
+        }
+    }
+    backend->shutdown();
+}
+
+TEST_CASE("a surface copy scales by nearest pixel, as the CPU copy does",
+          "[gpu][metal][surface][copy]") {
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+    {
+        latte::SurfaceCopier copier;
+        std::string error;
+        REQUIRE(copier.initialize(*backend, error));
+
+        // A 6x3 picture in an 8x4 texture, as a colour buffer is padded; the
+        // padding holds what no copy should read.
+        constexpr u32 kWidth = 8;
+        constexpr u32 kHeight = 4;
+        std::vector<u8> bytes(std::size_t{kWidth} * kHeight * 4, 0xEE);
+        for (u32 y = 0; y < 3; ++y) {
+            for (u32 x = 0; x < 6; ++x) {
+                const std::size_t at = ((std::size_t{y} * kWidth) + x) * 4;
+                bytes[at + 0] = static_cast<u8>(x * 40);
+                bytes[at + 1] = static_cast<u8>(y * 80);
+                bytes[at + 2] = static_cast<u8>(x + (y * 6));
+                bytes[at + 3] = 0xFF;
+            }
+        }
+        const TextureHandle source =
+            source_texture(*backend, TextureFormat::RGBA8Unorm, kWidth, kHeight, bytes);
+
+        // Up, and down: 10x5, then 4x2.
+        for (const auto& [width, height] : {std::pair{10U, 5U}, std::pair{4U, 2U}}) {
+            const TextureHandle target = copy_target(*backend, width, height);
+            REQUIRE(copier.copy(latte::CopySource{source, TextureFormat::RGBA8Unorm, 6, 3},
+                                latte::CopyTarget{target, width, height},
+                                error));
+            backend->submit();
+
+            std::vector<u8> out(std::size_t{width} * height * 4);
+            REQUIRE(backend->read_texture(target, out));
+            std::size_t wrong = 0;
+            for (u32 y = 0; y < height; ++y) {
+                for (u32 x = 0; x < width; ++x) {
+                    // gx2::copy_to_scan_frame's arithmetic.
+                    const u32 sx = (x * 6) / width;
+                    const u32 sy = (y * 3) / height;
+                    const std::size_t from = ((std::size_t{sy} * kWidth) + sx) * 4;
+                    const std::size_t to = ((std::size_t{y} * width) + x) * 4;
+                    wrong += std::memcmp(&out[to], &bytes[from], 4) != 0 ? 1U : 0U;
+                }
+            }
+            INFO(width << "x" << height);
+            CHECK(wrong == 0);
+            CHECK(backend->command_errors() == 0);
+            backend->destroy(target);
+        }
+        backend->destroy(source);
+    }
+    backend->shutdown();
+}
+
+TEST_CASE("GX2's clear and scan-out copy run on the GPU, and the flip shows them",
+          "[gpu][metal][gx2]") {
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+    {
+        // WHB's frame, through GX2's own calls, with Metal attached
+        // (ADR-006): clear the TV's colour buffer, copy it to the TV, swap.
+        constexpr ppcaddr_t kBuffer = 0x10005000;
+        constexpr ppcaddr_t kImage = 0x10100000;
+        constexpr ppcaddr_t kTvScan = memory::mem1_base + 0x100000;
+        constexpr u32 kFrameBytes = 1280 * 720 * 4;
+
+        memory::Memory memory;
+        std::string error;
+        REQUIRE(memory.initialize(memory::default_regions(), error));
+        cpu::CoreState state;
+        hle::Registry registry;
+        hle::coreinit::Context os;
+        hle::coreinit::register_all(registry, os);
+        os.memory = &memory;
+        state.core_id = 1;
+        state.timebase = 10'000;
+        static_cast<void>(os.scheduler.adopt_main(state, 0x10001000));
+        std::vector<hle::coreinit::ScreenFlip> shown;
+        os.screens.on_flip = [&shown](const hle::coreinit::ScreenFlip& flip,
+                                      const memory::Memory&) {
+            shown.push_back(flip);
+            return true;
+        };
+        os.gpu.attach_backend(backend.get());
+
+        const auto call =
+            [&](std::string_view name, std::vector<u32> arguments, std::vector<f32> floats = {}) {
+                hle::Function* const function = registry.find("gx2", name);
+                REQUIRE(function != nullptr);
+                for (std::size_t i = 0; i < arguments.size(); ++i) {
+                    state.gpr[3 + i] = arguments[i];
+                }
+                for (std::size_t i = 0; i < floats.size(); ++i) {
+                    state.fpr[1 + i].ps0 = static_cast<f64>(floats[i]);
+                }
+                hle::Call context{.state = state, .memory = memory};
+                function->handler(context);
+            };
+
+        call("GX2Init", {0});
+        call("GX2SetTVBuffer", {kTvScan, 2 * kFrameBytes, 3, 0x01A, 2}); // 720p, RGBA8, double
+        call("GX2SetTVEnable", {1});
+
+        hle::gx2::ColorBuffer buffer{};
+        buffer.surface.dim = 1;
+        buffer.surface.width = 1280;
+        buffer.surface.height = 720;
+        buffer.surface.depth = 1;
+        buffer.surface.mip_levels = 1;
+        buffer.surface.format = 0x01A;
+        buffer.surface.use = hle::gx2::surface_use_texture | hle::gx2::surface_use_color_buffer;
+        buffer.view_num_slices = 1;
+        REQUIRE(hle::gx2::calc_surface_size_and_alignment(buffer.surface));
+        buffer.surface.image = kImage;
+        const auto registers = hle::gx2::color_buffer_registers(buffer);
+        REQUIRE(registers.has_value());
+        buffer.cb_color_size = registers->size;
+        buffer.cb_color_info = registers->info;
+        buffer.cb_color_view = registers->view;
+        REQUIRE(hle::gx2::write_guest(memory, kBuffer, buffer));
+
+        // 0.4 is 102 exactly, in a byte.
+        call("GX2ClearColor", {kBuffer}, {0.0F, 0.4F, 1.0F, 1.0F});
+        call("GX2CopyColorBufferToScanBuffer", {kBuffer, 1});
+        call("GX2SwapScanBuffers", {});
+        call("GX2Flush", {});
+        state.timebase = hle::gx2::vsync_tick(1);
+        static_cast<void>(os.scheduler.reschedule(state));
+
+        REQUIRE(shown.size() == 1);
+        REQUIRE(shown[0].texture.valid());
+        backend->submit();
+
+        std::vector<u8> pixels(kFrameBytes);
+        REQUIRE(backend->read_texture(shown[0].texture, pixels));
+        std::size_t wrong = 0;
+        for (std::size_t i = 0; i < pixels.size(); i += 4) {
+            const std::array<u8, 4> pixel{pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]};
+            wrong += pixel != std::array<u8, 4>{0, 102, 255, 255} ? 1U : 0U;
+        }
+        INFO("the first pixel: " << int{pixels[0]} << ", " << int{pixels[1]} << ", "
+                                 << int{pixels[2]} << ", " << int{pixels[3]});
+        CHECK(wrong == 0);
+        // Guest memory never saw it.
+        CHECK(memory.read<u32>(kTvScan) == 0);
+        CHECK(backend->command_errors() == 0);
+
+        os.gpu.attach_backend(nullptr);
+    }
     backend->shutdown();
 }
 

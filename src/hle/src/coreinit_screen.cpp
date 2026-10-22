@@ -154,6 +154,7 @@ void os_screen_flip_buffers_ex(Call& call, u32 screen) {
         .geometry = geometry_of(id),
         .enabled = state->enabled,
         .flip_count = state->flips,
+        .texture = {}, // OSScreen's frames are bytes
     };
     if (!context.screens.on_flip(flip, call.memory)) {
         // The frontend wants the title stopped -- its window was closed.

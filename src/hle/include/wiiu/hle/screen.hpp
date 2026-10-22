@@ -25,10 +25,13 @@
 //
 // What reaches the screen is the frontend's business, not coreinit's. A flip
 // calls `Screens::on_flip` with the visible buffer, and the frontend copies
-// it out and presents it (7.6) -- or, in a test, checks what was drawn.
+// it out and presents it (7.6) -- or, in a test, checks what was drawn. GX2's
+// flips come the same way (8.1), with a texture instead of bytes when the GPU
+// filled the frame (ADR-006).
 #pragma once
 
 #include <wiiu/common/types.hpp>
+#include <wiiu/gpu/types.hpp>
 #include <wiiu/memory/memory.hpp>
 
 #include <array>
@@ -107,6 +110,12 @@ struct ScreenFlip {
     bool enabled = false;
 
     u64 flip_count = 0;
+
+    /// The frame as a texture, when the copy that filled it ran on the GPU
+    /// (ADR-006): then this, not the bytes at `address`, is what the screen
+    /// shows -- the bytes are whatever was there before. GX2's frames only;
+    /// OSScreen's are always bytes.
+    gpu::TextureHandle texture;
 };
 
 struct Screens {

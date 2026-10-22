@@ -402,10 +402,11 @@ int run_window(const Arguments& args) {
     return 0;
 }
 
-/// Hand OSScreen's flips to the display (6.8 -> 7.6).
+/// Hand OSScreen's flips to the display (6.8 -> 7.6), and GX2's.
 ///
 /// A flip copies the visible frame out at once, which is what scan-out is:
-/// the title will be drawing into that buffer again two flips from now. The
+/// the title will be drawing into that buffer again two flips from now. A
+/// GX2 frame the GPU filled is a texture already, and is shown as one. The
 /// TV's flip presents; the GamePad's only updates its image, so a title that
 /// flips both every frame does not present twice. A title that only ever
 /// uses the GamePad presents on its flips instead.
@@ -415,13 +416,19 @@ void connect_screens(wiiu::hle::coreinit::Context& coreinit, wiiu::frontend::Dis
 
     coreinit.screens.on_flip = [&display](const ScreenFlip& flip,
                                           const wiiu::memory::Memory& memory) {
-        const wiiu::u32 size = flip.geometry.frame_bytes();
-        const wiiu::u8* const host =
-            memory.translate(flip.address, size, wiiu::memory::Access::Read);
         const auto screen = flip.screen == ScreenId::Tv ? wiiu::gpu::PresentScreen::Tv
                                                         : wiiu::gpu::PresentScreen::Drc;
+        const wiiu::u32 size = flip.geometry.frame_bytes();
+        const wiiu::u8* const host =
+            flip.texture.valid() ? nullptr
+                                 : memory.translate(flip.address, size, wiiu::memory::Access::Read);
 
-        if (host != nullptr) {
+        if (flip.texture.valid()) {
+            // A frame the GPU filled (ADR-006): shown where it is.
+            display.presenter().show(
+                screen,
+                wiiu::gpu::ScreenTexture{flip.texture, flip.geometry.width, flip.geometry.height});
+        } else if (host != nullptr) {
             display.presenter().update(screen,
                                        wiiu::gpu::ScreenImage{{host, size},
                                                               flip.geometry.width,

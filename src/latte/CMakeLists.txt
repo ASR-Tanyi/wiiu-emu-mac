@@ -19,6 +19,7 @@ wiiu_add_library(latte
         src/shader_program.cpp
         src/surface.cpp
         src/surface_cache.cpp
+        src/surface_copy.cpp
         src/timeline.cpp
     HEADERS
         include/wiiu/latte/color_buffer.hpp
@@ -39,6 +40,7 @@ wiiu_add_library(latte
         include/wiiu/latte/shader_state.hpp
         include/wiiu/latte/surface.hpp
         include/wiiu/latte/surface_cache.hpp
+        include/wiiu/latte/surface_copy.hpp
         include/wiiu/latte/timeline.hpp
         include/wiiu/latte/viewport.hpp
     DEPS
