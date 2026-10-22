@@ -330,6 +330,7 @@ void Gpu::attach_backend(gpu::GpuBackend* backend) {
     copier_.shutdown();
     guest_buffers_.reset();
     index_cache_.reset();
+    depth_stencils_.reset();
     pipelines_.reset();
     surfaces_.reset();
     backend_ = backend;
@@ -338,6 +339,7 @@ void Gpu::attach_backend(gpu::GpuBackend* backend) {
     }
     surfaces_ = std::make_unique<latte::SurfaceCache>(*backend_);
     pipelines_ = std::make_unique<latte::PipelineCache>(*backend_);
+    depth_stencils_ = std::make_unique<latte::DepthStencilCache>(*backend_);
     std::string error;
     if (!copier_.initialize(*backend_, error)) {
         // Clears still run on the GPU; copies of what they made cannot, and
@@ -535,18 +537,40 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
         return false; // every face culled: nothing to draw
     }
 
+    // The depth and stencil tests, and the depth buffer they are made
+    // against: the one GX2SetDepthBuffer named, from the surface a clear of
+    // it made, or a new one. A draw that tests and writes nothing does not
+    // need it, and one with no depth buffer bound -- DB_DEPTH_INFO's format
+    // INVALID, as before GX2SetDepthBuffer -- tests nothing.
+    latte::DepthStencilState depth = latte::depth_stencil_state(registers);
+    std::optional<latte::DepthSurface> depth_surface;
+    if (depth.uses_depth_buffer()) {
+        const latte::DepthBufferKey key = latte::DepthBufferKey::from(registers);
+        if (latte::depth_texture_format(key).has_value()) {
+            depth_surface = surfaces_->depth_buffer(key, error);
+            if (!depth_surface.has_value()) {
+                problem = "a draw's depth buffer: " + error;
+                return false;
+            }
+            // A depth buffer without a stencil passes the stencil test.
+            depth.desc.stencil = depth.desc.stencil && depth_surface->has_stencil;
+        }
+    }
+
     latte::DrawShaders shaders;
     if (!latte::build_draw_shaders(registers, *memory_, shaders, error)) {
         problem = "a draw's shaders: " + error;
         return false;
     }
-    const gpu::PipelineHandle pipeline =
-        pipelines_->pipeline(latte::PipelineKey{.vertex_msl = shaders.vertex_msl,
-                                                .pixel_msl = shaders.pixel_msl,
-                                                .color_format = surface->format,
-                                                .primitive = *primitive,
-                                                .blend = *blend},
-                             error);
+    const gpu::PipelineHandle pipeline = pipelines_->pipeline(
+        latte::PipelineKey{.vertex_msl = shaders.vertex_msl,
+                           .pixel_msl = shaders.pixel_msl,
+                           .color_format = surface->format,
+                           .depth_format = depth_surface.has_value() ? depth_surface->format
+                                                                     : gpu::TextureFormat::Unknown,
+                           .primitive = *primitive,
+                           .blend = *blend},
+        error);
     if (!pipeline.valid()) {
         problem = "a draw's pipeline did not build: " + error;
         return false;
@@ -573,8 +597,14 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
             return false;
         }
     }
-    const std::optional<gpu::Rect> scissor =
-        latte::scissor(registers, surface->width, surface->height);
+    // The scissor stays inside every attachment, the depth buffer's too.
+    u32 width = surface->width;
+    u32 height = surface->height;
+    if (depth_surface.has_value()) {
+        width = std::min(width, depth_surface->width);
+        height = std::min(height, depth_surface->height);
+    }
+    const std::optional<gpu::Rect> scissor = latte::scissor(registers, width, height);
     if (!scissor.has_value()) {
         return false;
     }
@@ -585,11 +615,22 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
     pass.colors[0].texture = surface->texture;
     pass.colors[0].load = gpu::LoadAction::Load;
     pass.colors[0].store = gpu::StoreAction::Store;
+    if (depth_surface.has_value()) {
+        pass.depth_stencil.texture = depth_surface->texture;
+        pass.depth_stencil.load = gpu::LoadAction::Load;
+        pass.depth_stencil.store = gpu::StoreAction::Store;
+    }
     if (!backend_->begin_render_pass(pass)) {
         problem = "the backend refused a draw's render pass";
         return false;
     }
     backend_->set_pipeline(pipeline);
+    if (depth_surface.has_value()) {
+        backend_->set_depth_stencil(depth_stencils_->state(depth.desc));
+        if (depth.desc.stencil) {
+            backend_->set_stencil_reference(depth.front_reference, depth.back_reference);
+        }
+    }
     backend_->set_viewport(latte::viewport(registers));
     backend_->set_scissor(*scissor);
     backend_->set_cull_mode(raster->cull);

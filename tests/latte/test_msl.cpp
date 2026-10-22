@@ -4,7 +4,8 @@
 // (that it compiles and draws is test_metal.cpp's, on the Mac); the vertex
 // shader's outputs matching the pixel shader's inputs by semantic, those it
 // does not write included; each attribute index and component select; each
-// interpolation's qualifier; and the refusal of what is not emitted yet.
+// interpolation's qualifier; OpenGL's clip-space depth brought to Metal's
+// when asked; and the refusal of what is not emitted yet.
 
 #include <wiiu/latte/msl.hpp>
 
@@ -184,6 +185,25 @@ TEST_CASE("a semantic the pixel shader reads is output, if only as zero", "[latt
     const std::string vs = vertex(example_vertex(), &ps);
     CHECK(vs.find("    float4 sem9 [[user(sem9)]];\n") != std::string::npos);
     CHECK(vs.find("out.sem9.") == std::string::npos); // declared, never written
+}
+
+TEST_CASE("OpenGL's clip-space depth is brought to Metal's as the position is returned",
+          "[latte][shader][msl]") {
+    const ir::Shader ps = example_pixel();
+    CHECK(vertex(example_vertex(), &ps).find("out.position.w) * 0.5") == std::string::npos);
+
+    std::string out;
+    std::string error;
+    REQUIRE(msl::emit_vertex(
+        example_vertex(), &ps, out, error, msl::VertexOptions{.depth_from_minus_one = true}));
+    CHECK(out.ends_with("    out.position.w = R2.w;\n"
+                        "    out.sem0.x = R1.x;\n"
+                        "    out.sem0.y = R1.y;\n"
+                        "    out.sem0.z = R1.z;\n"
+                        "    out.sem0.w = R1.w;\n"
+                        "    out.position.z = (out.position.z + out.position.w) * 0.5;\n"
+                        "    return out;\n"
+                        "}\n"));
 }
 
 TEST_CASE("an attribute's index and components", "[latte][shader][msl]") {

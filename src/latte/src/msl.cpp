@@ -171,7 +171,8 @@ void declare_registers(std::string& out, const std::set<u32>& registers) {
 bool emit_vertex(const ir::Shader& vertex,
                  const ir::Shader* pixel,
                  std::string& out,
-                 std::string& error) {
+                 std::string& error,
+                 const VertexOptions& options) {
     out.clear();
     if (vertex.stage != ir::Stage::Vertex) {
         error = "emit_vertex was given a pixel shader";
@@ -287,6 +288,9 @@ bool emit_vertex(const ir::Shader& vertex,
                    parameter->swizzle,
                    fmt::format("R{}", parameter->gpr));
         }
+    }
+    if (options.depth_from_minus_one) {
+        out += "    out.position.z = (out.position.z + out.position.w) * 0.5;\n";
     }
     out += "    return out;\n}\n";
     return true;

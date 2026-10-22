@@ -6,7 +6,9 @@
 // offset as the rectangle GX2SetViewport was given, flipped ones included,
 // with the depth range by the clip-space convention; the scissor is cut to
 // the render target, and one that leaves nothing is none; and a pipeline is
-// built once and found after, and so is a failure, with its error kept.
+// built once and found after, and so is a failure, with its error kept. And
+// the depth and stencil tests, from DB_DEPTH_CONTROL and the stencil masks,
+// each state made once.
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/gpu/null_backend.hpp>
@@ -125,6 +127,7 @@ TEST_CASE("a pipeline is built once, and so is a failure", "[latte][draw][pipeli
     const PipelineKey key{.vertex_msl = "vertex VertexOut vertex_main(...)",
                           .pixel_msl = "fragment float4 fragment_main(...)",
                           .color_format = gpu::TextureFormat::RGBA8Unorm,
+                          .depth_format = gpu::TextureFormat::Unknown,
                           .primitive = gpu::PrimitiveType::Triangles,
                           .blend = {}};
     const gpu::PipelineHandle first = cache.pipeline(key, error);
@@ -157,6 +160,12 @@ TEST_CASE("a pipeline is built once, and so is a failure", "[latte][draw][pipeli
     blended.blend.enabled = true;
     CHECK(cache.pipeline(blended, error) != first);
     CHECK(cache.stats().builds == 3);
+
+    // And drawing with a depth buffer.
+    PipelineKey depth = key;
+    depth.depth_format = gpu::TextureFormat::Depth32FloatStencil8;
+    CHECK(cache.pipeline(depth, error) != first);
+    CHECK(cache.stats().builds == 4);
 
     cache.clear();
     CHECK(cache.size() == 0);
@@ -313,4 +322,131 @@ TEST_CASE("the blend colour and the faces culled come from their registers",
     REQUIRE(registers.write(reg::pa_su_sc_mode_cntl, 1U << 3));
     CHECK_FALSE(raster_state(registers, error).has_value());
     CHECK(error.find("polygon mode") != std::string::npos);
+}
+
+// --------------------------------------------------------------------------
+// Depth and stencil
+// --------------------------------------------------------------------------
+
+namespace {
+
+/// DB_DEPTH_CONTROL's fields, as GX2SetDepthStencilControl packs them.
+struct Control {
+    bool stencil = false;
+    bool depth = false;
+    bool write = false;
+    u32 depth_func = 0;
+    bool backface = false;
+    std::array<u32, 4> front{}; ///< func, fail, zpass, zfail
+    std::array<u32, 4> back{};
+};
+
+[[nodiscard]] u32 depth_control(const Control& c) {
+    return (c.stencil ? 1U : 0U) | ((c.depth ? 1U : 0U) << 1) | ((c.write ? 1U : 0U) << 2) |
+           (c.depth_func << 4) | ((c.backface ? 1U : 0U) << 7) | (c.front[0] << 8) |
+           (c.front[1] << 11) | (c.front[2] << 14) | (c.front[3] << 17) | (c.back[0] << 20) |
+           (c.back[1] << 23) | (c.back[2] << 26) | (c.back[3] << 29);
+}
+
+[[nodiscard]] u32 ref_mask(u32 ref, u32 mask, u32 write_mask) {
+    return ref | (mask << 8) | (write_mask << 16);
+}
+
+} // namespace
+
+TEST_CASE("depth tests come from DB_DEPTH_CONTROL", "[latte][draw][depth]") {
+    RegisterFile registers;
+
+    // Nothing enabled: nothing tested, nothing written, no buffer wanted.
+    DepthStencilState state = depth_stencil_state(registers);
+    CHECK(state.desc == gpu::DepthStencilDesc{});
+    CHECK_FALSE(state.uses_depth_buffer());
+
+    // GX2's default: tested LESS and written.
+    REQUIRE(registers.write(reg::db_depth_control,
+                            depth_control({.depth = true, .write = true, .depth_func = 1})));
+    state = depth_stencil_state(registers);
+    CHECK(state.desc.depth_compare == gpu::CompareFunction::Less);
+    CHECK(state.desc.depth_write);
+    CHECK_FALSE(state.desc.stencil);
+    CHECK(state.uses_depth_buffer());
+
+    // Read-only depth: GEQUAL, not written.
+    REQUIRE(
+        registers.write(reg::db_depth_control, depth_control({.depth = true, .depth_func = 6})));
+    state = depth_stencil_state(registers);
+    CHECK(state.desc.depth_compare == gpu::CompareFunction::GreaterEqual);
+    CHECK_FALSE(state.desc.depth_write);
+
+    // The test disabled: its write and function go with it.
+    REQUIRE(registers.write(reg::db_depth_control,
+                            depth_control({.depth = false, .write = true, .depth_func = 1})));
+    state = depth_stencil_state(registers);
+    CHECK(state.desc.depth_compare == gpu::CompareFunction::Always);
+    CHECK_FALSE(state.desc.depth_write);
+    CHECK_FALSE(state.uses_depth_buffer());
+}
+
+TEST_CASE("stencil tests come from DB_DEPTH_CONTROL and the stencil masks",
+          "[latte][draw][depth]") {
+    RegisterFile registers;
+    REQUIRE(registers.write(reg::db_stencilrefmask, ref_mask(0x5A, 0xF0, 0x0F)));
+    REQUIRE(registers.write(reg::db_stencilrefmask_bf, ref_mask(0x33, 0x3C, 0xC3)));
+
+    // Front only: EQUAL; KEEP on fail, REPLACE on pass, INCR_WRAP on depth
+    // fail -- and the back face the same, masks and reference too.
+    Control control{.stencil = true, .front = {2, 0, 2, 6}, .back = {7, 1, 1, 1}};
+    REQUIRE(registers.write(reg::db_depth_control, depth_control(control)));
+    DepthStencilState state = depth_stencil_state(registers);
+    CHECK(state.uses_depth_buffer());
+    CHECK(state.desc.depth_compare == gpu::CompareFunction::Always);
+    REQUIRE(state.desc.stencil);
+    const gpu::StencilFace front{.compare = gpu::CompareFunction::Equal,
+                                 .stencil_fail = gpu::StencilOperation::Keep,
+                                 .depth_fail = gpu::StencilOperation::IncrementWrap,
+                                 .pass = gpu::StencilOperation::Replace,
+                                 .read_mask = 0xF0,
+                                 .write_mask = 0x0F};
+    CHECK(state.desc.front == front);
+    CHECK(state.desc.back == front);
+    CHECK(state.front_reference == 0x5A);
+    CHECK(state.back_reference == 0x5A);
+
+    // BACKFACE_ENABLE: the back has its own, from the _BF fields and register.
+    control.backface = true;
+    REQUIRE(registers.write(reg::db_depth_control, depth_control(control)));
+    state = depth_stencil_state(registers);
+    CHECK(state.desc.front == front);
+    CHECK(state.desc.back == gpu::StencilFace{.compare = gpu::CompareFunction::Always,
+                                              .stencil_fail = gpu::StencilOperation::Zero,
+                                              .depth_fail = gpu::StencilOperation::Zero,
+                                              .pass = gpu::StencilOperation::Zero,
+                                              .read_mask = 0x3C,
+                                              .write_mask = 0xC3});
+    CHECK(state.front_reference == 0x5A);
+    CHECK(state.back_reference == 0x33);
+}
+
+TEST_CASE("a depth-stencil state is made once", "[latte][draw][depth]") {
+    wiiu::log::set_all_levels(wiiu::log::Level::Off);
+    gpu::NullBackend backend;
+    std::string error;
+    REQUIRE(backend.initialize(error));
+    DepthStencilCache cache(backend);
+
+    gpu::DepthStencilDesc less;
+    less.depth_compare = gpu::CompareFunction::Less;
+    less.depth_write = true;
+    const gpu::DepthStencilHandle first = cache.state(less);
+    REQUIRE(first.valid());
+    CHECK(cache.state(less) == first);
+    gpu::DepthStencilDesc read_only = less;
+    read_only.depth_write = false;
+    CHECK(cache.state(read_only) != first);
+    CHECK(cache.size() == 2);
+    CHECK(backend.live_count(gpu::ResourceKind::DepthStencil) == 2);
+
+    cache.clear();
+    CHECK(cache.size() == 0);
+    CHECK(backend.live_count(gpu::ResourceKind::DepthStencil) == 0);
 }

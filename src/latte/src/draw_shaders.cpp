@@ -2,6 +2,7 @@
 
 #include <wiiu/latte/draw_shaders.hpp>
 #include <wiiu/latte/msl.hpp>
+#include <wiiu/latte/render_state.hpp>
 #include <wiiu/latte/shader_state.hpp>
 #include <wiiu/memory/map.hpp>
 
@@ -114,7 +115,10 @@ bool build_draw_shaders(const RegisterFile& registers,
             "the pixel shader at physical {:#010x}: {}", out.pixel_location.address, error);
         return false;
     }
-    if (!msl::emit_vertex(out.vertex_ir, &out.pixel_ir, out.vertex_msl, error)) {
+    const msl::VertexOptions options{
+        .depth_from_minus_one =
+            !PaClClipCntl{.raw = registers.read(reg::pa_cl_clip_cntl)}.dx_clip_space_def};
+    if (!msl::emit_vertex(out.vertex_ir, &out.pixel_ir, out.vertex_msl, error, options)) {
         error = fmt::format("emitting the vertex shader: {}", error);
         return false;
     }

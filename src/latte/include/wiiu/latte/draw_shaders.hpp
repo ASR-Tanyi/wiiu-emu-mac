@@ -11,6 +11,10 @@
 // (msl.hpp). What comes back is what a pipeline is made of, and everything
 // along the way, so a failure can be looked at stage by stage.
 //
+// The vertex shader is emitted for the clip-space convention PA_CL_CLIP_CNTL
+// names (msl.hpp), so the same programs under OpenGL's and Direct3D's make
+// two shaders.
+//
 // A vertex shader without a fetch shader is allowed -- SQ_PGM_START_FS's
 // size zero means none -- and is an error only if it calls one. Refused, not
 // yet translated: geometry shaders (VGT_GS_MODE other than off, Cemu's test,

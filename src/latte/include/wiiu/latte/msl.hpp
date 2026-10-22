@@ -33,9 +33,15 @@
 // byte swaps other than none and 8IN32, a semantic read twice with two
 // interpolations, and integer colour targets -- every colour output is a
 // `float4` for now. Not yet done either, and needing register state the
-// translator (8.11) has: the depth range and viewport transform of the
-// position, and R0's vertex and instance indices for a shader that reads
-// them.
+// translator (8.11) has: R0's vertex and instance indices for a shader that
+// reads them.
+//
+// **Clip-space depth.** Metal clips z to [0, w]; a title that leaves
+// PA_CL_CLIP_CNTL's DX_CLIP_SPACE_DEF clear -- GX2's default -- writes
+// OpenGL's [-w, w]. With `VertexOptions::depth_from_minus_one` the position
+// is brought over as it is returned, z' = (z + w) / 2, which is Cemu's
+// SET_POSITION; the viewport's depth range (draw_state.hpp) is already read
+// the OpenGL way for such a title, so the depth that lands is OpenGL's.
 #pragma once
 
 #include <wiiu/common/types.hpp>
@@ -66,12 +72,20 @@ struct FetchConstants {
 
 static_assert(sizeof(FetchConstants) == 144);
 
+/// What a vertex shader's source depends on beyond the shader itself.
+struct VertexOptions {
+    /// Clip-space z runs from -w (OpenGL's convention), to be brought to
+    /// Metal's 0.
+    bool depth_from_minus_one = false;
+};
+
 /// A vertex shader's source, given the pixel shader it will be linked with
 /// (or none). False, with `error` saying what, for one this cannot emit yet.
 [[nodiscard]] bool emit_vertex(const ir::Shader& vertex,
                                const ir::Shader* pixel,
                                std::string& out,
-                               std::string& error);
+                               std::string& error,
+                               const VertexOptions& options = {});
 
 /// A pixel shader's source.
 [[nodiscard]] bool emit_pixel(const ir::Shader& pixel, std::string& out, std::string& error);

@@ -1332,7 +1332,8 @@ TEST_CASE("decaf's example triangle, drawn through GX2's own calls", "[gpu][meta
 
         // The frame: clear to blue, draw, copy to the TV, swap. The draw
         // either way GX2 has: auto-indexed, or from indices in the title's
-        // byte order, which are converted for Metal (latte/index_cache.hpp).
+        // byte order, which are converted for Metal (latte/index_cache.hpp);
+        // blended; and tested against a depth buffer.
         call("GX2ClearColor", {kBuffer}, {0.0F, 0.0F, 1.0F, 1.0F});
         std::array<u8, 4> green{0, 255, 0, 255};
         SECTION("auto-indexed") {
@@ -1345,6 +1346,46 @@ TEST_CASE("decaf's example triangle, drawn through GX2's own calls", "[gpu][meta
             call("GX2SetBlendControl", {0, 4, 5, 0, 0, 0, 0, 0});
             call("GX2DrawEx", {4, 3, 0, 1});
             green = {0, 102, 153, 194}; // alpha: 0.4 * 0.4 + 0.6
+        }
+        // Against WHB's depth buffer, D24_S8, under GX2's default depth state:
+        // LESS, written. The triangle's z of 0 is in OpenGL's clip space,
+        // GX2's default, so it lands in the middle of the depth range: 0.5.
+        const auto set_depth_buffer = [&](f32 clear) {
+            constexpr ppcaddr_t kDepthBuffer = 0x10006000;
+            constexpr ppcaddr_t kDepthImage = 0x10800000;
+            hle::gx2::DepthBuffer depth{};
+            depth.surface.dim = 1;
+            depth.surface.width = 1280;
+            depth.surface.height = 720;
+            depth.surface.depth = 1;
+            depth.surface.mip_levels = 1;
+            depth.surface.format = 0x011;
+            depth.surface.use = hle::gx2::surface_use_depth_buffer;
+            depth.surface.tile_mode = hle::gx2::tile_mode_default;
+            depth.view_num_slices = 1;
+            REQUIRE(hle::gx2::calc_surface_size_and_alignment(depth.surface));
+            depth.surface.image = kDepthImage;
+            const auto depth_registers = hle::gx2::depth_buffer_registers(depth);
+            REQUIRE(depth_registers.has_value());
+            depth.db_depth_size = depth_registers->size;
+            depth.db_depth_view = depth_registers->view;
+            depth.db_depth_info = depth_registers->info;
+            REQUIRE(hle::gx2::write_guest(memory, kDepthBuffer, depth));
+            call("GX2SetDepthBuffer", {kDepthBuffer});
+            call("GX2ClearDepthStencilEx",
+                 {kDepthBuffer, 0, hle::gx2::clear_depth | hle::gx2::clear_stencil},
+                 {clear});
+        };
+        SECTION("in front of what the depth buffer holds") {
+            set_depth_buffer(1.0F);
+            call("GX2DrawEx", {4, 3, 0, 1});
+        }
+        SECTION("behind what the depth buffer holds") {
+            // 0.5 is not less than 0.25: hidden. (Without OpenGL's z brought
+            // over, it would be drawn at 0, in front.)
+            set_depth_buffer(0.25F);
+            call("GX2DrawEx", {4, 3, 0, 1});
+            green = {0, 0, 255, 255};
         }
         SECTION("from GX2's big-endian 16-bit indices") {
             constexpr ppcaddr_t kIndices = 0x10040200;

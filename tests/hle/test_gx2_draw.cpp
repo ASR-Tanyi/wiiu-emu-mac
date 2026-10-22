@@ -13,8 +13,9 @@
 // made -- with the viewport and scissor, the attribute buffers bound from
 // guest memory and their fetch constants, the pipeline built once, an
 // indexed draw's indices converted to the host's order once, the blending
-// and culling GX2's colour and polygon calls set; what is not drawn yet
-// refused by name, and nothing drawn without a GPU.
+// and culling GX2's colour and polygon calls set, the depth buffer
+// GX2SetDepthBuffer named tested as GX2's depth calls say; what is not drawn
+// yet refused by name, and nothing drawn without a GPU.
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/cpu/state.hpp>
@@ -42,6 +43,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace wiiu;
@@ -453,6 +455,17 @@ TEST_CASE_METHOD(DrawFixture,
     CHECK(shaders.vertex_msl.find("device const uchar* attrib1 [[buffer(2)]]") !=
           std::string::npos);
     CHECK(shaders.pixel_msl.find("float4 color0 [[color(0)]];") != std::string::npos);
+
+    // GX2's default clip space is OpenGL's: z from -w, brought to Metal's 0.
+    constexpr std::string_view remap = "out.position.z = (out.position.z + out.position.w) * 0.5;";
+    CHECK(shaders.vertex_msl.find(remap) != std::string::npos);
+
+    // Half Z, Direct3D's: left as it is.
+    call("GX2SetRasterizerClipControlHalfZ", {1, 1, 1});
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    REQUIRE(built);
+    CHECK(shaders.vertex_msl.find(remap) == std::string::npos);
 }
 
 TEST_CASE_METHOD(DrawFixture,
@@ -685,6 +698,90 @@ TEST_CASE_METHOD(GpuDrawFixture,
     call("GX2DrawEx", {4, 3, 0, 1});
     run_gpu();
     CHECK(os.gpu.problems().contains("a draw's blending: logic op (ROP3 0x66) is not drawn yet"));
+    CHECK(backend.rejected() == 0);
+}
+
+namespace {
+
+constexpr ppcaddr_t kDepthBuffer = 0x10031000;
+constexpr ppcaddr_t kDepthImage = 0x10200000;
+
+/// WHB's depth buffer, D24_S8, the size of the fixture's colour buffer, set
+/// with GX2SetDepthBuffer and cleared to 1.0 as WHB clears it each frame.
+void set_depth_buffer(GpuDrawFixture& f) {
+    gx2::DepthBuffer buffer{};
+    buffer.surface.dim = 1;
+    buffer.surface.width = 64;
+    buffer.surface.height = 64;
+    buffer.surface.depth = 1;
+    buffer.surface.mip_levels = 1;
+    buffer.surface.format = 0x011;
+    buffer.surface.use = gx2::surface_use_depth_buffer;
+    buffer.surface.tile_mode = gx2::tile_mode_default;
+    buffer.view_num_slices = 1;
+    REQUIRE(gx2::calc_surface_size_and_alignment(buffer.surface));
+    buffer.surface.image = kDepthImage;
+    const std::optional<gx2::DepthBufferRegisters> registers = gx2::depth_buffer_registers(buffer);
+    REQUIRE(registers.has_value());
+    buffer.db_depth_size = registers->size;
+    buffer.db_depth_view = registers->view;
+    buffer.db_depth_info = registers->info;
+    REQUIRE(gx2::write_guest(f.memory, kDepthBuffer, buffer));
+    f.call("GX2SetDepthBuffer", {kDepthBuffer});
+    f.call(
+        "GX2ClearDepthStencilEx", {kDepthBuffer, 0, gx2::clear_depth | gx2::clear_stencil}, {1.0F});
+}
+
+} // namespace
+
+TEST_CASE_METHOD(GpuDrawFixture,
+                 "a draw is tested against the depth buffer GX2SetDepthBuffer named",
+                 "[hle][gx2][draw][gpu][depth]") {
+    // GX2's default state tests LESS and writes -- but with no depth buffer
+    // set there is nothing to test against, and none is attached.
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    CHECK(os.gpu.draw_stats().drawn == 1);
+    CHECK_FALSE(backend.recorded("[depth:"));
+    CHECK_FALSE(backend.recorded("set_depth_stencil"));
+
+    // With one: the surface the clear made, loaded and stored, and the
+    // default state made and set.
+    set_depth_buffer(*this);
+    backend.clear_events();
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    CHECK(os.gpu.draw_stats().drawn == 2);
+    const std::optional<latte::DepthSurface> depth =
+        os.gpu.surfaces()->find(latte::DepthBufferKey::from(os.gpu.registers()));
+    REQUIRE(depth.has_value());
+    CHECK(os.gpu.surfaces()->size() == 2);
+    CHECK(backend.last_render_pass().depth_stencil.texture == depth->texture);
+    CHECK(backend.recorded(
+        "begin_render_pass 'draw' colors=1 [0:load/store] [depth:load/store stencil:load/store]"));
+    CHECK(backend.recorded("depth 1 write on stencil off")); // LESS
+    CHECK(backend.recorded("set_depth_stencil "));
+    CHECK_FALSE(backend.recorded("set_stencil_reference"));
+    CHECK(os.gpu.pipelines()->stats().builds == 2); // the same shaders, with a depth buffer
+
+    // Read-only, GEQUAL: another state; the same pipeline.
+    call("GX2SetDepthOnlyControl", {1, 0, 6});
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    CHECK(backend.recorded("depth 6 write off stencil off"));
+    REQUIRE(os.gpu.depth_stencils() != nullptr);
+    CHECK(os.gpu.depth_stencils()->size() == 2);
+    CHECK(os.gpu.pipelines()->stats().builds == 2);
+
+    // Depth off: nothing tested or written, so no depth buffer is wanted.
+    call("GX2SetDepthOnlyControl", {0, 0, 1});
+    backend.clear_events();
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    CHECK(os.gpu.draw_stats().drawn == 4);
+    CHECK(backend.recorded("draw vertices 3"));
+    CHECK_FALSE(backend.recorded("[depth:"));
+    CHECK(os.gpu.pipelines()->stats().builds == 2);
     CHECK(backend.rejected() == 0);
 }
 

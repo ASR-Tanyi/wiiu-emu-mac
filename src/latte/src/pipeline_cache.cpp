@@ -22,6 +22,7 @@ gpu::PipelineHandle PipelineCache::pipeline(const PipelineKey& key, std::string&
     desc.fragment_entry = std::string{msl::fragment_entry};
     desc.primitive = key.primitive;
     desc.color_formats[0] = key.color_format;
+    desc.depth_format = key.depth_format;
     desc.blend[0] = key.blend;
     desc.color_count = 1;
 
@@ -46,6 +47,24 @@ void PipelineCache::clear() {
         }
     }
     entries_.clear();
+}
+
+gpu::DepthStencilHandle DepthStencilCache::state(const gpu::DepthStencilDesc& desc) {
+    if (const auto found = states_.find(desc); found != states_.end()) {
+        return found->second;
+    }
+    const gpu::DepthStencilHandle state = backend_->create_depth_stencil(desc);
+    if (state.valid()) {
+        states_.emplace(desc, state);
+    }
+    return state;
+}
+
+void DepthStencilCache::clear() {
+    for (const auto& [desc, state] : states_) {
+        backend_->destroy(state);
+    }
+    states_.clear();
 }
 
 } // namespace wiiu::latte

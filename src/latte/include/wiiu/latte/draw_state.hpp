@@ -11,7 +11,7 @@
 // space (PA_CL_CLIP_CNTL.DX_CLIP_SPACE_DEF, GX2's "half Z") the near plane is
 // the z offset and the far is offset plus scale; without it, z runs from -1,
 // so near is offset less scale (Cemu's again). Clip space's own z, which
-// Metal clips to [0, 1], is the emitter's to bring over (msl.hpp, not done).
+// Metal clips to [0, 1], is the emitter's to bring over (msl.hpp).
 //
 // **The scissor** is the generic scissor (PA_SC_GENERIC_SCISSOR_*), which
 // GX2SetScissor writes, cut to the render target: Metal refuses a scissor
@@ -37,6 +37,13 @@
 // polygon, which Metal's cull mode cannot say, so a draw of triangles is not
 // encoded at all. Polygon mode -- drawing triangles as points or lines -- is
 // refused for now.
+//
+// **Depth and stencil** are DB_DEPTH_CONTROL's, with the stencil's masks
+// and references in DB_STENCILREFMASK and _BF, read as Cemu's Metal renderer
+// reads them: depth disabled tests nothing and writes nothing; the stencil,
+// when enabled, is the front face's fields for both faces unless
+// BACKFACE_ENABLE gives the back its own (and its own masks and reference).
+// Latte's comparisons and stencil operations are Metal's, in Metal's order.
 //
 // **Primitives** map where Metal has them. Fans, loops, polygons, quad strips
 // and the adjacency types need their indices rewritten, which is not done
@@ -83,5 +90,22 @@ struct RasterState {
 /// PA_SU_SC_MODE_CNTL's culling. Nothing, with `error`, for polygon mode.
 [[nodiscard]] std::optional<RasterState> raster_state(const RegisterFile& registers,
                                                       std::string& error);
+
+/// The depth and stencil tests, and the references the stencil compares
+/// with -- which Metal sets in a pass rather than in the state.
+struct DepthStencilState {
+    gpu::DepthStencilDesc desc;
+    u8 front_reference = 0;
+    u8 back_reference = 0;
+
+    /// Whether a draw with this state reads or writes a depth buffer at all.
+    [[nodiscard]] bool uses_depth_buffer() const noexcept {
+        return desc.depth_compare != gpu::CompareFunction::Always || desc.depth_write ||
+               desc.stencil;
+    }
+};
+
+/// DB_DEPTH_CONTROL and DB_STENCILREFMASK(_BF), as Metal takes them.
+[[nodiscard]] DepthStencilState depth_stencil_state(const RegisterFile& registers) noexcept;
 
 } // namespace wiiu::latte

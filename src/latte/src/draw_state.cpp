@@ -247,4 +247,72 @@ std::optional<RasterState> raster_state(const RegisterFile& registers, std::stri
     return out;
 }
 
+namespace {
+
+// Latte's numbers are Metal's order (render_state.hpp, gpu/types.hpp).
+static_assert(static_cast<u32>(CompareFunction::Always) ==
+              static_cast<u32>(gpu::CompareFunction::Always));
+static_assert(static_cast<u32>(CompareFunction::GreaterEqual) ==
+              static_cast<u32>(gpu::CompareFunction::GreaterEqual));
+static_assert(static_cast<u32>(StencilOp::DecrementWrap) ==
+              static_cast<u32>(gpu::StencilOperation::DecrementWrap));
+static_assert(static_cast<u32>(StencilOp::Invert) ==
+              static_cast<u32>(gpu::StencilOperation::Invert));
+
+[[nodiscard]] gpu::CompareFunction compare(CompareFunction latte) noexcept {
+    return static_cast<gpu::CompareFunction>(static_cast<u32>(latte));
+}
+
+[[nodiscard]] gpu::StencilOperation stencil_operation(StencilOp latte) noexcept {
+    return static_cast<gpu::StencilOperation>(static_cast<u32>(latte));
+}
+
+[[nodiscard]] gpu::StencilFace stencil_face(CompareFunction function,
+                                            StencilOp fail,
+                                            StencilOp depth_fail,
+                                            StencilOp pass,
+                                            DbStencilRefMask masks) noexcept {
+    return gpu::StencilFace{.compare = compare(function),
+                            .stencil_fail = stencil_operation(fail),
+                            .depth_fail = stencil_operation(depth_fail),
+                            .pass = stencil_operation(pass),
+                            .read_mask = static_cast<u8>(masks.mask.value()),
+                            .write_mask = static_cast<u8>(masks.write_mask.value())};
+}
+
+} // namespace
+
+DepthStencilState depth_stencil_state(const RegisterFile& registers) noexcept {
+    const DbDepthControl control{.raw = registers.read(reg::db_depth_control)};
+    DepthStencilState out;
+    if (control.z_enable) {
+        out.desc.depth_compare = compare(control.z_func);
+        out.desc.depth_write = control.z_write_enable;
+    }
+    if (!control.stencil_enable) {
+        return out;
+    }
+    const DbStencilRefMask front{.raw = registers.read(reg::db_stencilrefmask)};
+    out.desc.stencil = true;
+    out.desc.front = stencil_face(control.stencil_func,
+                                  control.stencil_fail,
+                                  control.stencil_zfail,
+                                  control.stencil_zpass,
+                                  front);
+    out.front_reference = static_cast<u8>(front.ref.value());
+    if (control.backface_enable) {
+        const DbStencilRefMask back{.raw = registers.read(reg::db_stencilrefmask_bf)};
+        out.desc.back = stencil_face(control.stencil_func_bf,
+                                     control.stencil_fail_bf,
+                                     control.stencil_zfail_bf,
+                                     control.stencil_zpass_bf,
+                                     back);
+        out.back_reference = static_cast<u8>(back.ref.value());
+    } else {
+        out.desc.back = out.desc.front;
+        out.back_reference = out.front_reference;
+    }
+    return out;
+}
+
 } // namespace wiiu::latte

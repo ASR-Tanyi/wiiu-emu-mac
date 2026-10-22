@@ -14,6 +14,7 @@
 
 #include <wiiu/gpu/backend.hpp>
 
+#include <array>
 #include <map>
 #include <span>
 #include <string>
@@ -157,6 +158,20 @@ private:
     /// The pipeline set in the current pass. Cleared when a pass begins,
     /// because on Metal a new encoder starts with nothing set.
     PipelineHandle pass_pipeline_;
+
+    /// The attachment formats each pipeline was built for, and each
+    /// texture's format: Metal refuses a pipeline in a pass whose
+    /// attachments are not those formats, and so does this.
+    struct AttachmentFormats {
+        std::array<TextureFormat, max_color_attachments> colors{};
+        u32 color_count = 0;
+        TextureFormat depth = TextureFormat::Unknown;
+    };
+
+    std::map<u32, AttachmentFormats> pipeline_formats_;
+    std::map<u32, TextureFormat> texture_formats_;
+
+    [[nodiscard]] TextureFormat format_of(TextureHandle texture) const;
 
     std::vector<std::string> events_;
     std::vector<u8> last_bytes_;

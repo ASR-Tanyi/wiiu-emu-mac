@@ -45,7 +45,8 @@
 // textures, and the work on them is done there -- the clear, the scan-out
 // copy of a surface the GPU holds, which fills a scan frame's texture rather
 // than its bytes (a flip then hands the frontend that texture), and draws,
-// into render target 0's surface. Without one, as in most tests, the clear
+// into render target 0's surface, tested against the depth buffer's when
+// they test or write depth or stencil. Without one, as in most tests, the clear
 // and the copy are done on guest memory, on the CPU, and nothing draws.
 //
 // What is not here yet: swap interval 0's flip-without-waiting (it waits for
@@ -459,6 +460,11 @@ public:
         return pipelines_.get();
     }
 
+    /// The depth-stencil states draws have been made with, likewise.
+    [[nodiscard]] const latte::DepthStencilCache* depth_stencils() const noexcept {
+        return depth_stencils_.get();
+    }
+
     [[nodiscard]] const DrawStats& draw_stats() const noexcept { return draw_stats_; }
 
     /// Every problem the GPU's work has run into, each once, as logged --
@@ -549,6 +555,7 @@ private:
     std::unique_ptr<latte::SurfaceCache> surfaces_;
     latte::SurfaceCopier copier_;
     std::unique_ptr<latte::PipelineCache> pipelines_;
+    std::unique_ptr<latte::DepthStencilCache> depth_stencils_;
     std::unique_ptr<latte::GuestBuffers> guest_buffers_; ///< made at the first draw
     std::unique_ptr<latte::IndexCache> index_cache_;     ///< and at the first indexed one
     DrawStats draw_stats_;

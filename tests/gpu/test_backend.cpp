@@ -522,6 +522,47 @@ TEST_CASE_METHOD(BackendFixture,
     CHECK(backend.live_count(ResourceKind::DepthStencil) == 0);
 }
 
+TEST_CASE_METHOD(BackendFixture,
+                 "a pipeline is set only in a pass with the attachments it was built for",
+                 "[gpu]") {
+    const PipelineHandle pipeline = simple_pipeline(); // BGRA8, no depth
+    RenderPassDesc pass = simple_pass();
+    REQUIRE(backend.begin_render_pass(pass));
+    backend.set_pipeline(pipeline);
+    backend.end_render_pass();
+    CHECK(backend.rejected() == 0);
+
+    // Another colour format: Metal's validation refuses it, and so does this.
+    TextureDesc rgba;
+    rgba.width = 64;
+    rgba.height = 64;
+    rgba.format = TextureFormat::RGBA8Unorm;
+    rgba.usage = TextureUsage::RenderTarget;
+    pass.colors[0].texture = backend.create_texture(rgba);
+    REQUIRE(backend.begin_render_pass(pass));
+    backend.set_pipeline(pipeline);
+    backend.end_render_pass();
+    CHECK(backend.recorded("colour attachment 0 is rgba8_unorm, the pipeline was built for "
+                           "bgra8_unorm"));
+
+    // A depth attachment the pipeline was not built for.
+    pass = simple_pass();
+    TextureDesc depth;
+    depth.width = 1280;
+    depth.height = 720;
+    depth.format = TextureFormat::Depth32Float;
+    depth.usage = TextureUsage::RenderTarget;
+    pass.depth_stencil.texture = backend.create_texture(depth);
+    pass.depth_stencil.load = LoadAction::Clear;
+    pass.depth_stencil.store = StoreAction::DontCare;
+    REQUIRE(backend.begin_render_pass(pass));
+    backend.set_pipeline(pipeline);
+    backend.end_render_pass();
+    CHECK(backend.recorded("the depth attachment is depth32_float, the pipeline was built for "
+                           "unknown"));
+    CHECK(backend.rejected() == 2);
+}
+
 TEST_CASE_METHOD(BackendFixture, "a binding index past the stage's table is refused", "[gpu]") {
     SamplerDesc sampler_desc;
     const SamplerHandle sampler = backend.create_sampler(sampler_desc);

@@ -9,9 +9,12 @@
 // than compiled again every draw (P5's counters say how often each happens).
 //
 // The key is the shaders' MSL itself, which is exactly what decides what
-// gets compiled; 8.10 proper will key by a hash of the programs and their
-// registers, and keep pipelines on disk, so a title's second run compiles
-// nothing.
+// gets compiled, with the attachments' formats; 8.10 proper will key by a
+// hash of the programs and their registers, and keep pipelines on disk, so a
+// title's second run compiles nothing.
+//
+// Depth-stencil states are cached beside them: a Metal object of their own,
+// cheap to make but made once all the same, keyed by what they say.
 #pragma once
 
 #include <wiiu/common/types.hpp>
@@ -27,6 +30,7 @@ struct PipelineKey {
     std::string vertex_msl;
     std::string pixel_msl;
     gpu::TextureFormat color_format = gpu::TextureFormat::Unknown;
+    gpu::TextureFormat depth_format = gpu::TextureFormat::Unknown; ///< none without one
     gpu::PrimitiveType primitive = gpu::PrimitiveType::Triangles;
     gpu::BlendState blend; ///< render target 0's
 
@@ -69,6 +73,28 @@ private:
     gpu::GpuBackend* backend_;
     std::map<PipelineKey, Entry> entries_;
     PipelineCacheStats stats_;
+};
+
+class DepthStencilCache {
+public:
+    explicit DepthStencilCache(gpu::GpuBackend& backend) : backend_(&backend) {}
+
+    ~DepthStencilCache() { clear(); }
+
+    DepthStencilCache(const DepthStencilCache&) = delete;
+    DepthStencilCache& operator=(const DepthStencilCache&) = delete;
+
+    /// The state for `desc`, made the first time.
+    [[nodiscard]] gpu::DepthStencilHandle state(const gpu::DepthStencilDesc& desc);
+
+    /// Every state destroyed.
+    void clear();
+
+    [[nodiscard]] std::size_t size() const noexcept { return states_.size(); }
+
+private:
+    gpu::GpuBackend* backend_;
+    std::map<gpu::DepthStencilDesc, gpu::DepthStencilHandle> states_;
 };
 
 } // namespace wiiu::latte

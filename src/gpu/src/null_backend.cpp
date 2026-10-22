@@ -93,6 +93,10 @@ void NullBackend::kill(ResourceKind kind, u32 id, std::string_view what) {
     }
     if (kind == ResourceKind::Texture) {
         texture_pixels_.erase(id);
+        texture_formats_.erase(id);
+    }
+    if (kind == ResourceKind::Pipeline) {
+        pipeline_formats_.erase(id);
     }
     if (kind == ResourceKind::Fence) {
         fences_.erase(id);
@@ -152,6 +156,7 @@ bool NullBackend::attach_surface(const NativeSurface& surface, std::string& erro
         const u32 id = next_id(ResourceKind::Texture);
         live_[index_of(ResourceKind::Texture)].emplace(id, "drawable");
         drawable_ = TextureHandle{id};
+        texture_formats_.emplace(id, TextureFormat::BGRA8Unorm);
     }
 
     // Resized along with the surface, so that what was presented can be read
@@ -255,6 +260,7 @@ TextureHandle NullBackend::create_texture(const TextureDesc& desc) {
 
     const u32 id = next_id(ResourceKind::Texture);
     live_[index_of(ResourceKind::Texture)].emplace(id, label_or(desc.label, "texture"));
+    texture_formats_.emplace(id, desc.format);
 
     if (const u32 pixel = format_bytes_per_pixel(desc.format); pixel != 0) {
         TexturePixels pixels;
@@ -317,6 +323,10 @@ PipelineHandle NullBackend::create_pipeline(const PipelineDesc& desc, std::strin
     }
     const u32 id = next_id(ResourceKind::Pipeline);
     live_[index_of(ResourceKind::Pipeline)].emplace(id, label_or(desc.label, "pipeline"));
+    pipeline_formats_.emplace(id,
+                              AttachmentFormats{.colors = desc.color_formats,
+                                                .color_count = desc.color_count,
+                                                .depth = desc.depth_format});
     record(fmt::format("create_pipeline {} primitive={} label={}",
                        id,
                        primitive_type_name(desc.primitive),
@@ -675,8 +685,48 @@ void NullBackend::set_pipeline(PipelineHandle pipeline) {
         reject(fmt::format("set_pipeline {}: not a live handle", pipeline.value()));
         return;
     }
+    // Metal's validation: the pipeline was built for this pass's
+    // attachments, format for format.
+    if (const auto formats = pipeline_formats_.find(pipeline.value());
+        formats != pipeline_formats_.end()) {
+        const AttachmentFormats& built = formats->second;
+        const RenderPassDesc& pass = last_render_pass_;
+        for (u32 index = 0; index < std::max(pass.color_count, built.color_count); ++index) {
+            const TextureFormat format = index < pass.color_count
+                                             ? format_of(pass.colors[index].texture)
+                                             : TextureFormat::Unknown;
+            const TextureFormat expected =
+                index < built.color_count ? built.colors[index] : TextureFormat::Unknown;
+            if (format != expected) {
+                reject(fmt::format("set_pipeline {}: colour attachment {} is {}, the pipeline "
+                                   "was built for {}",
+                                   pipeline.value(),
+                                   index,
+                                   texture_format_name(format),
+                                   texture_format_name(expected)));
+                return;
+            }
+        }
+        const TextureFormat depth = format_of(pass.depth_stencil.texture);
+        if (depth != built.depth) {
+            reject(fmt::format("set_pipeline {}: the depth attachment is {}, the pipeline was "
+                               "built for {}",
+                               pipeline.value(),
+                               texture_format_name(depth),
+                               texture_format_name(built.depth)));
+            return;
+        }
+    }
     pass_pipeline_ = pipeline;
     record(fmt::format("set_pipeline {}", pipeline.value()));
+}
+
+TextureFormat NullBackend::format_of(TextureHandle texture) const {
+    if (!texture.valid()) {
+        return TextureFormat::Unknown;
+    }
+    const auto found = texture_formats_.find(texture.value());
+    return found == texture_formats_.end() ? TextureFormat::Unknown : found->second;
 }
 
 void NullBackend::set_viewport(const Viewport& viewport) {
