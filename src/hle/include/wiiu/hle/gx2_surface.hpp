@@ -112,6 +112,14 @@ inline constexpr u32 surface_use_scan_buffer = 1U << 3;
 inline constexpr u32 tile_mode_default = 0;
 inline constexpr u32 tile_mode_default_bad_align = 0x20;
 
+/// 2D- or 3D-tiled. Read the way GX2 reads a title's tile mode: anything from
+/// 2D thin1 up but linear-special, so a value past the modes counts too, as it
+/// does in decaf and Cemu (its layout uses the low four bits).
+[[nodiscard]] constexpr bool is_macro_tiled(u32 mode) noexcept {
+    return mode >= static_cast<u32>(latte::TileMode::Tiled2DThin1) &&
+           mode != static_cast<u32>(latte::TileMode::LinearSpecial);
+}
+
 /// The swizzle word's third byte on a 2D-tiled surface before any level has
 /// stepped down from macro-tiling.
 inline constexpr u32 swizzle_first_untiled_level_unset = 0xD;

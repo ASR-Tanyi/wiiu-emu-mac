@@ -7,6 +7,7 @@
 #include <wiiu/hle/gx2_shader.hpp>
 #include <wiiu/hle/gx2_state.hpp>
 #include <wiiu/hle/gx2_surface.hpp>
+#include <wiiu/hle/gx2_texture.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/draw.hpp>
 #include <wiiu/latte/draw_shaders.hpp>
@@ -1389,6 +1390,7 @@ void register_gx2(Registry& registry, coreinit::Context& context) {
     register_gx2_context(registry);
     register_gx2_shader(registry);
     register_gx2_buffers(registry);
+    register_gx2_texture(registry);
     register_gx2_draw(registry);
 }
 

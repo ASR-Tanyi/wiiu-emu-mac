@@ -188,6 +188,7 @@ wiiu_add_test(hle
         hle/test_gx2_draw.cpp
         hle/test_gx2_state.cpp
         hle/test_gx2_surface.cpp
+        hle/test_gx2_texture.cpp
         hle/test_hle.cpp
         hle/test_ios.cpp
         hle/test_recording.cpp

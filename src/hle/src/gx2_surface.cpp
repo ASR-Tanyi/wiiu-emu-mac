@@ -23,14 +23,6 @@ namespace {
 
 using latte::TileMode;
 
-/// 2D- or 3D-tiled. Read the way GX2 reads a title's tile mode: anything from
-/// 2D thin1 up but linear-special, so a value past the modes counts too, as it
-/// does in decaf and Cemu (its layout uses the low four bits).
-[[nodiscard]] constexpr bool is_macro_tiled(u32 mode) noexcept {
-    return mode >= static_cast<u32>(TileMode::Tiled2DThin1) &&
-           mode != static_cast<u32>(TileMode::LinearSpecial);
-}
-
 /// How many levels a full chain from this size has. GX2 caps a surface's
 /// `mipLevels` at it, and leaves a surface asking for one level alone.
 [[nodiscard]] u32 full_chain_levels(const Surface& surface) {
