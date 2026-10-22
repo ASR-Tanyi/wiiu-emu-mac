@@ -12,6 +12,7 @@ wiiu_add_library(latte
         src/control_flow.cpp
         src/draw_shaders.cpp
         src/formats.cpp
+        src/guest_buffers.cpp
         src/msl.cpp
         src/pm4.cpp
         src/registers.cpp
@@ -20,6 +21,7 @@ wiiu_add_library(latte
         src/surface.cpp
         src/surface_cache.cpp
         src/surface_copy.cpp
+        src/vertex_inputs.cpp
         src/timeline.cpp
     HEADERS
         include/wiiu/latte/color_buffer.hpp
@@ -29,6 +31,7 @@ wiiu_add_library(latte
         include/wiiu/latte/draw_shaders.hpp
         include/wiiu/latte/draw.hpp
         include/wiiu/latte/formats.hpp
+        include/wiiu/latte/guest_buffers.hpp
         include/wiiu/latte/microcode.hpp
         include/wiiu/latte/msl.hpp
         include/wiiu/latte/pm4.hpp
@@ -41,6 +44,7 @@ wiiu_add_library(latte
         include/wiiu/latte/surface.hpp
         include/wiiu/latte/surface_cache.hpp
         include/wiiu/latte/surface_copy.hpp
+        include/wiiu/latte/vertex_inputs.hpp
         include/wiiu/latte/timeline.hpp
         include/wiiu/latte/viewport.hpp
     DEPS

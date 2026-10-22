@@ -131,6 +131,7 @@ wiiu_add_test(latte
         latte/test_surface.cpp
         latte/test_surface_cache.cpp
         latte/test_surface_copy.cpp
+        latte/test_vertex_inputs.cpp
         latte/test_timeline.cpp
     DEPS
         wiiu::latte)

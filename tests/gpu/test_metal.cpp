@@ -19,6 +19,7 @@
 #include <wiiu/hle/gx2_surface.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/formats.hpp>
+#include <wiiu/latte/guest_buffers.hpp>
 #include <wiiu/latte/msl.hpp>
 #include <wiiu/latte/surface_copy.hpp>
 #include <wiiu/memory/map.hpp>
@@ -790,6 +791,34 @@ TEST_CASE("a surface copy scales by nearest pixel, as the CPU copy does",
             backend->destroy(target);
         }
         backend->destroy(source);
+    }
+    backend->shutdown();
+}
+
+TEST_CASE("guest memory is wrapped for the GPU in place", "[gpu][metal][p22]") {
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+    {
+        // Metal takes no-copy buffers only over whole pages of memory the
+        // process mapped itself; guest RAM is that, a window at a time.
+        memory::Memory memory;
+        std::string error;
+        REQUIRE(memory.initialize(memory::default_regions(), error));
+        latte::GuestBuffers buffers(*backend, memory);
+
+        for (const physaddr_t address : {physaddr_t{0x20001000}, physaddr_t{0x00000100}}) {
+            const std::optional<latte::GuestBuffers::Range> range =
+                buffers.find(address, 64, error);
+            INFO(error);
+            REQUIRE(range.has_value());
+            ppcaddr_t guest = 0;
+            REQUIRE(memory::to_virtual(memory.regions(), address, guest));
+            // The guest's bytes themselves.
+            CHECK(static_cast<u8*>(backend->buffer_contents(range->buffer)) + range->offset ==
+                  memory.translate_unchecked(guest));
+        }
+        CHECK(backend->memory_stats().imported == 2);
+        buffers.clear();
+        CHECK(backend->memory_stats().imported == 0);
     }
     backend->shutdown();
 }
