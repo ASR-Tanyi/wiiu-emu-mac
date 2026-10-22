@@ -11,9 +11,11 @@ wiiu_add_library(latte
         src/command_processor.cpp
         src/control_flow.cpp
         src/draw_shaders.cpp
+        src/draw_state.cpp
         src/formats.cpp
         src/guest_buffers.cpp
         src/msl.cpp
+        src/pipeline_cache.cpp
         src/pm4.cpp
         src/registers.cpp
         src/shader_ir.cpp
@@ -29,11 +31,13 @@ wiiu_add_library(latte
         include/wiiu/latte/control_flow.hpp
         include/wiiu/latte/depth_buffer.hpp
         include/wiiu/latte/draw_shaders.hpp
+        include/wiiu/latte/draw_state.hpp
         include/wiiu/latte/draw.hpp
         include/wiiu/latte/formats.hpp
         include/wiiu/latte/guest_buffers.hpp
         include/wiiu/latte/microcode.hpp
         include/wiiu/latte/msl.hpp
+        include/wiiu/latte/pipeline_cache.hpp
         include/wiiu/latte/pm4.hpp
         include/wiiu/latte/registers.hpp
         include/wiiu/latte/render_state.hpp
