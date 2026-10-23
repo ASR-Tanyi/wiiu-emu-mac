@@ -8,10 +8,12 @@
 // four words a fetch.
 //
 // So far: the three forms of a control-flow instruction -- the common one,
-// the ALU clause's and the export's -- and a vertex fetch. The field
-// positions are decaf's and Cemu's, which agree on every one of them; the
-// instruction numbers are decaf's, which follow AMD's R700 ISA, and Cemu's
-// agree on every one it has. A word's top two CF_INST bits are its form:
+// the ALU clause's and the export's -- a vertex fetch, and a texture fetch.
+// The field positions are decaf's and Cemu's, which agree on every one of
+// them but a texture fetch's LOD bias, which Cemu reads from word 2 on top
+// of the source selects and decaf from word 1's free bits 21 to 27; decaf's
+// is taken. The instruction numbers are decaf's, which follow AMD's R700
+// ISA, and Cemu's agree on every one it has. A word's top two CF_INST bits are its form:
 // 0 the common one, 1 an export, 2 or 3 an ALU clause, whose CF_INST is the
 // word's top four bits rather than seven.
 #pragma once
@@ -301,9 +303,95 @@ union VtxWord2 {
     BitField<20, 1, bool> alt_const;
 };
 
-/// Bytes in a control-flow instruction and in a vertex fetch.
+/// TEX_INST: what a texture fetch does, by decaf's names for R700's
+/// numbers. 0 and 1 are the vertex fetches, which a texture clause may also
+/// hold, in a vertex fetch's words.
+enum class TexInst : u32 {
+    VtxFetch = 0x00,
+    VtxSemantic = 0x01,
+    Mem = 0x02,
+    Ld = 0x03,
+    GetTextureInfo = 0x04,
+    GetSampleInfo = 0x05,
+    GetCompTexLod = 0x06,
+    GetGradientsH = 0x07,
+    GetGradientsV = 0x08,
+    GetLerp = 0x09,
+    KeepGradients = 0x0A,
+    SetGradientsH = 0x0B,
+    SetGradientsV = 0x0C,
+    Pass = 0x0D,
+    SetCubemapIndex = 0x0E,
+    Fetch4 = 0x0F,
+    Sample = 0x10,
+    SampleL = 0x11,
+    SampleLb = 0x12,
+    SampleLz = 0x13,
+    SampleG = 0x14,
+    SampleGL = 0x15,
+    SampleGLb = 0x16,
+    SampleGLz = 0x17,
+    SampleC = 0x18,
+    SampleCL = 0x19,
+    SampleCLb = 0x1A,
+    SampleCLz = 0x1B,
+    SampleCG = 0x1C,
+    SampleCGL = 0x1D,
+    SampleCGLb = 0x1E,
+    SampleCGLz = 0x1F,
+};
+
+/// A texture fetch's first word: what it does, from which resource, with
+/// which register's coordinates. The resource is counted from the stage's
+/// first, as a vertex fetch's buffer is.
+union TexWord0 {
+    u32 raw;
+    BitField<0, 5, TexInst> tex_inst;
+    BitField<5, 1, bool> bc_frac_mode;
+    BitField<7, 1, bool> fetch_whole_quad;
+    BitField<8, 8, u32> resource_id;
+    BitField<16, 7, u32> src_gpr;
+    BitField<23, 1, bool> src_rel;
+    BitField<24, 1, bool> alt_const;
+};
+
+/// The second: where the result goes, the LOD bias (signed, three
+/// fractional bits), and whether each coordinate is normalised (set) or in
+/// texels.
+union TexWord1 {
+    u32 raw;
+    BitField<0, 7, u32> dst_gpr;
+    BitField<7, 1, bool> dst_rel;
+    BitField<9, 3, Sel> dst_sel_x;
+    BitField<12, 3, Sel> dst_sel_y;
+    BitField<15, 3, Sel> dst_sel_z;
+    BitField<18, 3, Sel> dst_sel_w;
+    BitField<21, 7, u32> lod_bias;
+    BitField<28, 1, bool> coord_type_x;
+    BitField<29, 1, bool> coord_type_y;
+    BitField<30, 1, bool> coord_type_z;
+    BitField<31, 1, bool> coord_type_w;
+};
+
+/// The third: the texel offsets (signed, one fractional bit), the sampler,
+/// and which of the source register's components are the coordinates. The
+/// fourth word is padding.
+union TexWord2 {
+    u32 raw;
+    BitField<0, 5, u32> offset_x;
+    BitField<5, 5, u32> offset_y;
+    BitField<10, 5, u32> offset_z;
+    BitField<15, 5, u32> sampler_id;
+    BitField<20, 3, Sel> src_sel_x;
+    BitField<23, 3, Sel> src_sel_y;
+    BitField<26, 3, Sel> src_sel_z;
+    BitField<29, 3, Sel> src_sel_w;
+};
+
+/// Bytes in a control-flow instruction and in a vertex or texture fetch.
 inline constexpr u32 cf_instruction_bytes = 8;
 inline constexpr u32 vtx_instruction_bytes = 16;
+inline constexpr u32 tex_instruction_bytes = 16;
 
 /// The most instructions one fetch clause holds.
 inline constexpr u32 max_fetches_per_clause = 16;
