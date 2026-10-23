@@ -39,6 +39,14 @@ enum class RelocationType : u8 {
     Rel14 = 11,    ///< conditional branch displacement
     DtpMod32 = 68, ///< TLS module id
     DtpRel32 = 78, ///< TLS offset within the module
+    /// Green Hills' halves of a displacement, S + A - P, each written at its
+    /// own halfword. elf2rpl turns each R_PPC_REL32 -- a switch's jump table
+    /// in .rodata, say -- into a HI at the word and a LO at the word + 2 (its
+    /// addend 2 more, so both are the word's displacement); Cafe OS's loader
+    /// has no REL32 (decaf's reimplementation of it).
+    GhsRel16Ha = 251,
+    GhsRel16Hi = 252,
+    GhsRel16Lo = 253,
 };
 
 [[nodiscard]] std::string_view relocation_name(RelocationType type) noexcept;
@@ -60,6 +68,13 @@ struct RelocationContext {
     /// Resolved address for a symbol index, for imports. Returning false
     /// leaves the relocation unapplied and records a warning.
     std::function<bool(u32 symbol, ppcaddr_t& out)> resolve;
+
+    /// Whether a symbol is an undefined weak one, whose address is zero. A
+    /// branch to one is made a branch to itself, as Cafe OS's loader makes it
+    /// (decaf): wut's crt calls `__init_wut_socket` only `if
+    /// (&__init_wut_socket)`, so the branch is there and never runs, and zero
+    /// is out of a relative branch's reach.
+    std::function<bool(u32 symbol)> undefined_weak;
 };
 
 struct RelocationResult {
@@ -88,11 +103,14 @@ struct RelocationResult {
 /// loaded correctly.
 [[nodiscard]] constexpr bool is_halfword_relocation(RelocationType type) noexcept {
     return type == RelocationType::Addr16Lo || type == RelocationType::Addr16Hi ||
-           type == RelocationType::Addr16Ha;
+           type == RelocationType::Addr16Ha || type == RelocationType::GhsRel16Ha ||
+           type == RelocationType::GhsRel16Hi || type == RelocationType::GhsRel16Lo;
 }
 
-/// The 16-bit value a halfword relocation writes.
-[[nodiscard]] constexpr u16 relocation_halfword(RelocationType type, ppcaddr_t target) noexcept {
+/// The 16-bit value a halfword relocation at `at` writes.
+[[nodiscard]] constexpr u16
+relocation_halfword(RelocationType type, ppcaddr_t target, ppcaddr_t at) noexcept {
+    const ppcaddr_t relative = target - at;
     switch (type) {
         case RelocationType::Addr16Lo:
             return static_cast<u16>(target & 0xFFFF);
@@ -100,6 +118,12 @@ struct RelocationResult {
             return static_cast<u16>((target >> 16) & 0xFFFF);
         case RelocationType::Addr16Ha:
             return high_adjusted(target);
+        case RelocationType::GhsRel16Lo:
+            return static_cast<u16>(relative & 0xFFFF);
+        case RelocationType::GhsRel16Hi:
+            return static_cast<u16>((relative >> 16) & 0xFFFF);
+        case RelocationType::GhsRel16Ha:
+            return high_adjusted(relative);
         default:
             return 0;
     }

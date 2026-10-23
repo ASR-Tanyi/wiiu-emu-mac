@@ -221,6 +221,11 @@ public:
     static constexpr ppcaddr_t trampoline_base = 0x01900000;
     static constexpr u32 trampoline_size = 0x10000;
 
+    /// The top of that area holds data exports instead: a word each.
+    static constexpr u32 data_export_size = 0x1000;
+    static constexpr ppcaddr_t data_export_base =
+        trampoline_base + trampoline_size - data_export_size;
+
     void add(std::string library, std::string name, Handler handler);
 
     /// Register a plain function, deducing the marshalling.
@@ -241,7 +246,17 @@ public:
     /// stop a title loading, it must be visible when it is called.
     [[nodiscard]] ppcaddr_t resolve(std::string_view library, std::string_view name);
 
-    /// Write the `sc` words backing the trampolines into guest memory.
+    /// A data import: the address of a word holding the trampoline of the
+    /// function of that name. That is what coreinit's MEMAllocFromDefaultHeap,
+    /// MEMAllocFromDefaultHeapEx and MEMFreeToDefaultHeap are -- pointers to
+    /// the default heap's functions, exported as data, which a title loads
+    /// and calls through (and may overwrite, to replace the allocator). Zero
+    /// for a data import that is not a function implemented here: it stays
+    /// unresolved, and a title that reads it faults where it does.
+    [[nodiscard]] ppcaddr_t resolve_data(std::string_view library, std::string_view name);
+
+    /// Write the `sc` words backing the trampolines into guest memory, and
+    /// each data export's pointer.
     [[nodiscard]] bool install(memory::Memory& memory, std::string& error);
 
     /// Run the handler for a trampoline address. Returns false if the address
@@ -280,6 +295,9 @@ private:
     std::map<std::string, Function> functions_;
     std::map<ppcaddr_t, Function*> by_trampoline_;
     ppcaddr_t next_trampoline_ = trampoline_base;
+    std::map<std::string, ppcaddr_t> data_exports_;     ///< by library.name: the word's address
+    std::map<ppcaddr_t, const Function*> data_targets_; ///< what each word points at
+    ppcaddr_t next_data_export_ = data_export_base;
 
     std::deque<TraceEntry> trace_;
     std::size_t trace_capacity_ = 0;

@@ -27,11 +27,23 @@
 // results, unit by unit (PV.x to PV.w, and PS for the T unit), whether or
 // not they were written to a register. Translated so far is float
 // arithmetic -- MOV, ADD, MUL and MUL_IEEE, MAX and MIN, the MULADDs, DOT4
-// and DOT4_IEEE -- from registers, literals, the inline constants and PV
-// and PS, with each source's absolute value and negation and each result's
+// and DOT4_IEEE -- from registers, literals, the inline constants, PV and PS,
+// and uniforms, with each source's absolute value and negation and each
+// result's
 // output modifier and clamp. MUL, MULADD and DOT4 are DX9's multiply, where
 // zero times anything, infinity and NaN included, is zero; the _IEEE forms
 // are IEEE's.
+//
+// **Uniforms** come one of two ways, and SQ_CONFIG's DX9_CONSTS -- which
+// GX2's shader mode sets -- says which (decaf's reading): set, a source of
+// 256 to 511 is one of the stage's 256 uniform registers, C0 to C255;
+// clear, a source of 128 to 191 is a constant of a uniform block, through
+// the clause's two constant caches. Each cache locks one bank -- a uniform
+// block -- and a run of sixteen constants (LOCK_1) or thirty-two (LOCK_2)
+// from KCACHE_ADDR * 16, so KC0[n] is constant KCACHE_ADDR0 * 16 + n of
+// bank KCACHE_BANK0 (decaf's and Cemu's arithmetic, which agree). A source
+// of the other kind than SQ_CONFIG says, a cache the clause does not lock,
+// an index past what it locks, and a lock from the loop index are refused.
 //
 // A sample is written down with what the texture resource bound to its unit
 // says about it at the draw: its shape, and its component selects (WORD4's
@@ -42,8 +54,8 @@
 //
 // Everything else is refused, saying which instruction and that it is not
 // done yet, rather than translated into something that draws wrongly: in an
-// ALU clause, every other instruction, uniforms (KCACHE and the constant
-// file), relative registers and indexing, predication, PV or PS where the
+// ALU clause, every other instruction, relative registers and indexing
+// (of uniforms too), predication, PV or PS where the
 // previous group of the clause left nothing, a vertex shader reading R0
 // before writing it (R0 holds the vertex and instance indices, not modelled
 // yet), and ALU clauses that push, pop or break; loops, jumps and
@@ -64,6 +76,7 @@
 #include <wiiu/common/types.hpp>
 #include <wiiu/latte/microcode.hpp>
 #include <wiiu/latte/registers.hpp>
+#include <wiiu/latte/resources.hpp>
 #include <wiiu/latte/shader_program.hpp>
 
 #include <array>
@@ -166,19 +179,23 @@ struct SampleTexture {
 
 /// What an ALU source reads.
 enum class SourceKind : u8 {
-    Register,       ///< a component of R0 to R127
-    Value,          ///< a literal or an inline constant: these 32 bits
-    PreviousVector, ///< PV: the previous group's result on the X, Y, Z or W unit
-    PreviousScalar, ///< PS: its result on the T unit
+    Register,        ///< a component of R0 to R127
+    Value,           ///< a literal or an inline constant: these 32 bits
+    PreviousVector,  ///< PV: the previous group's result on the X, Y, Z or W unit
+    PreviousScalar,  ///< PS: its result on the T unit
+    UniformRegister, ///< one of the stage's 256 uniform registers (the constant file)
+    UniformBlock,    ///< a constant of one of the stage's uniform blocks, through KCACHE
 };
 
 /// One of an ALU instruction's sources, with its modifiers: the absolute
 /// value first, then the negation, as decaf applies them.
 struct AluSource {
     SourceKind kind = SourceKind::Value;
-    u32 gpr = 0;  ///< `Register`
-    u32 chan = 0; ///< `Register` and `PreviousVector`: x, y, z or w
-    u32 bits = 0; ///< `Value`: as stored -- a float's bits, or an integer's
+    u32 gpr = 0;   ///< `Register`
+    u32 chan = 0;  ///< every kind but `Value` and `PreviousScalar`: x, y, z or w
+    u32 bits = 0;  ///< `Value`: as stored -- a float's bits, or an integer's
+    u32 block = 0; ///< `UniformBlock`: which of the stage's sixteen (the KCACHE bank)
+    u32 index = 0; ///< `UniformRegister` and `UniformBlock`: which four-component constant
     bool absolute = false;
     bool negate = false;
 };
@@ -239,6 +256,17 @@ struct Shader {
     std::vector<PixelInput> inputs;          ///< a pixel shader's
     std::vector<Statement> body;
 };
+
+/// The uniforms a shader's ALU reads: whether it reads the stage's uniform
+/// registers, and which of its uniform blocks.
+struct UniformUse {
+    bool registers = false;
+    std::array<bool, resource::uniform_blocks_per_stage> blocks{};
+
+    [[nodiscard]] bool any() const noexcept;
+};
+
+[[nodiscard]] UniformUse uniform_use(const Shader& shader);
 
 /// A vertex shader, with the fetch shader it calls (or none, if it calls
 /// none). False, with `error` saying what and where, for one this cannot

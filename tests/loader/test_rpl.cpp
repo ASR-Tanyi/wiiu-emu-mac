@@ -216,15 +216,20 @@ TEST_CASE("a little-endian ELF is rejected", "[loader][rpl]") {
     CHECK(result.error.find("big-endian") != std::string::npos);
 }
 
-TEST_CASE("an ordinary ELF is rejected", "[loader][rpl]") {
+TEST_CASE("e_type is ET_CAFE_RPL's 0xFE01, and another is noted, not refused", "[loader][rpl]") {
     std::vector<u8> bytes = read_file(data_path("hello.rpx"));
-    bytes[16] = 0x00; // e_type = ET_EXEC rather than ET_CAFE_RPL
-    bytes[17] = 0x02;
+    CHECK(bytes[16] == 0xFE); // as elf2rpl writes it
+    CHECK(bytes[17] == 0x01);
 
+    // Cafe OS's loader does not look at it (decaf's reimplementation), so
+    // neither does this one: 0xFF01, which wut-tools' elf.h names and this
+    // loader once required, loads with a warning.
+    bytes[16] = 0xFF;
     Rpl rpl;
     const ParseResult result = parse(bytes, rpl);
-    CHECK_FALSE(result.ok);
-    CHECK(result.error.find("ET_CAFE_RPL") != std::string::npos);
+    CHECK(result.ok);
+    REQUIRE(result.warnings.size() == 1);
+    CHECK(result.warnings[0] == "e_type is 0xff01, where RPX and RPL files have 0xfe01");
 }
 
 TEST_CASE("a truncated file is rejected rather than read past its end", "[loader][rpl]") {

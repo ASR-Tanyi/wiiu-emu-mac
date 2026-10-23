@@ -53,11 +53,22 @@
 // forms are plain `*` and `+`; whether Metal's compiler fuses them, as
 // R700's MULADD_IEEE does not, is unchecked.
 //
+// **Uniforms** are read where they are. The stage's uniform registers are a
+// `constant float4* uniforms` at `uniform_registers_slot`, bound as bytes
+// at the draw; uniform block n is a `constant float4* ub<n>` at
+// `first_uniform_block_slot + n`, bound in place in guest memory -- as
+// stored, without a byte swap, which is how Latte reads it: GX2 sets no
+// swap on a uniform block, and titles swap their blocks to little-endian
+// themselves (GX2EndianSwap), as decaf and Cemu both read them. An index is
+// not checked against the block's size: the memory past it is guest memory
+// too (guest_buffers.hpp), and a title that reads past its block reads what
+// is there, as on Cemu.
+//
 // Refused, as not translated yet: attribute formats other than 32-bit
 // floats (32, 32_32, 32_32_32 and 32_32_32_32, SCALED, as GX2 writes them),
 // byte swaps other than none and 8IN32, a semantic read twice with two
-// interpolations, and integer colour targets -- every colour output is a
-// `float4` for now. Not yet done either, and needing register state the
+// interpolations, uniform blocks 13 to 15, and integer colour targets --
+// every colour output is a `float4` for now. Not yet done either, and needing register state the
 // translator (8.11) has: R0's vertex and instance indices for a shader that
 // reads them.
 //
@@ -88,6 +99,14 @@ inline constexpr u32 first_attribute_buffer_slot = 1;
 
 /// The samplers Metal binds a stage, without argument buffers.
 inline constexpr u32 max_samplers = 16;
+
+/// Both stages' uniform slots, past the vertex stage's attribute buffers:
+/// the stage's 256 uniform registers, as 4 KiB of bytes, then uniform block
+/// n at `first_uniform_block_slot + n`. Metal's thirty-one buffer slots leave
+/// room for thirteen blocks; argument buffers (ADR-003) lift that.
+inline constexpr u32 uniform_registers_slot = 17;
+inline constexpr u32 first_uniform_block_slot = 18;
+inline constexpr u32 max_uniform_blocks = 13;
 
 /// What a vertex shader reads at `fetch_constants_slot`. The MSL structure
 /// is written from the same layout.

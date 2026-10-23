@@ -16,6 +16,7 @@
 #include <wiiu/latte/pm4.hpp>
 #include <wiiu/latte/resources.hpp>
 #include <wiiu/latte/samplers.hpp>
+#include <wiiu/latte/uniform_inputs.hpp>
 #include <wiiu/latte/vertex_inputs.hpp>
 #include <wiiu/memory/map.hpp>
 
@@ -635,6 +636,19 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
         problem = "a draw's vertices: " + error;
         return false;
     }
+    // The uniforms each shader's ALU reads (uniform_inputs.hpp).
+    latte::UniformInputs vertex_uniforms;
+    latte::UniformInputs pixel_uniforms;
+    if (!latte::uniform_inputs(
+            registers, shaders.vertex_ir, *guest_buffers_, vertex_uniforms, error)) {
+        problem = "a draw's vertex shader uniforms: " + error;
+        return false;
+    }
+    if (!latte::uniform_inputs(
+            registers, shaders.pixel_ir, *guest_buffers_, pixel_uniforms, error)) {
+        problem = "a draw's pixel shader uniforms: " + error;
+        return false;
+    }
 
     // An indexed draw's indices, converted to the host's order (index_cache.hpp).
     std::optional<latte::IndexBuffer> indices;
@@ -690,6 +704,8 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
         backend_->set_blend_color(latte::blend_color(registers));
     }
     latte::bind_vertex_inputs(*backend_, inputs);
+    latte::bind_uniform_inputs(*backend_, vertex_uniforms);
+    latte::bind_uniform_inputs(*backend_, pixel_uniforms);
     for (const auto& [unit, texture] : textures) {
         backend_->bind_texture(gpu::ShaderStage::Fragment, unit, texture);
     }

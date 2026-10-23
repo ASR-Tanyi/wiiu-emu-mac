@@ -8,13 +8,18 @@
 // no region holds whole is refused. And from the registers, the buffers a
 // vertex shader reads -- each buffer its attributes name, found through its
 // resource, with its stride and size and the instance step rates for the
-// shader's FetchConstants -- bound at the emitter's slots.
+// shader's FetchConstants -- bound at the emitter's slots. And the uniforms
+// a shader's ALU reads: its stage's uniform blocks from the stage's
+// constant cache, read in place, and its uniform registers copied as bytes,
+// each at the emitter's slot; a block with nothing bound, or out of RAM,
+// refused.
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/gpu/null_backend.hpp>
 #include <wiiu/latte/guest_buffers.hpp>
 #include <wiiu/latte/resources.hpp>
 #include <wiiu/latte/shader_state.hpp>
+#include <wiiu/latte/uniform_inputs.hpp>
 #include <wiiu/latte/vertex_inputs.hpp>
 #include <wiiu/memory/map.hpp>
 
@@ -25,6 +30,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 using namespace wiiu;
 using namespace wiiu::latte;
@@ -214,4 +220,161 @@ TEST_CASE_METHOD(GuestFixture,
     vertex.attributes = {ir::VertexAttribute{.buffer = 16}};
     CHECK_FALSE(vertex_inputs(registers, vertex, *buffers, inputs, error));
     CHECK(error.find("attribute buffer 16") != std::string::npos);
+}
+
+// --------------------------------------------------------------------------
+// 8.12 — uniforms
+// --------------------------------------------------------------------------
+
+namespace {
+
+/// A shader of one ALU group whose sources are `sources`, one MOV each.
+[[nodiscard]] ir::Shader reading(ir::Stage stage, const std::vector<ir::AluSource>& sources) {
+    ir::Shader shader;
+    shader.stage = stage;
+    ir::AluGroup group;
+    u32 unit = 0;
+    for (const ir::AluSource& source : sources) {
+        ir::AluOperation op;
+        op.unit = static_cast<AluUnit>(unit++);
+        op.opcode = ir::AluOpcode::Mov;
+        op.sources[0] = source;
+        group.operations.push_back(op);
+    }
+    shader.body.emplace_back(group);
+    return shader;
+}
+
+[[nodiscard]] ir::AluSource block_source(u32 block, u32 index) {
+    return {.kind = ir::SourceKind::UniformBlock, .block = block, .index = index};
+}
+
+[[nodiscard]] ir::AluSource register_source(u32 index) {
+    return {.kind = ir::SourceKind::UniformRegister, .index = index};
+}
+
+/// Uniform block `block` of the stage as `GX2Set…UniformBlock` leaves the
+/// constant cache: the address >> 8, and the size in 256-byte units.
+void put_uniform_block(
+    RegisterFile& registers, ir::Stage stage, u32 block, physaddr_t address, u32 size) {
+    const bool vertex = stage == ir::Stage::Vertex;
+    REQUIRE(registers.write((vertex ? reg::sq_alu_const_cache_vs_0 : reg::sq_alu_const_cache_ps_0) +
+                                (4 * block),
+                            address >> 8));
+    REQUIRE(registers.write(
+        (vertex ? reg::sq_alu_const_buffer_size_vs_0 : reg::sq_alu_const_buffer_size_ps_0) +
+            (4 * block),
+        (size + 255) >> 8));
+}
+
+void in_a_pass(gpu::NullBackend& backend, const auto& bind) {
+    gpu::TextureDesc desc;
+    desc.width = 4;
+    desc.height = 4;
+    desc.format = gpu::TextureFormat::RGBA8Unorm;
+    desc.usage = gpu::TextureUsage::RenderTarget;
+    gpu::RenderPassDesc pass;
+    pass.color_count = 1;
+    pass.colors[0].texture = backend.create_texture(desc);
+    pass.colors[0].load = gpu::LoadAction::DontCare;
+    pass.colors[0].store = gpu::StoreAction::Store;
+    REQUIRE(backend.begin_render_pass(pass));
+    bind();
+    backend.end_render_pass();
+}
+
+} // namespace
+
+TEST_CASE_METHOD(GuestFixture,
+                 "a draw binds the uniform blocks its shader reads, from the constant cache",
+                 "[latte][gpu][draw][uniforms]") {
+    RegisterFile registers;
+    put_uniform_block(registers, ir::Stage::Pixel, 1, kDataPhysical + 0x4000, 64);
+    put_uniform_block(registers, ir::Stage::Pixel, 4, kDataPhysical + 0x5000, 512);
+    put_uniform_block(registers, ir::Stage::Pixel, 6, kDataPhysical + 0x6000, 64); // not read
+    put_uniform_block(registers, ir::Stage::Vertex, 1, kDataPhysical + 0x7000, 64);
+
+    const ir::Shader pixel =
+        reading(ir::Stage::Pixel, {block_source(4, 20), block_source(1, 0), block_source(4, 2)});
+    UniformInputs inputs;
+    std::string error;
+    REQUIRE(uniform_inputs(registers, pixel, *buffers, inputs, error));
+    CHECK(inputs.stage == gpu::ShaderStage::Fragment);
+    CHECK(inputs.registers.empty());
+    REQUIRE(inputs.blocks.size() == 2);
+    CHECK(inputs.blocks[0].block == 1);
+    CHECK(inputs.blocks[0].range.offset == 0x4000);
+    CHECK(inputs.blocks[1].block == 4);
+    CHECK(inputs.blocks[1].range.offset == 0x5000);
+
+    // At the emitter's slots: block n at 18 + n.
+    in_a_pass(backend, [&] { bind_uniform_inputs(backend, inputs); });
+    const std::string buffer = std::to_string(inputs.blocks[0].range.buffer.value());
+    CHECK(backend.recorded("bind_buffer fragment [19] = " + buffer + " +16384"));
+    CHECK(backend.recorded("bind_buffer fragment [22] = " + buffer + " +20480"));
+    CHECK(backend.rejected() == 0);
+
+    // The vertex shader's come from its own constant cache.
+    const ir::Shader vertex = reading(ir::Stage::Vertex, {block_source(1, 0)});
+    REQUIRE(uniform_inputs(registers, vertex, *buffers, inputs, error));
+    CHECK(inputs.stage == gpu::ShaderStage::Vertex);
+    REQUIRE(inputs.blocks.size() == 1);
+    CHECK(inputs.blocks[0].range.offset == 0x7000);
+}
+
+TEST_CASE_METHOD(GuestFixture,
+                 "a draw binds the stage's uniform registers as bytes",
+                 "[latte][gpu][draw][uniforms]") {
+    RegisterFile registers;
+    // C3 of the pixel shader, and C3 of the vertex shader, 256 registers on.
+    for (u32 word = 0; word < 4; ++word) {
+        REQUIRE(registers.write(reg::sq_alu_constant0_0 + (16 * 3) + (4 * word), 0x100 + word));
+        REQUIRE(registers.write(reg::sq_alu_constant0_256 + (16 * 3) + (4 * word), 0x200 + word));
+    }
+    const auto word_at = [](const std::vector<u8>& bytes, std::size_t index) {
+        u32 value = 0;
+        std::memcpy(&value, bytes.data() + (index * 4), 4);
+        return value;
+    };
+
+    UniformInputs inputs;
+    std::string error;
+    REQUIRE(uniform_inputs(
+        registers, reading(ir::Stage::Pixel, {register_source(3)}), *buffers, inputs, error));
+    REQUIRE(inputs.registers.size() == 4096);
+    CHECK(word_at(inputs.registers, 12) == 0x100);
+    CHECK(word_at(inputs.registers, 15) == 0x103);
+    CHECK(inputs.blocks.empty());
+
+    REQUIRE(uniform_inputs(
+        registers, reading(ir::Stage::Vertex, {register_source(3)}), *buffers, inputs, error));
+    CHECK(word_at(inputs.registers, 12) == 0x200);
+    CHECK(word_at(inputs.registers, 15) == 0x203);
+
+    in_a_pass(backend, [&] { bind_uniform_inputs(backend, inputs); });
+    CHECK(backend.recorded("bind_bytes vertex [17] 4096 bytes"));
+    CHECK(backend.last_bytes() == inputs.registers);
+    CHECK(backend.rejected() == 0);
+
+    // A shader that reads no uniforms binds nothing.
+    REQUIRE(uniform_inputs(
+        registers, reading(ir::Stage::Pixel, {ir::AluSource{}}), *buffers, inputs, error));
+    CHECK(inputs.registers.empty());
+    CHECK(inputs.blocks.empty());
+}
+
+TEST_CASE_METHOD(GuestFixture,
+                 "a uniform block the shader reads and cannot have is refused",
+                 "[latte][gpu][draw][uniforms]") {
+    RegisterFile registers;
+    UniformInputs inputs;
+    std::string error;
+    const ir::Shader pixel = reading(ir::Stage::Pixel, {block_source(2, 0)});
+    CHECK_FALSE(uniform_inputs(registers, pixel, *buffers, inputs, error));
+    CHECK(error.find("uniform block 2 is read, and none is bound (SQ_ALU_CONST_CACHE_PS_2") !=
+          std::string::npos);
+
+    put_uniform_block(registers, ir::Stage::Pixel, 2, 0x0A000000, 64);
+    CHECK_FALSE(uniform_inputs(registers, pixel, *buffers, inputs, error));
+    CHECK(error.find("uniform block 2: physical 0x0a000000") != std::string::npos);
 }

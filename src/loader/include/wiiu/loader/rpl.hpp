@@ -1,6 +1,6 @@
 // Phase 5.1-5.3 — RPX and RPL files.
 //
-// A Cafe executable is ELF32, PowerPC, big-endian, with `e_type` 0xFF01 and
+// A Cafe executable is ELF32, PowerPC, big-endian, with `e_type` 0xFE01 and
 // **no program headers**: section headers alone drive loading. Sections may be
 // individually zlib-compressed, each carries a CRC32, and imports and exports
 // use PE-style tables rather than ELF dynamic symbols.
@@ -110,8 +110,18 @@ static_assert(sizeof(RplFileInfo) == 0x60);
 // Constants
 // --------------------------------------------------------------------------
 
-inline constexpr u16 et_cafe_rpl = 0xFF01;
+/// `e_type` as RPX and RPL files carry it: what elf2rpl writes, and what
+/// decaf writes into the RPLs it makes for its HLE libraries. (wut-tools'
+/// `elf.h` names 0xFF01 ET_CAFE_RPL, a value elf2rpl itself does not use; this
+/// project read it from there first, and refused every real file.)
+inline constexpr u16 et_cafe_rpl = 0xFE01;
 inline constexpr u16 em_ppc = 20;
+
+/// Sections from here on are the loader's own: Cafe OS puts them in memory
+/// of its own (the module's load region -- its import and export tables,
+/// symbols and strings, sized by RplFileInfo's load size) and the program
+/// never addresses them. wut's linker script puts them at 0xC0000000.
+inline constexpr ppcaddr_t load_region_base = 0xC0000000;
 
 inline constexpr u32 sht_rpl_exports = 0x80000001;
 inline constexpr u32 sht_rpl_imports = 0x80000002;
@@ -227,6 +237,10 @@ struct Rpl {
     /// `.fimport_*` / `.dimport_*` section it points at. Empty if the symbol
     /// is not an import.
     [[nodiscard]] std::string import_library(const Symbol& symbol) const;
+
+    /// Whether an imported symbol is data -- in a `.dimport_*` section --
+    /// rather than a function.
+    [[nodiscard]] bool is_data_import(const Symbol& symbol) const;
     [[nodiscard]] const Section* section_at(ppcaddr_t address) const noexcept;
 };
 

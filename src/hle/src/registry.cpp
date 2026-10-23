@@ -99,7 +99,7 @@ ppcaddr_t Registry::resolve(std::string_view library, std::string_view name) {
 
     Function& function = it->second;
     if (function.trampoline == 0) {
-        if (next_trampoline_ >= trampoline_base + trampoline_size) {
+        if (next_trampoline_ >= data_export_base) {
             WIIU_LOG_ERROR(Coreinit, "out of trampoline space resolving {}", id);
             return 0;
         }
@@ -110,10 +110,42 @@ ppcaddr_t Registry::resolve(std::string_view library, std::string_view name) {
     return function.trampoline;
 }
 
+ppcaddr_t Registry::resolve_data(std::string_view library, std::string_view name) {
+    const std::string id = key(library, name);
+    if (const auto known = data_exports_.find(id); known != data_exports_.end()) {
+        return known->second;
+    }
+    const auto it = functions_.find(id);
+    if (it == functions_.end() || it->second.is_stub) {
+        return 0;
+    }
+    if (next_data_export_ >= trampoline_base + trampoline_size) {
+        WIIU_LOG_ERROR(Coreinit, "out of data export space resolving {}", id);
+        return 0;
+    }
+    if (resolve(library, name) == 0) {
+        return 0;
+    }
+    const ppcaddr_t address = next_data_export_;
+    next_data_export_ += 4;
+    data_exports_[id] = address;
+    data_targets_[address] = &it->second;
+    return address;
+}
+
 bool Registry::install(memory::Memory& memory, std::string& error) {
     for (const auto& [address, function] : by_trampoline_) {
         if (!memory.try_write<u32>(address, kSystemCall)) {
             error = fmt::format("cannot write trampoline for {}.{} at {:#010x}",
+                                function->library,
+                                function->name,
+                                address);
+            return false;
+        }
+    }
+    for (const auto& [address, function] : data_targets_) {
+        if (!memory.try_write<u32>(address, function->trampoline)) {
+            error = fmt::format("cannot write the data export {}.{} at {:#010x}",
                                 function->library,
                                 function->name,
                                 address);

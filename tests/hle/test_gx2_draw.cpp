@@ -16,8 +16,9 @@
 // and culling GX2's colour and polygon calls set, the depth buffer
 // GX2SetDepthBuffer named tested as GX2's depth calls say, the textures a
 // pixel shader samples uploaded and bound at their units with their
-// samplers; what is not drawn yet refused by name, and nothing drawn without
-// a GPU.
+// samplers, the uniforms a shader reads bound from GX2's uniform-block and
+// uniform-register calls as the shader mode says; what is not drawn yet
+// refused by name, and nothing drawn without a GPU.
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/cpu/state.hpp>
@@ -873,6 +874,90 @@ TEST_CASE_METHOD(
         named = named || problem.starts_with("a draw's texture 0: format 0x22");
     }
     CHECK(named);
+    CHECK(backend.rejected() == 0);
+}
+
+TEST_CASE_METHOD(GpuDrawFixture,
+                 "a draw's uniforms are bound from GX2's uniform calls",
+                 "[hle][gx2][draw][gpu][uniforms]") {
+    // The example's pixel shader made to read uniforms: one ALU clause
+    // locking sixteen constants of uniform block 0 --
+    //   MUL R1.x, R0.x, KC0[0].x   MOV R1.y, KC0[0].y
+    //   MOV R1.z, KC0[1].z         MOV R1.w, R0.w
+    // -- and R1 exported.
+    constexpr u32 xyzw = 0x688;
+    constexpr u32 last = 1U << 31;
+    constexpr u32 mov = 0x19U << 7;
+    constexpr u32 mul = 0x01U << 7;
+    constexpr u32 write = 1U << 4;
+    const auto dst = [](u32 gpr, u32 chan) { return (gpr << 21) | (chan << 29); };
+    const auto src0 = [](u32 sel, u32 chan) { return sel | (chan << 10); };
+    const auto src1 = [](u32 sel, u32 chan) { return (sel << 13) | (chan << 23); };
+    const std::vector<u32> uniform_block_ps{
+        2 | (1U << 30), // ALU at 2, cache 0 locks sixteen of bank 0 from 0
+        (3U << 18) | (8U << 26) | last,
+        1U << 15,
+        xyzw | (0x28U << 23) | last | (1U << 21),
+        src0(0, 0) | src1(128, 0),
+        mul | write | dst(1, 0),
+        src0(128, 1),
+        mov | write | dst(1, 1),
+        src0(129, 2),
+        mov | write | dst(1, 2),
+        src0(0, 3) | last,
+        mov | write | dst(1, 3),
+    };
+    put_program(memory, kPixelProgram, uniform_block_ps);
+    gx2::PixelShader ps{};
+    REQUIRE(gx2::read_guest(memory, kPixelStruct, ps));
+    ps.size = static_cast<u32>(uniform_block_ps.size() * 4);
+    REQUIRE(gx2::write_guest(memory, kPixelStruct, ps));
+    call("GX2SetPixelShader", {kPixelStruct});
+
+    // GX2_SHADER_MODE_UNIFORM_BLOCK, and the block.
+    constexpr ppcaddr_t kUniforms = 0x10033000;
+    call("GX2SetShaderModeEx", {1, 48, 64, 0, 0, 200, 192});
+    call("GX2SetPixelUniformBlock", {0, 32, kUniforms});
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    for (const std::string& problem : os.gpu.problems()) {
+        UNSCOPED_INFO(problem);
+    }
+    CHECK(os.gpu.draw_stats().drawn == 1);
+    CHECK(backend.recorded("bind_buffer fragment [18] = "));
+    CHECK_FALSE(backend.recorded("bind_bytes fragment"));
+
+    // In uniform-register mode the same shader is refused, by name.
+    call("GX2SetShaderModeEx", {0, 48, 64, 0, 0, 200, 192});
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    CHECK(os.gpu.draw_stats().refused == 1);
+    bool named = false;
+    for (const std::string& problem : os.gpu.problems()) {
+        named = named || problem.find("SQ_CONFIG says uniform registers") != std::string::npos;
+    }
+    CHECK(named);
+
+    // A shader reading C2 instead reads what GX2SetPixelUniformReg wrote.
+    std::vector<u32> uniform_register_ps = uniform_block_ps;
+    uniform_register_ps[0] = 2;
+    uniform_register_ps[4] = src0(0, 0) | src1(256 + 2, 0);
+    uniform_register_ps[6] = src0(256 + 2, 1);
+    uniform_register_ps[8] = src0(256 + 2, 2);
+    put_program(memory, kPixelProgram, uniform_register_ps);
+    call("GX2SetPixelShader", {kPixelStruct});
+    constexpr ppcaddr_t kValues = 0x10033400;
+    put_floats(memory, kValues, {0.5F, 0.25F, 0.125F, 1.0F});
+    call("GX2SetPixelUniformReg", {8, 4, kValues}); // C2: words 8 to 11
+    backend.clear_events();
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    CHECK(os.gpu.draw_stats().drawn == 2);
+    CHECK(backend.recorded("bind_bytes fragment [17] 4096 bytes"));
+    REQUIRE(backend.last_bytes().size() == 4096);
+    std::array<f32, 4> c2{};
+    std::memcpy(c2.data(), backend.last_bytes().data() + (2 * 16), sizeof(c2));
+    CHECK(c2 == std::array<f32, 4>{0.5F, 0.25F, 0.125F, 1.0F});
     CHECK(backend.rejected() == 0);
 }
 

@@ -222,7 +222,7 @@ static_assert(offsetof(Elf32Header, entry) == 24);
 static_assert(offsetof(Elf32Header, shoff) == 32);
 static_assert(offsetof(Elf32Header, shstrndx) == 50);
 
-/// A real RPX header prefix. e_type 0xFF01 is ET_CAFE_RPL; the 0xCA 0xFE in
+/// A real RPX header prefix. e_type 0xFE01 is ET_CAFE_RPL; the 0xCA 0xFE in
 /// e_ident at EI_OSABI/EI_ABIVERSION is the Cafe marker.
 constexpr std::array<u8, 52> kRpxHeader{
     // e_ident
@@ -231,7 +231,7 @@ constexpr std::array<u8, 52> kRpxHeader{
     0x02,                                                 // EI_DATA    = ELFDATA2MSB (big-endian)
     0x01,                                                 // EI_VERSION = 1
     0xCA, 0xFE,                                           // EI_OSABI, EI_ABIVERSION
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x01, // e_type      = ET_CAFE_RPL
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x01, // e_type      = ET_CAFE_RPL
     0x00, 0x14,                                           // e_machine   = EM_PPC (20)
     0x00, 0x00, 0x00, 0x01,                               // e_version   = 1
     0x02, 0x00, 0x00, 0x00,                               // e_entry     = 0x02000000 (app region)
@@ -261,7 +261,7 @@ TEST_CASE("a guest struct parses a known blob", "[common][endian][guest-struct]"
     CHECK(header.ident[7] == 0xCA); // Cafe marker
     CHECK(header.ident[8] == 0xFE);
 
-    CHECK(header.type == 0xFF01); // ET_CAFE_RPL
+    CHECK(header.type == 0xFE01); // ET_CAFE_RPL
     CHECK(header.machine == 20);  // EM_PPC
     CHECK(header.version == 1U);
     CHECK(header.entry == 0x02000000U);
@@ -278,7 +278,7 @@ TEST_CASE("a guest struct parses a known blob", "[common][endian][guest-struct]"
 TEST_CASE("writing a guest struct reproduces the blob", "[common][endian][guest-struct]") {
     Elf32Header header{};
     std::memcpy(header.ident.data(), kRpxHeader.data(), header.ident.size());
-    header.type = 0xFF01;
+    header.type = 0xFE01;
     header.machine = 20;
     header.version = 1;
     header.entry = 0x02000000;

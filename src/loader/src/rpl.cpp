@@ -94,6 +94,12 @@ std::string Rpl::import_library(const Symbol& symbol) const {
     return underscore == std::string::npos ? section->name : section->name.substr(underscore + 1);
 }
 
+bool Rpl::is_data_import(const Symbol& symbol) const {
+    const Section* const section = find_section(symbol.section_index);
+    return section != nullptr && section->type == sht_rpl_imports &&
+           section->name.starts_with(".dimport_");
+}
+
 const Section* Rpl::section_at(ppcaddr_t address) const noexcept {
     for (const Section& section : sections) {
         if (section.occupies_memory() && section.size != 0 && address >= section.address &&
@@ -132,9 +138,13 @@ ParseResult parse(std::span<const u8> bytes, Rpl& out) {
         return result;
     }
     if (header.type != et_cafe_rpl) {
-        result.error = fmt::format(
-            "e_type is {:#06x}, expected {:#06x} (ET_CAFE_RPL)", header.type.value(), et_cafe_rpl);
-        return result;
+        // Not fatal either: Cafe OS's loader does not look at it (decaf's
+        // reimplementation of it checks the class, byte order, OS/ABI,
+        // version, machine and section count, and not the type).
+        result.warnings.push_back(
+            fmt::format("e_type is {:#06x}, where RPX and RPL files have {:#06x}",
+                        header.type.value(),
+                        et_cafe_rpl));
     }
     if (header.machine != em_ppc) {
         result.error =

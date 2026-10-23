@@ -83,7 +83,19 @@ inline constexpr u32 db_shader_control = 0x2880C;
 inline constexpr u32 sq_alu_constant0_0 = 0x30000;
 inline constexpr u32 sq_alu_constant0_256 = 0x31000;
 
+/// SQ_CONFIG: among other things, whether shaders read their uniforms from
+/// the uniform registers or from uniform blocks (Linux's `r600d.h`).
+inline constexpr u32 sq_config = 0x8C00;
+
 } // namespace reg
+
+/// SQ_CONFIG's DX9_CONSTS: set, the ALU reads the uniform registers (the
+/// constant file, sources 256 to 511); clear, uniform blocks, through
+/// KCACHE. GX2's shader mode decides it (decaf).
+inline constexpr u32 sq_config_dx9_consts = 1U << 2;
+
+/// The uniform registers a stage has, of four words each.
+inline constexpr u32 uniform_registers_per_stage = 256;
 
 /// DB_SHADER_CONTROL's DUAL_EXPORT_ENABLE, which GX2 sets on every pixel
 /// shader it binds (decaf).

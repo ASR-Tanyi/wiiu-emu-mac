@@ -10,7 +10,8 @@
 // word for word -- every source read before any result is written, a
 // reduction computed once and written where each unit's write mask says,
 // each opcode, source modifier and output modifier, and only the helpers a
-// shader uses; and the refusal of what is not emitted yet.
+// shader uses; uniforms, the registers and each block at its slot; and the
+// refusal of what is not emitted yet.
 
 #include <wiiu/latte/msl.hpp>
 
@@ -592,4 +593,56 @@ TEST_CASE("each ALU opcode, source modifier and output modifier, as MSL",
                            "    VertexOut out = {};\n") != std::string::npos);
     CHECK(vertex_text.find("        const float alu_x = mul_dx9(R2.x, 0.5f);\n"
                            "        R2.x = alu_x;\n") != std::string::npos);
+}
+
+TEST_CASE("uniforms are read where they are bound", "[latte][shader][msl][alu][uniforms]") {
+    using enum ir::AluOpcode;
+    const auto block = [](u32 number, u32 index, u32 chan) {
+        return ir::AluSource{
+            .kind = ir::SourceKind::UniformBlock, .chan = chan, .block = number, .index = index};
+    };
+    const auto file = [](u32 index, u32 chan) {
+        return ir::AluSource{.kind = ir::SourceKind::UniformRegister, .chan = chan, .index = index};
+    };
+    ir::AluGroup group;
+    group.operations = {
+        operation(AluUnit::X, Mul, 1, 0, {block(3, 52, 1), file(7, 2)}),
+        operation(AluUnit::Y, Add, 1, 1, {block(0, 0, 3), block(3, 1, 0)}),
+    };
+    group.operations[1].sources[1].negate = true;
+
+    // The pixel shader: the uniform registers at 17, block n at 18 + n,
+    // after its inputs and before its textures.
+    ir::Shader ps = example_pixel();
+    ps.body = {group, ir::ExportColor{.index = 0, .target = 0, .gpr = 1, .swizzle = kXyzw}};
+    const std::string text = pixel(ps);
+    CHECK(text.find("fragment PixelOut fragment_main(PixelIn in [[stage_in]],\n"
+                    "                    constant float4* uniforms [[buffer(17)]],\n"
+                    "                    constant float4* ub0 [[buffer(18)]],\n"
+                    "                    constant float4* ub3 [[buffer(21)]]) {\n") !=
+          std::string::npos);
+    CHECK(text.find("        const float alu_x = mul_dx9(ub3[52].y, uniforms[7].z);\n"
+                    "        const float alu_y = ub0[0].w + -ub3[1].x;\n") != std::string::npos);
+
+    // The vertex shader: the same slots, after its attribute buffers.
+    ir::Shader vs = example_vertex();
+    vs.body.insert(vs.body.begin() + 1, group);
+    const std::string vertex_text = vertex(vs);
+    CHECK(vertex_text.find(
+              "                    device const uchar* attrib1 [[buffer(2)]],\n"
+              "                    constant float4* uniforms [[buffer(17)]],\n"
+              "                    constant float4* ub0 [[buffer(18)]],\n"
+              "                    constant float4* ub3 [[buffer(21)]]) {\n") != std::string::npos);
+
+    // A shader with no uniforms has no such parameters.
+    CHECK(pixel(alu_pixel()).find("uniforms") == std::string::npos);
+
+    // Block 13 on is past Metal's thirty-one buffer slots.
+    group.operations[0].sources[0].block = 13;
+    ps.body[0] = group;
+    std::string out;
+    std::string error;
+    CHECK_FALSE(msl::emit_pixel(ps, out, error));
+    CHECK(error.find("uniform block 13 is past the 13 Metal has buffer slots for") !=
+          std::string::npos);
 }

@@ -51,9 +51,30 @@ LoadResult load_module(const loader::Rpl& rpl,
         // appears to load fine.
         const std::string library =
             symbol.name.empty() ? std::string{} : rpl.import_library(symbol);
+        constexpr u8 stb_weak = 2; // STB_WEAK
+        if (library.empty() && i != 0 && symbol.section_index == 0 &&
+            symbol.binding() == stb_weak) {
+            // Undefined and weak: its address is zero wherever the module
+            // goes (see RelocationContext::undefined_weak).
+            symbol_addresses[static_cast<u32>(i)] = 0;
+            continue;
+        }
         if (library.empty()) {
             // A local symbol: it moves with the module.
             symbol_addresses[static_cast<u32>(i)] = symbol.value + static_cast<u32>(out.delta);
+            continue;
+        }
+
+        if (rpl.is_data_import(symbol)) {
+            const ppcaddr_t data = registry.resolve_data(library, symbol.name);
+            if (data == 0) {
+                out.unresolved_imports.push_back(fmt::format("{}.{}", library, symbol.name));
+                result.warnings.push_back(
+                    fmt::format("could not resolve the data import {}.{}", library, symbol.name));
+                continue;
+            }
+            symbol_addresses[static_cast<u32>(i)] = data;
+            out.resolved_imports.push_back(fmt::format("{}.{}", library, symbol.name));
             continue;
         }
 
@@ -81,6 +102,11 @@ LoadResult load_module(const loader::Rpl& rpl,
 
     loader::RelocationContext context;
     context.delta = out.delta;
+    context.undefined_weak = [&rpl](u32 symbol) {
+        constexpr u8 stb_weak = 2; // STB_WEAK
+        return symbol < rpl.symbols.size() && rpl.symbols[symbol].section_index == 0 &&
+               rpl.symbols[symbol].binding() == stb_weak;
+    };
     context.resolve = [&symbol_addresses](u32 symbol, ppcaddr_t& address) {
         const auto it = symbol_addresses.find(symbol);
         if (it == symbol_addresses.end()) {
@@ -119,6 +145,12 @@ LoadResult load_module(const loader::Rpl& rpl,
     // --- write into guest memory -------------------------------------------
     for (const loader::Section& section : rpl.sections) {
         if (!section.occupies_memory() || section.size == 0) {
+            continue;
+        }
+        // The loader's own sections (import and export tables, symbols):
+        // read above, not part of the program's memory.
+        if (section.address >= loader::load_region_base) {
+            WIIU_LOG_DEBUG(Loader, "{:<16}    the loader's, not written", section.name);
             continue;
         }
 

@@ -1944,6 +1944,133 @@ TEST_CASE("an emitted pixel shader runs its ALU groups", "[gpu][metal][msl][alu]
     backend->shutdown();
 }
 
+TEST_CASE("an emitted pixel shader reads its uniforms", "[gpu][metal][msl][alu][uniforms]") {
+    using namespace wiiu::latte;
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+    const TextureHandle target = make_target(*backend);
+
+    // decaf's example triangle, green, with a pixel shader of one ALU group
+    // reading a uniform register and a uniform block:
+    //
+    //   x: MUL R1.x, R0.y, C0.x    y: MOV R1.y, C0.y
+    //   z: MOV R1.z, UB0[1].z      w: MOV R1.w, R0.w
+    //
+    // With C0 = (1, 0, 0, 1) and constant 1 of block 0 (0, 0, 1, 0), stored
+    // little-endian as a title's swapped block is: magenta.
+    constexpr ir::Swizzle xyzw{Sel::X, Sel::Y, Sel::Z, Sel::W};
+    const auto attribute = [&](u32 semantic, u32 gpr, u32 buffer) {
+        ir::VertexAttribute a;
+        a.semantic = semantic;
+        a.gpr = gpr;
+        a.buffer = buffer;
+        a.bytes = 16;
+        a.data_format = 0x23;
+        a.num_format = NumFormat::Scaled;
+        a.endian = Endian::Swap8In32;
+        a.components = xyzw;
+        return a;
+    };
+    const auto op =
+        [](AluUnit unit, ir::AluOpcode opcode, u32 chan, ir::AluSource a, ir::AluSource b = {}) {
+            ir::AluOperation o;
+            o.unit = unit;
+            o.opcode = opcode;
+            o.sources = {a, b, {}};
+            o.dst_gpr = 1;
+            o.dst_chan = chan;
+            return o;
+        };
+    const auto file = [](u32 index, u32 chan) {
+        return ir::AluSource{.kind = ir::SourceKind::UniformRegister, .chan = chan, .index = index};
+    };
+    ir::AluGroup group;
+    group.operations = {
+        op(AluUnit::X,
+           ir::AluOpcode::Mul,
+           0,
+           ir::AluSource{.kind = ir::SourceKind::Register, .gpr = 0, .chan = 1},
+           file(0, 0)),
+        op(AluUnit::Y, ir::AluOpcode::Mov, 1, file(0, 1)),
+        op(AluUnit::Z,
+           ir::AluOpcode::Mov,
+           2,
+           ir::AluSource{.kind = ir::SourceKind::UniformBlock, .chan = 2, .block = 0, .index = 1}),
+        op(AluUnit::W,
+           ir::AluOpcode::Mov,
+           3,
+           ir::AluSource{.kind = ir::SourceKind::Register, .gpr = 0, .chan = 3}),
+    };
+
+    ir::Shader vs;
+    vs.stage = ir::Stage::Vertex;
+    vs.attributes = {attribute(0, 1, 0), attribute(1, 2, 1)};
+    vs.body = {ir::FetchAttributes{},
+               ir::ExportPosition{.gpr = 2, .swizzle = xyzw},
+               ir::ExportParameter{.index = 0, .semantic = 0, .gpr = 1, .swizzle = xyzw}};
+    ir::Shader ps;
+    ps.stage = ir::Stage::Pixel;
+    ps.inputs = {ir::PixelInput{.gpr = 0, .source = ir::InputSource::Parameter, .semantic = 0}};
+    ps.body = {group, ir::ExportColor{.index = 0, .target = 0, .gpr = 1, .swizzle = xyzw}};
+
+    PipelineDesc desc;
+    desc.label = "emitted uniform triangle";
+    std::string error;
+    REQUIRE(msl::emit_vertex(vs, &ps, desc.vertex_source, error));
+    REQUIRE(msl::emit_pixel(ps, desc.fragment_source, error));
+    desc.color_formats[0] = TextureFormat::BGRA8Unorm;
+    const PipelineHandle pipeline = backend->create_pipeline(desc, error);
+    INFO(error);
+    INFO(desc.fragment_source);
+    REQUIRE(pipeline.valid());
+
+    const BufferHandle colours =
+        shared_buffer(*backend,
+                      big_endian(std::array<f32, 12>{
+                          0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F}));
+    const BufferHandle positions = shared_buffer(
+        *backend,
+        big_endian(std::array<f32, 12>{
+            -1.0F, -1.0F, 0.0F, 1.0F, 1.0F, -1.0F, 0.0F, 1.0F, -1.0F, 1.0F, 0.0F, 1.0F}));
+    msl::FetchConstants constants;
+    constants.stride[0] = 16;
+    constants.stride[1] = 16;
+    constants.size[0] = 48;
+    constants.size[1] = 48;
+    const BufferHandle fetch =
+        shared_buffer(*backend, std::array<msl::FetchConstants, 1>{constants});
+    // The uniform registers, 256 of them, as the register file holds them;
+    // and the block, little-endian as the host stores floats.
+    std::array<f32, 256 * 4> registers{};
+    registers[0] = 1.0F;
+    registers[3] = 1.0F;
+    std::array<u8, sizeof(registers)> register_bytes{};
+    std::memcpy(register_bytes.data(), registers.data(), register_bytes.size());
+    const BufferHandle block =
+        shared_buffer(*backend, std::array<f32, 8>{0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F});
+
+    REQUIRE(backend->begin_render_pass(clear_pass(target, ClearColor{0.0F, 0.0F, 1.0F, 1.0F})));
+    backend->set_pipeline(pipeline);
+    backend->bind_buffer(ShaderStage::Vertex, msl::fetch_constants_slot, fetch, 0);
+    backend->bind_buffer(ShaderStage::Vertex, msl::first_attribute_buffer_slot + 0, colours, 0);
+    backend->bind_buffer(ShaderStage::Vertex, msl::first_attribute_buffer_slot + 1, positions, 0);
+    backend->bind_bytes(ShaderStage::Fragment, msl::uniform_registers_slot, register_bytes);
+    backend->bind_buffer(ShaderStage::Fragment, msl::first_uniform_block_slot + 0, block, 0);
+    DrawCall call;
+    call.vertex_count = 3;
+    backend->draw(call);
+    backend->end_render_pass();
+    backend->submit();
+
+    std::vector<u8> pixels(static_cast<std::size_t>(kTarget) * kTarget * 4);
+    REQUIRE(backend->read_texture(target, pixels));
+    constexpr std::array<u8, 4> magenta{0xFF, 0x00, 0xFF, 0xFF}; // BGRA
+    CHECK(at(pixels, 2, kTarget - 3) == magenta);
+    CHECK(at(pixels, 40, 61) == magenta);
+    CHECK(at(pixels, kTarget - 3, 2) == kBlue);
+    CHECK(backend->command_errors() == 0);
+    backend->shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // 7.8 — capture
 // ---------------------------------------------------------------------------

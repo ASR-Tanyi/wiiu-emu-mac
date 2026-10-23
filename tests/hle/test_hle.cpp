@@ -444,6 +444,71 @@ TEST_CASE("M2: a module runs and prints through OSReport", "[hle][m2]") {
     CHECK(machine.state.gpr[3] == 0U);
 }
 
+TEST_CASE("the load region stays the loader's, and a data import is a pointer to call through",
+          "[hle][loader]") {
+    // dataimport.rpx is laid out as elf2rpl lays out a wut RPX: its import
+    // table at 0xC0000000, the load region, which the program never
+    // addresses; and a call through coreinit's MEMAllocFromDefaultHeap,
+    // which coreinit exports as data -- a pointer to the default heap's
+    // allocator.
+    Machine machine;
+    LoadedModule module;
+    const LoadResult result = machine.load("dataimport.rpx", module);
+    INFO("error: " << result.error);
+    REQUIRE(result.ok);
+    CHECK(result.warnings.empty());
+    CHECK(module.unresolved_imports.empty());
+    CHECK(std::ranges::find(module.resolved_imports, "coreinit.MEMAllocFromDefaultHeap") !=
+          module.resolved_imports.end());
+
+    // lis/lwz name a word in the HLE area holding the allocator's trampoline.
+    const u32 lis = machine.memory.read<u32>(0x0200000C);
+    const u32 lwz = machine.memory.read<u32>(0x02000010);
+    const u32 cell = ((lis & 0xFFFFU) << 16) +
+                     static_cast<u32>(static_cast<s32>(static_cast<s16>(lwz & 0xFFFF)));
+    CHECK(cell >= Registry::data_export_base);
+    const Function* const alloc = machine.registry.find("coreinit", "MEMAllocFromDefaultHeap");
+    REQUIRE(alloc != nullptr);
+    CHECK(machine.memory.read<u32>(cell) == alloc->trampoline);
+    CHECK(machine.registry.resolve_data("coreinit", "MEMAllocFromDefaultHeap") == cell);
+
+    // And the call through it allocates.
+    const RunReport report = run(machine.interpreter, machine.memory, machine.registry);
+    CHECK(report.outcome == RunOutcome::Returned);
+    CHECK(alloc->call_count == 1);
+    CHECK(machine.state.gpr[3] != 0U);
+
+    // A data import that is no function implemented here stays unresolved.
+    CHECK(machine.registry.resolve_data("coreinit", "__OSCurrentThread") == 0);
+}
+
+TEST_CASE("a wut-built RPX loads with every relocation applied", "[hle][loader][wut]") {
+    // scripts/wut-samples.sh builds wut's helloworld sample: compiled against
+    // wut and newlib and made an RPX by elf2rpl, as a homebrew is. Not every
+    // checkout has one; without it there is nothing to check.
+    if (!std::filesystem::exists(data_path("wut/helloworld.rpx"))) {
+        SKIP("tests/loader/data/wut/helloworld.rpx is not built (scripts/wut-samples.sh)");
+    }
+    Machine machine;
+    LoadedModule module;
+    const LoadResult result = machine.load("wut/helloworld.rpx", module);
+    INFO("error: " << result.error);
+    REQUIRE(result.ok);
+    for (const std::string& warning : result.warnings) {
+        UNSCOPED_INFO(warning);
+    }
+    CHECK(result.warnings.empty());
+    CHECK(module.entry == 0x02000000U);
+    CHECK(module.unresolved_imports.empty());
+    // Its default-heap pointers are data imports, called through.
+    for (const char* name :
+         {"MEMAllocFromDefaultHeap", "MEMAllocFromDefaultHeapEx", "MEMFreeToDefaultHeap"}) {
+        INFO(name);
+        CHECK(std::ranges::find(module.resolved_imports, std::string{"coreinit."} + name) !=
+              module.resolved_imports.end());
+    }
+}
+
 TEST_CASE("the run loop stops on a fault rather than looping", "[hle][loader]") {
     Machine machine;
     LoadedModule module;

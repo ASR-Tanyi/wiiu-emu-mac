@@ -153,6 +153,12 @@ constexpr std::string_view previous_results = "    float4 PV = float4(0.0);\n"
         case ir::SourceKind::PreviousScalar:
             value = "PS";
             break;
+        case ir::SourceKind::UniformRegister:
+            value = fmt::format("uniforms[{}].{}", source.index, chans[source.chan & 3U]);
+            break;
+        case ir::SourceKind::UniformBlock:
+            value = fmt::format("ub{}[{}].{}", source.block, source.index, chans[source.chan & 3U]);
+            break;
     }
     if (source.absolute) {
         value = fmt::format("abs({})", value);
@@ -201,6 +207,32 @@ constexpr std::string_view previous_results = "    float4 PV = float4(0.0);\n"
         }
     }
     return "0.0f";
+}
+
+/// The parameters a shader's uniforms are bound at. False for a block past
+/// the slots there are.
+[[nodiscard]] bool
+uniform_parameters(const ir::Shader& shader, std::vector<std::string>& out, std::string& error) {
+    const ir::UniformUse use = ir::uniform_use(shader);
+    if (use.registers) {
+        out.push_back(
+            fmt::format("constant float4* uniforms [[buffer({})]]", uniform_registers_slot));
+    }
+    for (u32 block = 0; block < use.blocks.size(); ++block) {
+        if (!use.blocks[block]) {
+            continue;
+        }
+        if (block >= max_uniform_blocks) {
+            error = fmt::format("uniform block {} is past the {} Metal has buffer slots for; not "
+                                "emitted yet",
+                                block,
+                                max_uniform_blocks);
+            return false;
+        }
+        out.push_back(fmt::format(
+            "constant float4* ub{} [[buffer({})]]", block, first_uniform_block_slot + block));
+    }
+    return true;
 }
 
 /// One group: every result into its own constant, from sources read before
@@ -494,6 +526,11 @@ bool emit_vertex(const ir::Shader& vertex,
         }
     }
 
+    std::vector<std::string> uniforms;
+    if (!uniform_parameters(vertex, uniforms, error)) {
+        return false;
+    }
+
     const auto to = std::back_inserter(out);
     out += prelude;
     out += fetch_helpers;
@@ -515,6 +552,9 @@ bool emit_vertex(const ir::Shader& vertex,
                        ",\n                    device const uchar* attrib{} [[buffer({})]]",
                        buffer,
                        first_attribute_buffer_slot + buffer);
+    }
+    for (const std::string& parameter : uniforms) {
+        fmt::format_to(to, ",\n                    {}", parameter);
     }
     out += ") {\n";
     declare_registers(out, registers);
@@ -650,6 +690,10 @@ bool emit_pixel(const ir::Shader& pixel, std::string& out, std::string& error) {
     std::vector<std::string> parameters;
     if (has_inputs) {
         parameters.emplace_back("PixelIn in [[stage_in]]");
+    }
+    if (!uniform_parameters(pixel, parameters, error)) {
+        out.clear();
+        return false;
     }
     for (const u32 texture : textures) {
         parameters.push_back(fmt::format("texture2d<float> tex{0} [[texture({0})]]", texture));

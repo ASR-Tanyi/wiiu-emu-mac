@@ -22,13 +22,13 @@ namespace {
 using latte::pm4::Opcode;
 
 // Register addresses: Linux's `r600d.h` has every one.
-constexpr u32 sq_config = 0x8C00;
+constexpr u32 sq_config = latte::reg::sq_config;
 constexpr u32 sq_esgs_ring_base = 0x8C40;      ///< then its size, GSVS's base and size
 constexpr u32 sq_esgs_ring_itemsize = 0x288A8; ///< then SQ_GSVS_RING_ITEMSIZE
 constexpr u32 vgt_gs_mode = 0x28A40;
 
 // Field positions, from the same header.
-constexpr u32 dx9_consts = 1U << 2;
+constexpr u32 dx9_consts = latte::sq_config_dx9_consts;
 constexpr u32 alu_inst_prefer_vector = 1U << 3;
 
 [[nodiscard]] constexpr u32 priorities(u32 ps, u32 vs, u32 gs, u32 es) noexcept {

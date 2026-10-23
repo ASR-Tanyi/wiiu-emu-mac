@@ -26,6 +26,12 @@ std::string_view relocation_name(RelocationType type) noexcept {
             return "REL24";
         case RelocationType::Rel14:
             return "REL14";
+        case RelocationType::GhsRel16Ha:
+            return "GHS_REL16_HA";
+        case RelocationType::GhsRel16Hi:
+            return "GHS_REL16_HI";
+        case RelocationType::GhsRel16Lo:
+            return "GHS_REL16_LO";
         case RelocationType::DtpMod32:
             return "DTPMOD32";
         case RelocationType::DtpRel32:
@@ -107,6 +113,11 @@ bool apply_relocation(
             out = (word & 0xFFFF0003U) | (static_cast<u32>(displacement) & 0x0000FFFCU);
             return true;
         }
+
+        case RelocationType::GhsRel16Ha:
+        case RelocationType::GhsRel16Hi:
+        case RelocationType::GhsRel16Lo:
+            return false; // halfwords: relocation_halfword
     }
     return false;
 }
@@ -135,6 +146,7 @@ RelocationResult apply_relocations(std::span<const Relocation> relocations,
 
         // An entry with a symbol is an import and needs resolving; one without
         // just moves with the module.
+        const ppcaddr_t at = relocation.offset + static_cast<u32>(context.delta);
         ppcaddr_t target = 0;
         if (relocation.symbol != 0 && context.resolve) {
             if (!context.resolve(relocation.symbol, target)) {
@@ -143,6 +155,12 @@ RelocationResult apply_relocations(std::span<const Relocation> relocations,
                                                       relocation_name(relocation.type),
                                                       relocation.offset));
                 continue;
+            }
+            const bool branch = relocation.type == RelocationType::Rel24 ||
+                                relocation.type == RelocationType::Rel14;
+            if (branch && target == 0 && context.undefined_weak &&
+                context.undefined_weak(relocation.symbol)) {
+                target = at; // to itself (decaf's loader)
             }
             target += static_cast<u32>(relocation.addend);
         } else {
@@ -153,7 +171,7 @@ RelocationResult apply_relocations(std::span<const Relocation> relocations,
             // The offset addresses the immediate field itself, so only those
             // two bytes are written; the opcode beside them is not ours to
             // touch.
-            const u16be written = relocation_halfword(relocation.type, target);
+            const u16be written = relocation_halfword(relocation.type, target, at);
             std::memcpy(section.data.data() + index, &written, sizeof(written));
             ++result.applied;
             continue;
@@ -163,7 +181,6 @@ RelocationResult apply_relocations(std::span<const Relocation> relocations,
         std::memcpy(&stored, section.data.data() + index, sizeof(stored));
 
         u32 patched = 0;
-        const ppcaddr_t at = relocation.offset + static_cast<u32>(context.delta);
         if (!apply_relocation(relocation.type, stored.value(), target, at, patched)) {
             result.warnings.push_back(
                 fmt::format("{} at {:#010x} could not be applied (target {:#010x} out of range)",

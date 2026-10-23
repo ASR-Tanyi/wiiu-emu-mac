@@ -6,6 +6,7 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <array>
 #include <iterator>
 #include <optional>
@@ -163,7 +164,8 @@ constexpr std::array output_modifiers{
 class Builder {
 public:
     Builder(const RegisterFile& registers, Shader& out, std::string& error)
-        : registers_(registers), out_(out), error_(error) {}
+        : registers_(registers), out_(out), error_(error),
+          uniform_registers_((registers.read(reg::sq_config) & sq_config_dx9_consts) != 0) {}
 
     [[nodiscard]] bool fail(std::string message) {
         error_ = std::move(message);
@@ -501,7 +503,8 @@ public:
             if (is_nop(instruction)) {
                 continue; // no result: PV or PS of its unit is left unset
             }
-            const std::optional<AluOperation> operation = alu_operation(at, instruction, group);
+            const std::optional<AluOperation> operation =
+                alu_operation(at, inst, instruction, group);
             if (!operation.has_value()) {
                 return false;
             }
@@ -567,6 +570,7 @@ public:
     /// One instruction, or nothing (with the error set) for one not
     /// translated yet.
     [[nodiscard]] std::optional<AluOperation> alu_operation(const std::string& group_at,
+                                                            const CfInstruction& clause,
                                                             const AluInstruction& instruction,
                                                             const latte::AluGroup& group) {
         const std::string at = fmt::format("{}, {} on the {} unit",
@@ -633,8 +637,12 @@ public:
             if (!op3 && i < 2) {
                 source.abs = i == 0 ? instruction.op2().src0_abs : instruction.op2().src1_abs;
             }
-            const std::optional<AluSource> decoded = alu_source(
-                fmt::format("{}, source {}", at, i), source.sel, source.rel, source.chan, group);
+            const std::optional<AluSource> decoded = alu_source(fmt::format("{}, source {}", at, i),
+                                                                clause,
+                                                                source.sel,
+                                                                source.rel,
+                                                                source.chan,
+                                                                group);
             if (!decoded.has_value()) {
                 return std::nullopt;
             }
@@ -645,8 +653,12 @@ public:
         return operation;
     }
 
-    [[nodiscard]] std::optional<AluSource> alu_source(
-        const std::string& at, u32 sel, bool relative, u32 chan, const latte::AluGroup& group) {
+    [[nodiscard]] std::optional<AluSource> alu_source(const std::string& at,
+                                                      const CfInstruction& clause,
+                                                      u32 sel,
+                                                      bool relative,
+                                                      u32 chan,
+                                                      const latte::AluGroup& group) {
         if (relative) {
             return refuse(fmt::format("{} is a relative register; not translated yet", at));
         }
@@ -663,11 +675,20 @@ public:
             source.chan = chan;
             return source;
         }
-        if ((sel >= alu_src::kcache0_first && sel <= alu_src::kcache1_last) ||
-            (sel >= alu_src::const_file_first && sel <= alu_src::const_file_last)) {
-            return refuse(fmt::format("{} reads a uniform (KCACHE or the constant file); not "
-                                      "translated yet",
-                                      at));
+        if (sel >= alu_src::kcache0_first && sel <= alu_src::kcache1_last) {
+            return kcache_source(at, clause, sel, chan);
+        }
+        if (sel >= alu_src::const_file_first && sel <= alu_src::const_file_last) {
+            if (!uniform_registers_) {
+                return refuse(fmt::format("{} reads uniform register C{}, and SQ_CONFIG says "
+                                          "uniform blocks (DX9_CONSTS is clear)",
+                                          at,
+                                          sel - alu_src::const_file_first));
+            }
+            source.kind = SourceKind::UniformRegister;
+            source.index = sel - alu_src::const_file_first;
+            source.chan = chan;
+            return source;
         }
         source.kind = SourceKind::Value;
         switch (sel) {
@@ -710,6 +731,48 @@ public:
                 return refuse(
                     fmt::format("{} reads source select {}; not translated yet", at, sel));
         }
+    }
+
+    /// KC0[n] or KC1[n]: constant KCACHE_ADDR * 16 + n of the cache's
+    /// bank, if the clause locks that far.
+    [[nodiscard]] std::optional<AluSource>
+    kcache_source(const std::string& at, const CfInstruction& clause, u32 sel, u32 chan) {
+        const bool second = sel >= alu_src::kcache1_first;
+        const u32 n = sel - (second ? alu_src::kcache1_first : alu_src::kcache0_first);
+        const CfAluWord0 word0 = clause.alu0();
+        const CfAluWord1 word1 = clause.alu1();
+        const KcacheMode mode = second ? word1.kcache_mode1.value() : word0.kcache_mode0.value();
+        const u32 bank = second ? word0.kcache_bank1 : word0.kcache_bank0;
+        const u32 address = second ? word1.kcache_addr1 : word1.kcache_addr0;
+        const std::string name = fmt::format("KC{}[{}]", second ? 1 : 0, n);
+        if (uniform_registers_) {
+            return refuse(fmt::format("{} reads {}, a uniform block, and SQ_CONFIG says uniform "
+                                      "registers (DX9_CONSTS is set)",
+                                      at,
+                                      name));
+        }
+        switch (mode) {
+            case KcacheMode::Nop:
+                return refuse(fmt::format(
+                    "{} reads {}, and the clause locks nothing in that cache", at, name));
+            case KcacheMode::Lock1:
+                if (n >= 16) {
+                    return refuse(fmt::format(
+                        "{} reads {}, past the sixteen constants the clause locks", at, name));
+                }
+                break;
+            case KcacheMode::Lock2:
+                break;
+            case KcacheMode::LockLoopIndex:
+                return refuse(fmt::format(
+                    "{} reads {}, locked from the loop index; not translated yet", at, name));
+        }
+        AluSource source;
+        source.kind = SourceKind::UniformBlock;
+        source.block = bank;
+        source.index = (address * 16) + n;
+        source.chan = chan;
+        return source;
     }
 
     [[nodiscard]] std::nullopt_t refuse(std::string message) {
@@ -775,6 +838,7 @@ private:
     std::array<bool, 4> previous_vector_{}; ///< which of PV.x to .w the last group set
     bool previous_scalar_ = false;          ///< whether it set PS
     std::array<bool, 4> r0_written_{};      ///< a vertex shader's R0, component by component
+    bool uniform_registers_ = false;        ///< SQ_CONFIG's DX9_CONSTS
 };
 
 // --- describe ----------------------------------------------------------------
@@ -892,6 +956,12 @@ struct StatementText {
             case SourceKind::PreviousScalar:
                 out += "PS";
                 break;
+            case SourceKind::UniformRegister:
+                fmt::format_to(to, "C{}.{}", s.index, "xyzw"[s.chan & 3U]);
+                break;
+            case SourceKind::UniformBlock:
+                fmt::format_to(to, "UB{}[{}].{}", s.block, s.index, "xyzw"[s.chan & 3U]);
+                break;
         }
         if (s.absolute) {
             out += '|';
@@ -947,6 +1017,32 @@ bool build_pixel_shader(const ShaderProgram& pixel,
     out = Shader{.stage = Stage::Pixel, .attributes = {}, .inputs = {}, .body = {}};
     Builder builder{registers, out, error};
     return builder.supported_shape(pixel) && builder.pixel_inputs() && builder.body(pixel, nullptr);
+}
+
+bool UniformUse::any() const noexcept {
+    return registers || std::ranges::any_of(blocks, [](bool read) { return read; });
+}
+
+UniformUse uniform_use(const Shader& shader) {
+    UniformUse use;
+    for (const Statement& statement : shader.body) {
+        const auto* group = std::get_if<AluGroup>(&statement);
+        if (group == nullptr) {
+            continue;
+        }
+        for (const AluOperation& op : group->operations) {
+            for (u32 i = 0; i < source_count(op.opcode); ++i) {
+                const AluSource& source = op.sources[i];
+                if (source.kind == SourceKind::UniformRegister) {
+                    use.registers = true;
+                } else if (source.kind == SourceKind::UniformBlock &&
+                           source.block < use.blocks.size()) {
+                    use.blocks[source.block] = true;
+                }
+            }
+        }
+    }
+    return use;
 }
 
 std::string describe(const Shader& shader) {

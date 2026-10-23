@@ -11,7 +11,9 @@
 // microcode into their groups -- each unit's instruction, sources (registers,
 // literals, inline constants, PV and PS), modifiers, write mask, and a DOT4
 // across the four vector units -- with a vertex shader's R0 readable only
-// once written; and the refusal of everything not translated yet, by name.
+// once written; uniforms -- a block's constant through the clause's
+// constant caches, or a uniform register, as SQ_CONFIG says; and the
+// refusal of everything not translated yet, by name.
 
 #include <wiiu/latte/resources.hpp>
 #include <wiiu/latte/shader_ir.hpp>
@@ -468,18 +470,22 @@ constexpr u32 alu_muladd = 0x10;
 
 /// A program of ALU clauses, each a list of 64-bit slots, run in order,
 /// then one export: PIX0 (type 0) or POS0 (type 1) from `gpr`. `cf_inst`
-/// is each clause's ALU CF_INST.
+/// is each clause's ALU CF_INST; `kcache0` and `kcache1` are ORed into each
+/// clause's two words, for its constant caches.
 [[nodiscard]] std::vector<u32>
 alu_program(const std::vector<std::vector<std::array<u32, 2>>>& clauses,
             u32 export_type,
             u32 gpr,
-            u32 cf_inst = 8) {
+            u32 cf_inst = 8,
+            u32 kcache0 = 0,
+            u32 kcache1 = 0) {
     const auto cf_slots = static_cast<u32>(clauses.size() + 1);
     std::vector<u32> words;
     u32 address = cf_slots;
     for (const auto& clause : clauses) {
-        words.push_back(address);
-        words.push_back(((static_cast<u32>(clause.size()) - 1) << 18) | (cf_inst << 26) | barrier);
+        words.push_back(address | kcache0);
+        words.push_back(((static_cast<u32>(clause.size()) - 1) << 18) | (cf_inst << 26) | barrier |
+                        kcache1);
         address += static_cast<u32>(clause.size());
     }
     words.push_back(exp0(export_type == 1 ? 60 : 0, export_type, gpr));
@@ -629,9 +635,7 @@ TEST_CASE("what an ALU clause holds that is not translated yet is refused",
         return op2({.inst = alu_mov, .dst = 1, .a = a, .last = last});
     };
 
-    // Uniforms: KCACHE, and the constant file.
-    CHECK(refused({mov({128})}).find("reads a uniform") != std::string::npos);
-    CHECK(refused({mov({300})}).find("reads a uniform") != std::string::npos);
+    // (Uniforms have their own tests, below.)
     // PV and PS where the previous group left nothing: the first group, a
     // unit that ran a NOP, a T unit that ran nothing.
     CHECK(refused({mov({src_pv})}).find("reads PV.x, which the clause's previous group") !=
@@ -660,4 +664,92 @@ TEST_CASE("what an ALU clause holds that is not translated yet is refused",
               .find("DOT4 on fewer than the four vector units") != std::string::npos);
     // A clause that pushes first.
     CHECK(refused({mov({0})}, 9).find("push, pop or branch") != std::string::npos);
+}
+
+// --------------------------------------------------------------------------
+// Uniforms
+// --------------------------------------------------------------------------
+
+namespace {
+
+/// A constant cache's lock, as its clause's two words carry it: cache 0's
+/// bank and mode in word 0 and its address in word 1; cache 1's bank in
+/// word 0, its mode and address in word 1.
+struct Kcache {
+    u32 word0 = 0;
+    u32 word1 = 0;
+};
+
+[[nodiscard]] Kcache
+lock(u32 bank0, u32 mode0, u32 addr0, u32 bank1 = 0, u32 mode1 = 0, u32 addr1 = 0) {
+    return {.word0 = (bank0 << 22) | (bank1 << 26) | (mode0 << 30),
+            .word1 = mode1 | (addr0 << 2) | (addr1 << 10)};
+}
+
+[[nodiscard]] std::vector<u32> uniform_ps(const std::vector<std::array<u32, 2>>& clause,
+                                          Kcache kcache) {
+    return alu_program({clause}, 0, 1, 8, kcache.word0, kcache.word1);
+}
+
+constexpr u32 sq_config = 0x8C00;
+constexpr u32 dx9_consts = 1U << 2;
+
+} // namespace
+
+TEST_CASE("a uniform is a block's constant through KCACHE, or a uniform register",
+          "[latte][shader][ir][alu][uniforms]") {
+    const Registers registers;
+    // Cache 0 locks sixteen constants of block 2 from 3 * 16; cache 1
+    // thirty-two of block 5 from 16.
+    const Kcache kcache = lock(2, 1, 3, 5, 2, 1);
+    const std::vector<std::array<u32, 2>> blocks{
+        op2({.inst = alu_mov, .dst = 1, .chan = 0, .a = {128 + 4, 1}}),
+        op2({.inst = alu_mov, .dst = 1, .chan = 1, .a = {160 + 20, 3}}),
+        op2({.inst = alu_add,
+             .dst = 1,
+             .chan = 2,
+             .a = {128 + 15, 0},
+             .b = {160, 2, true},
+             .last = true}),
+    };
+    CHECK(pixel(uniform_ps(blocks, kcache), registers)
+              .find("    x: R1.x <- MOV(UB2[52].y)\n"
+                    "    y: R1.y <- MOV(UB5[36].w)\n"
+                    "    z: R1.z <- ADD(UB2[63].x, -UB5[16].z)\n") != std::string::npos);
+
+    // In uniform-register mode, the constant file.
+    registers.set(sq_config, dx9_consts);
+    const std::vector<std::array<u32, 2>> file{
+        op2({.inst = alu_mov, .dst = 1, .chan = 0, .a = {256 + 7, 2}}),
+        op2({.inst = alu_mov, .dst = 1, .chan = 1, .a = {511, 0}, .last = true}),
+    };
+    CHECK(pixel(uniform_ps(file, {}), registers)
+              .find("    x: R1.x <- MOV(C7.z)\n"
+                    "    y: R1.y <- MOV(C255.x)\n") != std::string::npos);
+}
+
+TEST_CASE("a uniform the clause or the shader mode does not provide is refused",
+          "[latte][shader][ir][alu][uniforms]") {
+    const Registers registers;
+    const auto mov = [](u32 sel) {
+        return std::vector{op2({.inst = alu_mov, .dst = 1, .a = {sel}, .last = true})};
+    };
+    // A cache the clause does not lock; past LOCK_1's sixteen; locked from
+    // the loop index.
+    CHECK(refused_pixel(uniform_ps(mov(128), {}), registers)
+              .find("reads KC0[0], and the clause locks nothing in that cache") !=
+          std::string::npos);
+    CHECK(refused_pixel(uniform_ps(mov(160 + 16), lock(0, 0, 0, 1, 1, 0)), registers)
+              .find("reads KC1[16], past the sixteen constants the clause locks") !=
+          std::string::npos);
+    CHECK(refused_pixel(uniform_ps(mov(128), lock(0, 3, 0)), registers)
+              .find("locked from the loop index") != std::string::npos);
+    // The other kind than SQ_CONFIG says.
+    CHECK(refused_pixel(uniform_ps(mov(300), {}), registers)
+              .find("reads uniform register C44, and SQ_CONFIG says uniform blocks") !=
+          std::string::npos);
+    registers.set(sq_config, dx9_consts);
+    CHECK(refused_pixel(uniform_ps(mov(128), lock(0, 1, 0)), registers)
+              .find("reads KC0[0], a uniform block, and SQ_CONFIG says uniform registers") !=
+          std::string::npos);
 }

@@ -42,7 +42,7 @@ SHF_ALLOC = 0x2
 SHF_EXECINSTR = 0x4
 SHF_DEFLATED = 0x08000000
 
-ET_CAFE_RPL = 0xFF01
+ET_CAFE_RPL = 0xFE01  # what elf2rpl writes; see loader/rpl.hpp
 EM_PPC = 20
 RPL_IS_RPX = 0x2
 
@@ -656,6 +656,86 @@ _start:
           note=f"asks the time, {len(relocations) // 12} relocations")
 
 
+def build_dataimport(path: Path):
+    """An RPX laid out as wut's elf2rpl lays one out: its import table in the
+    load region at 0xC0000000, which Cafe OS's loader keeps for itself, and a
+    call through coreinit's MEMAllocFromDefaultHeap -- which coreinit exports
+    as data, a pointer to the default heap's allocator, so the code loads the
+    pointer and calls through it.
+    """
+    obj = assemble_object("""
+\t.text
+\t.globl _start
+_start:
+\tmflr\t0
+\tstwu\t1,-32(1)
+\tstw\t0,36(1)
+
+\tlis\t9,MEMAllocFromDefaultHeap@ha
+\tlwz\t9,MEMAllocFromDefaultHeap@l(9)
+\tmtctr\t9
+\tli\t3,64
+\tbctrl
+
+\tlwz\t0,36(1)
+\tmtlr\t0
+\taddi\t1,1,32
+\tblr
+""")
+
+    _, headers, data, name_of = read_object(obj)
+    by_name = {name_of(h): (i, h) for i, h in enumerate(headers) if name_of(h)}
+    text_index, text_header = by_name[".text"]
+    _, symtab_header = by_name[".symtab"]
+    _, strtab_header = by_name[".strtab"]
+
+    text = data(text_header)
+    symtab = bytearray(data(symtab_header))
+    strtab = data(strtab_header)
+
+    text_addr = TEXT_BASE
+    load_addr = 0xC0000000      # wut.ld's loadmem
+    new_text_index = 1
+    new_import_index = 2
+
+    for i in range(len(symtab) // 16):
+        at = i * 16
+        name_off, value, size, info, other, shndx = struct.unpack_from(">IIIBBH", symtab, at)
+        if shndx == text_index:
+            shndx, value = new_text_index, value + text_addr
+        elif shndx == 0 and name_off != 0:
+            # The data import: a symbol in .dimport_coreinit, past the
+            # table's header and the library's name.
+            shndx, value = new_import_index, load_addr + 0x18
+        struct.pack_into(">IIIBBH", symtab, at, name_off, value, size, info, other, shndx)
+
+    relocations = bytearray()
+    for header in headers:
+        if header["type"] != SHT_RELA or header["info"] != text_index:
+            continue
+        raw = data(header)
+        for j in range(len(raw) // 12):
+            offset, info, addend = struct.unpack_from(">IIi", raw, j * 12)
+            relocations += struct.pack(">IIi", offset + text_addr, info, addend)
+
+    imports = build_imports("coreinit", 1) + bytes(0x18 - 8 - len(b"coreinit\0")) + bytes(8)
+
+    sections = [
+        Section(".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, text_addr, text, align=32),
+        Section(".dimport_coreinit", SHT_RPL_IMPORTS, SHF_ALLOC, load_addr, imports, align=16),
+        Section(".symtab", SHT_SYMTAB, 0, 0, bytes(symtab), link=4, entsize=16, align=4),
+        Section(".strtab", 3, 0, 0, strtab, align=1),
+        Section(".rela.text", SHT_RELA, 0, 0, bytes(relocations),
+                link=3, info=new_text_index, entsize=12, align=4),
+        Section(".rplfileinfo", SHT_RPL_FILEINFO, 0, 0,
+                build_file_info(text_size=len(text), data_size=0,
+                                load_size=len(imports), flags=RPL_IS_RPX,
+                                name="dataimport.rpx"), align=4),
+    ]
+    build(path, sections, entry=text_addr,
+          note="imports in the load region, a data import called through")
+
+
 def main() -> int:
     if shutil.which("powerpc-linux-gnu-as") is None:
         print("powerpc-linux-gnu-as not found; cannot rebuild fixtures", file=sys.stderr)
@@ -737,6 +817,7 @@ def main() -> int:
     build_homebrew(OUTPUT_DIR / "homebrew.rpx")
     build_threaded(OUTPUT_DIR / "threaded.rpx")
     build_clock(OUTPUT_DIR / "clock.rpx")
+    build_dataimport(OUTPUT_DIR / "dataimport.rpx")
 
     return 0
 

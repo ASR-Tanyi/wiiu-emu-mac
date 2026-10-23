@@ -81,7 +81,8 @@ if(Python3_FOUND AND WIIU_PPC_AS)
         "${fixture_dir}/libtest.rpl"
         "${fixture_dir}/homebrew.rpx"
         "${fixture_dir}/threaded.rpx"
-        "${fixture_dir}/clock.rpx")
+        "${fixture_dir}/clock.rpx"
+        "${fixture_dir}/dataimport.rpx")
 
     add_custom_command(
         OUTPUT ${fixtures}

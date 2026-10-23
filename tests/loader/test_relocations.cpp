@@ -228,3 +228,68 @@ TEST_CASE("relocation entries parse", "[loader][reloc]") {
     CHECK(relocations[0].addend == 0x40);
     CHECK(relocation_name(relocations[0].type) == "ADDR16_HA");
 }
+
+TEST_CASE("a REL32 split by elf2rpl is two Green Hills halves of S + A - P", "[loader][reloc]") {
+    // A switch's jump table entry in .rodata: the displacement from the
+    // entry to a case label in .text. elf2rpl writes it as GHS_REL16_HI at
+    // the word and GHS_REL16_LO at the word + 2, the LO's addend 2 more.
+    Section section;
+    section.name = ".rodata";
+    section.address = 0x10000100;
+    section.data.assign(8, 0);
+    section.size = 8;
+    constexpr u32 rodata_symbol = 3;
+    constexpr u32 text_symbol = 4;
+    constexpr s32 label = 0x5A74; // the case label, as an addend on .text's symbol
+    const std::vector<Relocation> relocations{
+        {0x10000104, text_symbol, RelocationType::GhsRel16Hi, label},
+        {0x10000106, text_symbol, RelocationType::GhsRel16Lo, label + 2},
+        // And the HA form, which elf2rpl does not write but the loader has.
+        {0x10000102, rodata_symbol, RelocationType::GhsRel16Ha, 0x8102},
+    };
+    RelocationContext context;
+    context.resolve = [](u32 symbol, ppcaddr_t& out) {
+        out = symbol == text_symbol ? 0x02000000 : 0x10010000;
+        return true;
+    };
+    const RelocationResult result = apply_relocations(relocations, section, context);
+    CHECK(result.applied == 3);
+    CHECK(result.warnings.empty());
+    const auto word = [&section](std::size_t at) {
+        return (static_cast<u32>(section.data[at]) << 24) |
+               (static_cast<u32>(section.data[at + 1]) << 16) |
+               (static_cast<u32>(section.data[at + 2]) << 8) | section.data[at + 3];
+    };
+    // 0x02005A74 - 0x10000104, as a 32-bit displacement.
+    CHECK(word(4) == 0x02005A74U - 0x10000104U);
+    // 0x10018102 - 0x10000102 = 0x18000: HA rounds it up to 2, where HI is 1.
+    CHECK(((static_cast<u32>(section.data[2]) << 8) | section.data[3]) == 0x0002);
+}
+
+TEST_CASE("a branch to an undefined weak symbol is made a branch to itself", "[loader][reloc]") {
+    // wut's crt: `if (&__init_wut_socket) __init_wut_socket();` with no
+    // socket library linked. Zero is out of a branch's reach from 0x02000000;
+    // Cafe OS's loader branches to the branch instead (decaf).
+    Section section;
+    section.name = ".text";
+    section.address = 0x02000D1C;
+    section.data = {0x48, 0x00, 0x00, 0x01}; // bl
+    section.size = 4;
+    const std::vector<Relocation> relocations{{0x02000D1C, 9, RelocationType::Rel24, 0}};
+    RelocationContext context;
+    context.resolve = [](u32, ppcaddr_t& out) {
+        out = 0;
+        return true;
+    };
+    context.undefined_weak = [](u32 symbol) { return symbol == 9; };
+    const RelocationResult result = apply_relocations(relocations, section, context);
+    CHECK(result.applied == 1);
+    CHECK(result.warnings.empty());
+    CHECK(section.data == std::vector<u8>{0x48, 0x00, 0x00, 0x01}); // bl .
+
+    // A symbol that is merely zero, not undefined and weak, is still out of reach.
+    context.undefined_weak = [](u32) { return false; };
+    const RelocationResult refused = apply_relocations(relocations, section, context);
+    CHECK(refused.applied == 0);
+    CHECK(refused.warnings.size() == 1);
+}
