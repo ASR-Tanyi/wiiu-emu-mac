@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <variant>
 
 namespace wiiu::hle::gx2 {
 
@@ -562,6 +563,14 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
     latte::DrawShaders shaders;
     if (!latte::build_draw_shaders(registers, *memory_, shaders, error)) {
         problem = "a draw's shaders: " + error;
+        return false;
+    }
+    // Its textures and samplers are not bound yet; Metal would refuse the
+    // draw for want of them.
+    if (std::ranges::any_of(shaders.pixel_ir.body, [](const latte::ir::Statement& statement) {
+            return std::holds_alternative<latte::ir::SampleTexture>(statement);
+        })) {
+        problem = "a draw whose pixel shader samples a texture is not drawn yet";
         return false;
     }
     const gpu::PipelineHandle pipeline = pipelines_->pipeline(

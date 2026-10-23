@@ -3,12 +3,14 @@
 #include <wiiu/latte/msl.hpp>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <algorithm>
 #include <iterator>
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -131,6 +133,31 @@ void assign(std::string& out,
     return "vid";
 }
 
+/// A sample: the texture's value at the source's two components, through
+/// the resource's selects (a masked one reads zero), then into the
+/// destination's components through the fetch's.
+void emit_sample(std::string& out, const ir::SampleTexture& sample) {
+    const std::string source = fmt::format("R{}", sample.src_gpr);
+    const auto either = [](const std::optional<std::string>& value) {
+        return value.value_or("0.0");
+    };
+    const auto to = std::back_inserter(out);
+    fmt::format_to(to,
+                   "    {{\n"
+                   "        const float4 t = tex{}.sample(smp{}, float2({}, {}));\n"
+                   "        const float4 v = float4({}, {}, {}, {});\n",
+                   sample.texture,
+                   sample.sampler,
+                   either(component(sample.coordinates[0], source)),
+                   either(component(sample.coordinates[1], source)),
+                   either(component(sample.texture_select[0], "t")),
+                   either(component(sample.texture_select[1], "t")),
+                   either(component(sample.texture_select[2], "t")),
+                   either(component(sample.texture_select[3], "t")));
+    assign(out, "        ", fmt::format("R{}", sample.dst_gpr), sample.swizzle, "v");
+    out += "    }\n";
+}
+
 void declare_registers(std::string& out, const std::set<u32>& registers) {
     for (const u32 gpr : registers) {
         fmt::format_to(std::back_inserter(out), "    float4 R{} = float4(0.0);\n", gpr);
@@ -228,6 +255,9 @@ bool emit_vertex(const ir::Shader& vertex,
         } else if (std::holds_alternative<ir::ExportColor>(statement)) {
             error = "a colour export in a vertex shader";
             return false;
+        } else if (std::holds_alternative<ir::SampleTexture>(statement)) {
+            error = "sampling a texture in a vertex shader is not emitted yet";
+            return false;
         }
     }
     if (pixel != nullptr) {
@@ -322,6 +352,8 @@ bool emit_pixel(const ir::Shader& pixel, std::string& out, std::string& error) {
         }
     }
     std::set<u32> targets;
+    std::set<u32> textures;
+    std::set<u32> samplers;
     for (const ir::Statement& statement : pixel.body) {
         if (const auto* color = std::get_if<ir::ExportColor>(&statement)) {
             registers.insert(color->gpr);
@@ -330,8 +362,27 @@ bool emit_pixel(const ir::Shader& pixel, std::string& out, std::string& error) {
                 error = fmt::format("colour {} has a component select of 6", color->index);
                 return false;
             }
+        } else if (const auto* sample = std::get_if<ir::SampleTexture>(&statement)) {
+            if (sample->sampler >= max_samplers) {
+                error = fmt::format("sampler {} is past the {} Metal binds a stage; not emitted "
+                                    "yet",
+                                    sample->sampler,
+                                    max_samplers);
+                return false;
+            }
+            if (!valid(sample->swizzle) || !valid(sample->texture_select) ||
+                static_cast<u32>(sample->coordinates[0]) == 6 ||
+                static_cast<u32>(sample->coordinates[1]) == 6) {
+                error = fmt::format("a sample of texture {} has a component select of 6",
+                                    sample->texture);
+                return false;
+            }
+            registers.insert(sample->src_gpr);
+            registers.insert(sample->dst_gpr);
+            textures.insert(sample->texture);
+            samplers.insert(sample->sampler);
         } else {
-            error = "a pixel shader statement that is not a colour export";
+            error = "a pixel shader statement that is not a sample or a colour export";
             return false;
         }
     }
@@ -357,11 +408,21 @@ bool emit_pixel(const ir::Shader& pixel, std::string& out, std::string& error) {
         out += "};\n";
     }
 
+    std::vector<std::string> parameters;
+    if (has_inputs) {
+        parameters.emplace_back("PixelIn in [[stage_in]]");
+    }
+    for (const u32 texture : textures) {
+        parameters.push_back(fmt::format("texture2d<float> tex{0} [[texture({0})]]", texture));
+    }
+    for (const u32 sampler : samplers) {
+        parameters.push_back(fmt::format("sampler smp{0} [[sampler({0})]]", sampler));
+    }
     fmt::format_to(to,
                    "\nfragment {} {}({}) {{\n",
                    targets.empty() ? "void" : "PixelOut",
                    fragment_entry,
-                   has_inputs ? "PixelIn in [[stage_in]]" : "");
+                   fmt::join(parameters, ",\n                    "));
     declare_registers(out, registers);
     for (const ir::PixelInput& input : pixel.inputs) {
         switch (input.source) {
@@ -381,6 +442,10 @@ bool emit_pixel(const ir::Shader& pixel, std::string& out, std::string& error) {
         out += "    PixelOut out = {};\n";
     }
     for (const ir::Statement& statement : pixel.body) {
+        if (const auto* sample = std::get_if<ir::SampleTexture>(&statement)) {
+            emit_sample(out, *sample);
+            continue;
+        }
         const auto& color = std::get<ir::ExportColor>(statement);
         assign(out,
                "    ",

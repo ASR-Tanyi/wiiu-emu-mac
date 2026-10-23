@@ -7,8 +7,10 @@
 // for the SQ_VTX_SEMANTIC that names it, a parameter's semantic is its
 // SPI_VS_OUT_ID byte, a pixel input is matched by semantic or takes its
 // default, a pixel export goes to the n-th enabled colour target); bursts;
-// and the refusal of everything not translated yet, by name.
+// a SAMPLE, with the bound texture's selects; and the refusal of everything
+// not translated yet, by name.
 
+#include <wiiu/latte/resources.hpp>
 #include <wiiu/latte/shader_ir.hpp>
 #include <wiiu/latte/shader_state.hpp>
 
@@ -249,10 +251,11 @@ TEST_CASE("what is not translated yet is refused by name", "[latte][shader][ir]"
         2, (8U << 26) | barrier, exp0(60, 1, 0), xyzw | exp_done | end_of_program, 0, 0};
     CHECK(refused_vertex(alu, nullptr, registers).find("ALU clauses") != std::string::npos);
 
-    // A texture clause in a pixel shader.
+    // A vertex fetch in a texture clause in a pixel shader.
     const std::vector<u32> tex{
         2, (1U << 23) | barrier, exp0(0, 0, 0), xyzw | exp_done | end_of_program, 0, 0, 0, 0};
-    CHECK(refused_pixel(tex, registers).find("texture clauses") != std::string::npos);
+    CHECK(refused_pixel(tex, registers).find("vertex fetches in a texture clause") !=
+          std::string::npos);
 
     // CALL_FS with no fetch shader.
     CHECK(refused_vertex(example_vs, nullptr, registers).find("there is none") !=
@@ -286,5 +289,97 @@ TEST_CASE("what is not translated yet is refused by name", "[latte][shader][ir]"
     const std::vector<u32> wrong_way{exp0(60, 1, 0), xyzw | exp_done | end_of_program};
     CHECK(refused_pixel(wrong_way, registers).find("not a pixel export") != std::string::npos);
     CHECK(refused_vertex(example_ps, nullptr, registers).find("pixel export in a vertex") !=
+          std::string::npos);
+}
+
+// --------------------------------------------------------------------------
+// Texture samples
+// --------------------------------------------------------------------------
+
+namespace {
+
+/// A SAMPLE into R1.xyzw from R0's X and Y, texture `texture` and sampler
+/// `sampler`, normalised coordinates; `word0`, `word1` and `word2` are
+/// ORed in.
+[[nodiscard]] std::vector<u32>
+sampling_ps(u32 texture = 0, u32 sampler = 0, u32 word0 = 0, u32 word1 = 0, u32 word2 = 0) {
+    return {2,
+            (1U << 23) | barrier, // TEX: ADDR(2) CNT(1)
+            exp0(0, 0, 1),
+            xyzw | exp_done | barrier | end_of_program,
+            0x10U | (texture << 8) | word0,
+            1U | (0x688U << 9) | 0xF0000000U | word1,
+            (sampler << 15) | (0U << 20) | (1U << 23) | (4U << 26) | (4U << 29) | word2,
+            0};
+}
+
+/// A texture resource at the pixel stage's unit `unit`: its shape and its
+/// component selects.
+void bind_texture(const Registers& registers,
+                  u32 unit,
+                  TexDim dim = TexDim::D2,
+                  std::array<Sel, 4> selects = {Sel::X, Sel::Y, Sel::Z, Sel::W}) {
+    const u32 base = resource::address(resource::ps_base + unit);
+    TexResourceWord0 word0{.raw = 0};
+    word0.dim = dim;
+    TexResourceWord4 word4{.raw = 0};
+    word4.dst_sel_x = selects[0];
+    word4.dst_sel_y = selects[1];
+    word4.dst_sel_z = selects[2];
+    word4.dst_sel_w = selects[3];
+    TexResourceWord6 word6{.raw = 0};
+    word6.type = ResourceType::ValidTexture;
+    registers.set(base, word0.raw);
+    registers.set(base + 16, word4.raw);
+    registers.set(base + 24, word6.raw);
+}
+
+} // namespace
+
+TEST_CASE("a sample is written down with its texture's selects", "[latte][shader][ir]") {
+    const Registers registers;
+    // An RGB texture: alpha reads one (GX2's component map for it).
+    bind_texture(registers, 3, TexDim::D2, {Sel::X, Sel::Y, Sel::Z, Sel::One});
+    CHECK(pixel(sampling_ps(3, 5), registers) ==
+          "pixel shader\n"
+          "  input R0 <- parameter 0 (semantic 0), perspective\n"
+          "  R1.xyzw <- sample texture 3 (xyz1) with sampler 5 at R0.xy\n"
+          "  colour 0 (target 0) <- R1.xyzw\n");
+
+    // The shader's own selects, and coordinates from other components.
+    std::vector<u32> words = sampling_ps(3, 5);
+    words[5] = 1U | (3U << 9) | (2U << 12) | (7U << 15) | (0U << 18) | 0xF0000000U;
+    words[6] = (5U << 15) | (3U << 20) | (2U << 23) | (4U << 26) | (4U << 29);
+    CHECK(pixel(words, registers)
+              .find("R1.wz_x <- sample texture 3 (xyz1) with sampler 5 at "
+                    "R0.wz") != std::string::npos);
+}
+
+TEST_CASE("what a texture clause holds that is not translated yet is refused",
+          "[latte][shader][ir]") {
+    const Registers registers;
+    bind_texture(registers, 0);
+
+    // Another instruction: SAMPLE_L.
+    std::vector<u32> lod = sampling_ps();
+    lod[4] = (lod[4] & ~0x1FU) | 0x11U;
+    CHECK(refused_pixel(lod, registers).find("is SAMPLE_L; only SAMPLE") != std::string::npos);
+    // Coordinates in texels.
+    std::vector<u32> texels = sampling_ps();
+    texels[5] &= ~(1U << 28);
+    CHECK(refused_pixel(texels, registers).find("texel coordinates") != std::string::npos);
+    // A LOD bias, and an offset.
+    CHECK(refused_pixel(sampling_ps(0, 0, 0, 1U << 21), registers).find("LOD bias") !=
+          std::string::npos);
+    CHECK(refused_pixel(sampling_ps(0, 0, 0, 0, 1U), registers).find("offsets") !=
+          std::string::npos);
+    // Relative registers.
+    CHECK(refused_pixel(sampling_ps(0, 0, 1U << 23), registers).find("relative") !=
+          std::string::npos);
+    // A unit with no texture, and a cube.
+    CHECK(refused_pixel(sampling_ps(1), registers).find("not a valid texture") !=
+          std::string::npos);
+    bind_texture(registers, 2, TexDim::Cube);
+    CHECK(refused_pixel(sampling_ps(2), registers).find("not 2D (SQ_TEX_DIM 3)") !=
           std::string::npos);
 }

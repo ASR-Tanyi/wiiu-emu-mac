@@ -5,13 +5,16 @@
 // shader's outputs matching the pixel shader's inputs by semantic, those it
 // does not write included; each attribute index and component select; each
 // interpolation's qualifier; OpenGL's clip-space depth brought to Metal's
-// when asked; and the refusal of what is not emitted yet.
+// when asked; a sample, through the texture's selects and then its own,
+// with each texture and sampler bound once at its unit's slot; and the
+// refusal of what is not emitted yet.
 
 #include <wiiu/latte/msl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <variant>
 
 using namespace wiiu;
 using namespace wiiu::latte;
@@ -206,6 +209,77 @@ TEST_CASE("OpenGL's clip-space depth is brought to Metal's as the position is re
                         "}\n"));
 }
 
+namespace {
+
+/// The example pixel shader, sampling texture 3 with sampler 5 at its
+/// input's XY into R1 -- an RGB texture, so alpha reads one -- and
+/// exporting R1.
+[[nodiscard]] ir::Shader sampling_pixel() {
+    ir::Shader ps = example_pixel();
+    ps.body = {ir::SampleTexture{.texture = 3,
+                                 .sampler = 5,
+                                 .src_gpr = 0,
+                                 .coordinates = {Sel::X, Sel::Y},
+                                 .texture_select = {Sel::X, Sel::Y, Sel::Z, Sel::One},
+                                 .dst_gpr = 1,
+                                 .swizzle = kXyzw},
+               ir::ExportColor{.index = 0, .target = 0, .gpr = 1, .swizzle = kXyzw}};
+    return ps;
+}
+
+} // namespace
+
+TEST_CASE("a sample reads its unit's texture with its sampler", "[latte][shader][msl]") {
+    CHECK(from(pixel(sampling_pixel()), "fragment") ==
+          "fragment PixelOut fragment_main(PixelIn in [[stage_in]],\n"
+          "                    texture2d<float> tex3 [[texture(3)]],\n"
+          "                    sampler smp5 [[sampler(5)]]) {\n"
+          "    float4 R0 = float4(0.0);\n"
+          "    float4 R1 = float4(0.0);\n"
+          "    R0 = in.sem0;\n"
+          "    PixelOut out = {};\n"
+          "    {\n"
+          "        const float4 t = tex3.sample(smp5, float2(R0.x, R0.y));\n"
+          "        const float4 v = float4(t.x, t.y, t.z, 1.0);\n"
+          "        R1.x = v.x;\n"
+          "        R1.y = v.y;\n"
+          "        R1.z = v.z;\n"
+          "        R1.w = v.w;\n"
+          "    }\n"
+          "    out.color0.x = R1.x;\n"
+          "    out.color0.y = R1.y;\n"
+          "    out.color0.z = R1.z;\n"
+          "    out.color0.w = R1.w;\n"
+          "    return out;\n"
+          "}\n");
+
+    // Its own selects, a coordinate from a constant, and a texture
+    // channel masked off -- which reads zero.
+    ir::Shader swizzled = sampling_pixel();
+    auto& sample = std::get<ir::SampleTexture>(swizzled.body[0]);
+    sample.coordinates = {Sel::W, Sel::Zero};
+    sample.texture_select = {Sel::W, Sel::Mask, Sel::One, Sel::X};
+    sample.swizzle = {Sel::Y, Sel::Mask, Sel::One, Sel::X};
+    const std::string text = pixel(swizzled);
+    CHECK(text.find("tex3.sample(smp5, float2(R0.w, 0.0))") != std::string::npos);
+    CHECK(text.find("const float4 v = float4(t.w, 0.0, 1.0, t.x);") != std::string::npos);
+    CHECK(text.find("        R1.x = v.y;\n"
+                    "        R1.z = 1.0;\n"
+                    "        R1.w = v.x;\n"
+                    "    }\n") != std::string::npos);
+
+    // Two samples of one texture with two samplers: the texture bound once.
+    ir::Shader twice = sampling_pixel();
+    ir::SampleTexture second = std::get<ir::SampleTexture>(twice.body[0]);
+    second.sampler = 6;
+    second.dst_gpr = 2;
+    twice.body.insert(twice.body.begin() + 1, second);
+    const std::string both = pixel(twice);
+    CHECK(both.find("texture2d<float> tex3 [[texture(3)]],\n"
+                    "                    sampler smp5 [[sampler(5)]],\n"
+                    "                    sampler smp6 [[sampler(6)]]) {") != std::string::npos);
+}
+
 TEST_CASE("an attribute's index and components", "[latte][shader][msl]") {
     ir::Shader vs = example_vertex();
     vs.attributes[0].index = ir::AttributeIndex::InstanceRate1;
@@ -288,4 +362,14 @@ TEST_CASE("what is not emitted yet is refused", "[latte][shader][msl]") {
 
     CHECK_FALSE(msl::emit_vertex(example_pixel(), nullptr, out, error));
     CHECK_FALSE(msl::emit_pixel(example_vertex(), out, error));
+
+    // Samplers past Metal's sixteen, and sampling in a vertex shader.
+    ir::Shader seventeen = sampling_pixel();
+    std::get<ir::SampleTexture>(seventeen.body[0]).sampler = 16;
+    CHECK_FALSE(msl::emit_pixel(seventeen, out, error));
+    CHECK(error.find("sampler 16 is past the 16") != std::string::npos);
+    ir::Shader sampling_vertex = example_vertex();
+    sampling_vertex.body.push_back(sampling_pixel().body[0]);
+    CHECK_FALSE(msl::emit_vertex(sampling_vertex, nullptr, out, error));
+    CHECK(error.find("vertex shader is not emitted yet") != std::string::npos);
 }

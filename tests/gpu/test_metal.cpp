@@ -1629,6 +1629,138 @@ TEST_CASE("decaf's example triangle draws through the emitted MSL", "[gpu][metal
     backend->shutdown();
 }
 
+TEST_CASE("an emitted pixel shader samples its texture through the selects",
+          "[gpu][metal][msl][texture]") {
+    using namespace wiiu::latte;
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+    const TextureHandle target = make_target(*backend);
+
+    // decaf's example triangle, with its colour attribute taken as a
+    // texture coordinate: every vertex the same one, so the whole triangle
+    // reads one texel. The pixel shader samples texture 3 with sampler 5
+    // into R1 -- as an RGB texture, alpha selected as one -- and exports R1.
+    constexpr ir::Swizzle xyzw{Sel::X, Sel::Y, Sel::Z, Sel::W};
+    const auto attribute = [&](u32 semantic, u32 gpr, u32 buffer) {
+        ir::VertexAttribute a;
+        a.semantic = semantic;
+        a.gpr = gpr;
+        a.buffer = buffer;
+        a.bytes = 16;
+        a.data_format = 0x23;
+        a.num_format = NumFormat::Scaled;
+        a.endian = Endian::Swap8In32;
+        a.components = xyzw;
+        return a;
+    };
+    ir::Shader vs;
+    vs.stage = ir::Stage::Vertex;
+    vs.attributes = {attribute(0, 1, 0), attribute(1, 2, 1)};
+    vs.body = {ir::FetchAttributes{},
+               ir::ExportPosition{.gpr = 2, .swizzle = xyzw},
+               ir::ExportParameter{.index = 0, .semantic = 0, .gpr = 1, .swizzle = xyzw}};
+    ir::Shader ps;
+    ps.stage = ir::Stage::Pixel;
+    ps.inputs = {ir::PixelInput{.gpr = 0, .source = ir::InputSource::Parameter, .semantic = 0}};
+    ps.body = {ir::SampleTexture{.texture = 3,
+                                 .sampler = 5,
+                                 .src_gpr = 0,
+                                 .coordinates = {Sel::X, Sel::Y},
+                                 .texture_select = {Sel::X, Sel::Y, Sel::Z, Sel::One},
+                                 .dst_gpr = 1,
+                                 .swizzle = xyzw},
+               ir::ExportColor{.index = 0, .target = 0, .gpr = 1, .swizzle = xyzw}};
+
+    PipelineDesc desc;
+    desc.label = "emitted sampling triangle";
+    std::string error;
+    REQUIRE(msl::emit_vertex(vs, &ps, desc.vertex_source, error));
+    REQUIRE(msl::emit_pixel(ps, desc.fragment_source, error));
+    desc.color_formats[0] = TextureFormat::BGRA8Unorm;
+    const PipelineHandle pipeline = backend->create_pipeline(desc, error);
+    INFO(error);
+    INFO(desc.fragment_source);
+    REQUIRE(pipeline.valid());
+
+    // A 2x2 RGBA texture, each texel its own colour, alpha half throughout.
+    TextureDesc texture_desc;
+    texture_desc.width = 2;
+    texture_desc.height = 2;
+    texture_desc.format = TextureFormat::RGBA8Unorm;
+    texture_desc.usage = TextureUsage::Sampled;
+    texture_desc.storage = Storage::Shared;
+    const TextureHandle texture = backend->create_texture(texture_desc);
+    REQUIRE(texture.valid());
+    const std::array<u8, 16> texels{0xFF,
+                                    0x00,
+                                    0x00,
+                                    0x80, // (0, 0) red
+                                    0x00,
+                                    0xFF,
+                                    0x00,
+                                    0x80, // (1, 0) green
+                                    0x00,
+                                    0x00,
+                                    0xFF,
+                                    0x80, // (0, 1) blue
+                                    0xFF,
+                                    0xFF,
+                                    0x00,
+                                    0x80}; // (1, 1) yellow
+    REQUIRE(backend->write_texture(texture, Rect{0, 0, 2, 2}, texels, 8));
+    SamplerDesc sampler_desc;
+    sampler_desc.min_filter = Filter::Nearest;
+    sampler_desc.mag_filter = Filter::Nearest;
+    sampler_desc.address_u = AddressMode::ClampToEdge;
+    sampler_desc.address_v = AddressMode::ClampToEdge;
+    const SamplerHandle sampler = backend->create_sampler(sampler_desc);
+    REQUIRE(sampler.valid());
+
+    const BufferHandle positions = shared_buffer(
+        *backend,
+        big_endian(std::array<f32, 12>{
+            -1.0F, -1.0F, 0.0F, 1.0F, 1.0F, -1.0F, 0.0F, 1.0F, -1.0F, 1.0F, 0.0F, 1.0F}));
+    msl::FetchConstants constants;
+    constants.stride[0] = 16;
+    constants.stride[1] = 16;
+    constants.size[0] = 48;
+    constants.size[1] = 48;
+    const BufferHandle fetch =
+        shared_buffer(*backend, std::array<msl::FetchConstants, 1>{constants});
+
+    // (0.75, 0.25) is texel (1, 0), green; (0.25, 0.75) is texel (0, 1),
+    // blue. Alpha is the select's one, not the texture's half.
+    for (const auto& [u, v, expected] :
+         {std::tuple{0.75F, 0.25F, std::array<u8, 4>{0x00, 0xFF, 0x00, 0xFF}},
+          std::tuple{0.25F, 0.75F, std::array<u8, 4>{0xFF, 0x00, 0x00, 0xFF}}}) {
+        const BufferHandle coordinates = shared_buffer(
+            *backend,
+            big_endian(std::array<f32, 12>{u, v, 0.0F, 1.0F, u, v, 0.0F, 1.0F, u, v, 0.0F, 1.0F}));
+        REQUIRE(backend->begin_render_pass(clear_pass(target, ClearColor{0.0F, 0.0F, 0.0F, 0.0F})));
+        backend->set_pipeline(pipeline);
+        backend->bind_buffer(ShaderStage::Vertex, msl::fetch_constants_slot, fetch, 0);
+        backend->bind_buffer(
+            ShaderStage::Vertex, msl::first_attribute_buffer_slot + 0, coordinates, 0);
+        backend->bind_buffer(
+            ShaderStage::Vertex, msl::first_attribute_buffer_slot + 1, positions, 0);
+        backend->bind_texture(ShaderStage::Fragment, 3, texture);
+        backend->bind_sampler(ShaderStage::Fragment, 5, sampler);
+        DrawCall call;
+        call.vertex_count = 3;
+        backend->draw(call);
+        backend->end_render_pass();
+        backend->submit();
+
+        std::vector<u8> pixels(static_cast<std::size_t>(kTarget) * kTarget * 4);
+        REQUIRE(backend->read_texture(target, pixels));
+        INFO("u " << u << " v " << v);
+        CHECK(at(pixels, 2, kTarget - 3) == expected); // BGRA
+        CHECK(at(pixels, 40, 61) == expected);
+        CHECK(at(pixels, kTarget - 3, 2) == std::array<u8, 4>{0, 0, 0, 0});
+    }
+    CHECK(backend->command_errors() == 0);
+    backend->shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // 7.8 — capture
 // ---------------------------------------------------------------------------

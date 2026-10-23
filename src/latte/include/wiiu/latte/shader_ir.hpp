@@ -17,14 +17,24 @@
 //   * a vertex shader's attributes, from its fetch shader's semantic
 //     fetches, each with the register it is fetched into;
 //   * a pixel shader's inputs, the registers R0 onwards hold on entry;
-//   * statements: fetching the attributes (CALL_FS), and exporting the
-//     position, a parameter or a colour.
+//   * statements: fetching the attributes (CALL_FS), sampling a texture
+//     (SAMPLE, in a texture clause), and exporting the position, a
+//     parameter or a colour.
+//
+// A sample is written down with what the texture resource bound to its unit
+// says about it at the draw: its shape, and its component selects (WORD4's
+// DST_SEL, GX2's component map), which the hardware applies to what the
+// texture returns before the fetch's own selects pick the destination's
+// components. So a shader is translated for the textures it is drawn with,
+// as it is for the other registers here.
 //
 // Everything else is refused, saying which instruction and that it is not
 // done yet, rather than translated into something that draws wrongly: ALU
-// and texture clauses, loops, jumps and subroutines, memory exports, point
-// size, clip distances and depth exports, relative registers, plain
-// (non-semantic) fetches. Each later step takes something off that list.
+// clauses, loops, jumps and subroutines, memory exports, point size, clip
+// distances and depth exports, relative registers, plain (non-semantic)
+// fetches; in a texture clause, every fetch but SAMPLE, coordinates in
+// texels, a LOD bias or offsets, and textures that are not 2D. Each later
+// step takes something off that list.
 //
 // Two rules that come from the hardware and are easy to get wrong, both
 // decaf's and Cemu's: a semantic fetch lands in R(n + 1), where
@@ -125,7 +135,20 @@ struct ExportColor {
     Swizzle swizzle{};
 };
 
-using Statement = std::variant<FetchAttributes, ExportPosition, ExportParameter, ExportColor>;
+/// A SAMPLE from a 2D texture: the stage's texture unit and sampler, at
+/// normalised coordinates from two of a register's components.
+struct SampleTexture {
+    u32 texture = 0; ///< the stage's texture unit: the fetch's resource
+    u32 sampler = 0; ///< the stage's sampler
+    u32 src_gpr = 0;
+    std::array<Sel, 2> coordinates{}; ///< the source register's U and V
+    Swizzle texture_select{};         ///< the resource's DST_SEL, applied first
+    u32 dst_gpr = 0;
+    Swizzle swizzle{}; ///< the fetch's DST_SEL: the destination's components
+};
+
+using Statement =
+    std::variant<FetchAttributes, SampleTexture, ExportPosition, ExportParameter, ExportColor>;
 
 struct Shader {
     Stage stage = Stage::Vertex;

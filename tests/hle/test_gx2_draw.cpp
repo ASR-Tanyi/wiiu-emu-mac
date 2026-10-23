@@ -26,6 +26,7 @@
 #include <wiiu/hle/gx2_fetch_shader.hpp>
 #include <wiiu/hle/gx2_shader.hpp>
 #include <wiiu/hle/gx2_surface.hpp>
+#include <wiiu/hle/gx2_texture.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/command_processor.hpp>
 #include <wiiu/latte/draw.hpp>
@@ -782,6 +783,53 @@ TEST_CASE_METHOD(GpuDrawFixture,
     CHECK(backend.recorded("draw vertices 3"));
     CHECK_FALSE(backend.recorded("[depth:"));
     CHECK(os.gpu.pipelines()->stats().builds == 2);
+    CHECK(backend.rejected() == 0);
+}
+
+TEST_CASE_METHOD(GpuDrawFixture,
+                 "a draw that samples a texture is refused until its textures are bound",
+                 "[hle][gx2][draw][gpu]") {
+    // The example's pixel shader made to sample: a TEX clause reading
+    // texture 0 with sampler 0 at R0.xy into R1, and R1 exported.
+    constexpr ppcaddr_t kTexture = 0x10032000;
+    constexpr u32 xyzw = 0x688;
+    put_program(memory,
+                kPixelProgram,
+                {2,
+                 (1U << 23) | (1U << 31),
+                 1U << 15,
+                 xyzw | (0x28U << 23) | (1U << 31) | (1U << 21),
+                 0x10,
+                 1U | (xyzw << 9) | 0xF0000000U,
+                 (1U << 23) | (4U << 26) | (4U << 29),
+                 0});
+    gx2::PixelShader ps{};
+    REQUIRE(gx2::read_guest(memory, kPixelStruct, ps));
+    ps.size = 32;
+    REQUIRE(gx2::write_guest(memory, kPixelStruct, ps));
+    call("GX2SetPixelShader", {kPixelStruct});
+
+    gx2::Texture texture{};
+    texture.surface.dim = 1;
+    texture.surface.width = 16;
+    texture.surface.height = 16;
+    texture.surface.depth = 1;
+    texture.surface.mip_levels = 1;
+    texture.surface.format = 0x01A;
+    texture.surface.use = gx2::surface_use_texture;
+    REQUIRE(gx2::calc_surface_size_and_alignment(texture.surface));
+    texture.surface.image = kColorImage + 0x10000;
+    texture.comp_map = 0x00010203;
+    REQUIRE(gx2::write_guest(memory, kTexture, texture));
+    call("GX2InitTextureRegs", {kTexture});
+    call("GX2SetPixelTexture", {kTexture, 0});
+
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    CHECK(os.gpu.draw_stats().refused == 1);
+    CHECK(
+        os.gpu.problems().contains("a draw whose pixel shader samples a texture is not drawn yet"));
+    CHECK_FALSE(backend.recorded("draw vertices"));
     CHECK(backend.rejected() == 0);
 }
 

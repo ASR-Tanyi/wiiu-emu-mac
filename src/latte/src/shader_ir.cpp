@@ -302,13 +302,88 @@ public:
                 continue;
             }
             if (inst.is(CfInst::Tex)) {
-                return not_yet(inst, "texture clauses");
+                if (!texture_clause(program, inst)) {
+                    return false;
+                }
+                continue;
             }
             if (inst.is(CfInst::Vtx) || inst.is(CfInst::VtxTc)) {
                 return not_yet(inst, "vertex fetch clauses outside a fetch shader");
             }
             return not_yet(inst, "instructions of this kind");
         }
+        return true;
+    }
+
+    /// A texture clause: each SAMPLE one statement.
+    [[nodiscard]] bool texture_clause(const ShaderProgram& program, const CfInstruction& inst) {
+        for (const DecodedClause& decoded : program.clauses) {
+            if (decoded.clause.cf_index != inst.index) {
+                continue;
+            }
+            for (std::size_t i = 0; i < decoded.texture_fetches.size(); ++i) {
+                if (!sample(inst, i, decoded.texture_fetches[i])) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return fail(fmt::format("{} runs a clause the program does not hold", where(inst)));
+    }
+
+    [[nodiscard]] bool sample(const CfInstruction& inst, std::size_t index, const TextureFetch& f) {
+        const std::string at = fmt::format("{}, fetch {}", where(inst), index);
+        if (f.is_vertex_fetch()) {
+            return fail(fmt::format("{} is a vertex fetch; vertex fetches in a texture clause are "
+                                    "not translated yet",
+                                    at));
+        }
+        if (f.inst() != TexInst::Sample) {
+            return fail(fmt::format(
+                "{} is {}; only SAMPLE is translated yet", at, tex_inst_name(f.inst())));
+        }
+        const TexWord0 word0 = f.tex0();
+        const TexWord1 word1 = f.tex1();
+        const TexWord2 word2 = f.tex2();
+        if (word0.src_rel || word1.dst_rel) {
+            return fail(fmt::format("{} uses a relative register; not translated yet", at));
+        }
+        if (!word1.coord_type_x || !word1.coord_type_y) {
+            return fail(fmt::format("{} samples at texel coordinates; not translated yet", at));
+        }
+        if (word1.lod_bias != 0 || word2.offset_x != 0 || word2.offset_y != 0 ||
+            word2.offset_z != 0) {
+            return fail(fmt::format("{} has a LOD bias or offsets; not translated yet", at));
+        }
+
+        const u32 first = out_.stage == Stage::Vertex ? resource::vs_base : resource::ps_base;
+        const TextureResource texture = texture_resource(registers_, first + word0.resource_id);
+        if (!texture.valid()) {
+            return fail(fmt::format("{} samples texture {}, which is not a valid texture",
+                                    at,
+                                    word0.resource_id.value()));
+        }
+        if (texture.word0.dim != TexDim::D2) {
+            return fail(fmt::format("{} samples texture {}, which is not 2D (SQ_TEX_DIM {}); not "
+                                    "translated yet",
+                                    at,
+                                    word0.resource_id.value(),
+                                    static_cast<u32>(texture.word0.dim.value())));
+        }
+        out_.body.emplace_back(
+            SampleTexture{.texture = word0.resource_id,
+                          .sampler = word2.sampler_id,
+                          .src_gpr = word0.src_gpr,
+                          .coordinates = {word2.src_sel_x.value(), word2.src_sel_y.value()},
+                          .texture_select = {texture.word4.dst_sel_x.value(),
+                                             texture.word4.dst_sel_y.value(),
+                                             texture.word4.dst_sel_z.value(),
+                                             texture.word4.dst_sel_w.value()},
+                          .dst_gpr = word1.dst_gpr,
+                          .swizzle = {word1.dst_sel_x.value(),
+                                      word1.dst_sel_y.value(),
+                                      word1.dst_sel_z.value(),
+                                      word1.dst_sel_w.value()}});
         return true;
     }
 
@@ -410,6 +485,20 @@ struct StatementText {
     std::string& out;
 
     void operator()(const FetchAttributes&) const { out += "  fetch attributes\n"; }
+
+    void operator()(const SampleTexture& s) const {
+        constexpr std::string_view chars = "xyzw01?_";
+        fmt::format_to(std::back_inserter(out),
+                       "  R{}.{} <- sample texture {} ({}) with sampler {} at R{}.{}{}\n",
+                       s.dst_gpr,
+                       swizzle_text(s.swizzle),
+                       s.texture,
+                       swizzle_text(s.texture_select),
+                       s.sampler,
+                       s.src_gpr,
+                       chars[static_cast<u32>(s.coordinates[0]) & 7U],
+                       chars[static_cast<u32>(s.coordinates[1]) & 7U]);
+    }
 
     void operator()(const ExportPosition& e) const {
         fmt::format_to(

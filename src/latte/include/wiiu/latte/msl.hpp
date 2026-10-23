@@ -28,6 +28,16 @@
 // fragment input nothing produces. A pixel input's interpolation is its
 // Metal qualifier.
 //
+// A pixel shader's sample reads a `texture2d<float>` named `tex<n>` at
+// `[[texture(n)]]`, n the stage's texture unit, with a `sampler` named
+// `smp<m>` at `[[sampler(m)]]`: the slots are the units, so a draw binds
+// what the resources and samplers registers name where they say. The
+// resource's component selects are applied to what the texture returns, then
+// the fetch's pick the destination's components. Metal takes sixteen
+// samplers a stage without argument buffers (ADR-003 brings those), so
+// Latte's samplers 16 and 17 are refused for now; and sampling in a vertex
+// shader, which Metal does with an explicit level, is not emitted yet.
+//
 // Refused, as not translated yet: attribute formats other than 32-bit
 // floats (32, 32_32, 32_32_32 and 32_32_32_32, SCALED, as GX2 writes them),
 // byte swaps other than none and 8IN32, a semantic read twice with two
@@ -60,6 +70,9 @@ inline constexpr std::string_view fragment_entry = "fragment_main";
 /// The vertex stage's buffer slots.
 inline constexpr u32 fetch_constants_slot = 0;
 inline constexpr u32 first_attribute_buffer_slot = 1;
+
+/// The samplers Metal binds a stage, without argument buffers.
+inline constexpr u32 max_samplers = 16;
 
 /// What a vertex shader reads at `fetch_constants_slot`. The MSL structure
 /// is written from the same layout.
