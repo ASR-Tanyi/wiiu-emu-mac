@@ -6,9 +6,11 @@
 
 #include <fmt/format.h>
 
+#include <array>
 #include <iterator>
 #include <optional>
 #include <string_view>
+#include <utility>
 
 namespace wiiu::latte::ir {
 
@@ -85,6 +87,77 @@ constexpr u32 color_targets = 8;
         ++enabled;
     }
     return std::nullopt;
+}
+
+// The ALU instructions translated so far, by number (decaf's table).
+constexpr u32 alu_nop = 0x1A;
+constexpr u32 op3_muladd = 0x10;      ///< then _M2, _M4, _D2
+constexpr u32 op3_muladd_ieee = 0x14; ///< then _M2, _M4, _D2
+constexpr u32 op3_muladd_ieee_d2 = 0x17;
+
+/// An OP2's OMOD, and the order of each MULADD's four forms.
+constexpr std::array output_modifiers{
+    OutputModifier::None, OutputModifier::Times2, OutputModifier::Times4, OutputModifier::Half};
+
+[[nodiscard]] std::optional<AluOpcode> op2_opcode(u32 number) noexcept {
+    switch (number) {
+        case 0x00:
+            return AluOpcode::Add;
+        case 0x01:
+            return AluOpcode::Mul;
+        case 0x02:
+            return AluOpcode::MulIeee;
+        case 0x03:
+            return AluOpcode::Max;
+        case 0x04:
+            return AluOpcode::Min;
+        case 0x19:
+            return AluOpcode::Mov;
+        case 0x50:
+            return AluOpcode::Dot4;
+        case 0x51:
+            return AluOpcode::Dot4Ieee;
+        default:
+            return std::nullopt;
+    }
+}
+
+[[nodiscard]] std::string_view opcode_name(AluOpcode opcode) noexcept {
+    switch (opcode) {
+        case AluOpcode::Mov:
+            return "MOV";
+        case AluOpcode::Add:
+            return "ADD";
+        case AluOpcode::Mul:
+            return "MUL";
+        case AluOpcode::MulIeee:
+            return "MUL_IEEE";
+        case AluOpcode::Max:
+            return "MAX";
+        case AluOpcode::Min:
+            return "MIN";
+        case AluOpcode::MulAdd:
+            return "MULADD";
+        case AluOpcode::MulAddIeee:
+            return "MULADD_IEEE";
+        case AluOpcode::Dot4:
+            return "DOT4";
+        case AluOpcode::Dot4Ieee:
+            return "DOT4_IEEE";
+    }
+    return "?";
+}
+
+[[nodiscard]] u32 source_count(AluOpcode opcode) noexcept {
+    switch (opcode) {
+        case AluOpcode::Mov:
+            return 1;
+        case AluOpcode::MulAdd:
+        case AluOpcode::MulAddIeee:
+            return 3;
+        default:
+            return 2;
+    }
 }
 
 class Builder {
@@ -279,7 +352,10 @@ public:
     [[nodiscard]] bool body(const ShaderProgram& program, const ShaderProgram* fetch) {
         for (const CfInstruction& inst : program.control_flow.main) {
             if (inst.is_alu()) {
-                return not_yet(inst, "ALU clauses");
+                if (!alu_clause(program, inst)) {
+                    return false;
+                }
+                continue;
             }
             if (inst.type() == CfInstType::Export) {
                 if (!exports(inst)) {
@@ -370,6 +446,10 @@ public:
                                     word0.resource_id.value(),
                                     static_cast<u32>(texture.word0.dim.value())));
         }
+        const Swizzle destination{word1.dst_sel_x.value(),
+                                  word1.dst_sel_y.value(),
+                                  word1.dst_sel_z.value(),
+                                  word1.dst_sel_w.value()};
         out_.body.emplace_back(
             SampleTexture{.texture = word0.resource_id,
                           .sampler = word2.sampler_id,
@@ -380,11 +460,261 @@ public:
                                              texture.word4.dst_sel_z.value(),
                                              texture.word4.dst_sel_w.value()},
                           .dst_gpr = word1.dst_gpr,
-                          .swizzle = {word1.dst_sel_x.value(),
-                                      word1.dst_sel_y.value(),
-                                      word1.dst_sel_z.value(),
-                                      word1.dst_sel_w.value()}});
+                          .swizzle = destination});
+        if (word1.dst_gpr == 0) {
+            for (std::size_t c = 0; c < destination.size(); ++c) {
+                r0_written_[c] = r0_written_[c] || destination[c] != Sel::Mask;
+            }
+        }
         return true;
+    }
+
+    // --- ALU clauses ----------------------------------------------------------
+
+    /// An ALU clause: each group one statement. PV and PS do not reach from
+    /// one clause into the next.
+    [[nodiscard]] bool alu_clause(const ShaderProgram& program, const CfInstruction& inst) {
+        if (inst.alu1().cf_inst != AluCfInst::Alu) {
+            return not_yet(inst, "ALU clauses that push, pop or branch");
+        }
+        for (const DecodedClause& decoded : program.clauses) {
+            if (decoded.clause.cf_index != inst.index) {
+                continue;
+            }
+            previous_vector_ = {};
+            previous_scalar_ = false;
+            for (std::size_t i = 0; i < decoded.alu_groups.size(); ++i) {
+                if (!alu_group(inst, i, decoded.alu_groups[i])) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return fail(fmt::format("{} runs a clause the program does not hold", where(inst)));
+    }
+
+    [[nodiscard]] bool
+    alu_group(const CfInstruction& inst, std::size_t index, const latte::AluGroup& group) {
+        const std::string at = fmt::format("{}, group {}", where(inst), index);
+        AluGroup out;
+        for (const AluInstruction& instruction : group.instructions) {
+            if (is_nop(instruction)) {
+                continue; // no result: PV or PS of its unit is left unset
+            }
+            const std::optional<AluOperation> operation = alu_operation(at, instruction, group);
+            if (!operation.has_value()) {
+                return false;
+            }
+            out.operations.push_back(*operation);
+        }
+        if (!reduction_complete(at, out)) {
+            return false;
+        }
+
+        // What this group leaves for the next: its units' results, and its
+        // writes.
+        previous_vector_ = {};
+        previous_scalar_ = false;
+        for (const AluOperation& op : out.operations) {
+            if (op.unit == AluUnit::T) {
+                previous_scalar_ = true;
+            } else {
+                previous_vector_[static_cast<u32>(op.unit)] = true;
+            }
+            if (op.write && op.dst_gpr == 0) {
+                r0_written_[op.dst_chan] = true;
+            }
+        }
+        out_.body.emplace_back(std::move(out));
+        return true;
+    }
+
+    [[nodiscard]] static bool is_nop(const AluInstruction& instruction) {
+        return !instruction.is_op3() && instruction.op2().alu_inst == alu_nop;
+    }
+
+    /// A reduction takes the four vector units, each running it.
+    [[nodiscard]] bool reduction_complete(const std::string& at, const AluGroup& group) {
+        std::optional<AluOpcode> reduction;
+        for (const AluOperation& op : group.operations) {
+            if (op.opcode == AluOpcode::Dot4 || op.opcode == AluOpcode::Dot4Ieee) {
+                reduction = op.opcode;
+            }
+        }
+        if (!reduction.has_value()) {
+            return true;
+        }
+        std::array<bool, 4> units{};
+        for (const AluOperation& op : group.operations) {
+            if (op.unit == AluUnit::T) {
+                continue;
+            }
+            if (op.opcode != *reduction) {
+                return fail(fmt::format("{} runs {} on the {} unit beside a reduction",
+                                        at,
+                                        opcode_name(op.opcode),
+                                        "xyzw"[static_cast<u32>(op.unit)]));
+            }
+            units[static_cast<u32>(op.unit)] = true;
+        }
+        if (units != std::array{true, true, true, true}) {
+            return fail(fmt::format(
+                "{} runs {} on fewer than the four vector units", at, opcode_name(*reduction)));
+        }
+        return true;
+    }
+
+    /// One instruction, or nothing (with the error set) for one not
+    /// translated yet.
+    [[nodiscard]] std::optional<AluOperation> alu_operation(const std::string& group_at,
+                                                            const AluInstruction& instruction,
+                                                            const latte::AluGroup& group) {
+        const std::string at = fmt::format("{}, {} on the {} unit",
+                                           group_at,
+                                           instruction.op.name,
+                                           "xyzwt"[static_cast<u32>(instruction.unit)]);
+        const AluWord0 word0 = instruction.alu0();
+        const AluWord1 word1 = instruction.alu1();
+        const bool op3 = instruction.is_op3();
+
+        AluOperation operation;
+        operation.unit = instruction.unit;
+        if (op3) {
+            const u32 number = instruction.op3().alu_inst;
+            if (number < op3_muladd || number > op3_muladd_ieee_d2) {
+                return refuse(fmt::format("{}: {} is not translated yet", at, instruction.op.name));
+            }
+            const u32 variant = (number - op3_muladd) % 4;
+            operation.opcode = number < op3_muladd_ieee ? AluOpcode::MulAdd : AluOpcode::MulAddIeee;
+            operation.modifier = output_modifiers[variant];
+            operation.write = true;
+        } else {
+            const AluWord1Op2 op2 = instruction.op2();
+            const std::optional<AluOpcode> opcode = op2_opcode(op2.alu_inst);
+            if (!opcode.has_value()) {
+                return refuse(fmt::format("{}: {} is not translated yet", at, instruction.op.name));
+            }
+            if (op2.update_pred || op2.update_execute_mask) {
+                return refuse(fmt::format(
+                    "{} updates the predicate or the execute mask; not translated yet", at));
+            }
+            operation.opcode = *opcode;
+            operation.modifier = output_modifiers[op2.omod];
+            operation.write = op2.write_mask;
+        }
+        if (word0.pred_sel != 0) {
+            return refuse(fmt::format("{} is predicated; not translated yet", at));
+        }
+        if (word1.dst_rel) {
+            return refuse(fmt::format("{} writes a relative register; not translated yet", at));
+        }
+        operation.dst_gpr = word1.dst_gpr;
+        operation.dst_chan = word1.dst_chan;
+        operation.clamp = word1.clamp;
+
+        struct Raw {
+            u32 sel;
+            bool rel;
+            u32 chan;
+            bool neg;
+            bool abs;
+        };
+
+        const std::array<Raw, 3> raw{
+            Raw{word0.src0_sel, word0.src0_rel, word0.src0_chan, word0.src0_neg, false},
+            Raw{word0.src1_sel, word0.src1_rel, word0.src1_chan, word0.src1_neg, false},
+            Raw{instruction.op3().src2_sel,
+                instruction.op3().src2_rel,
+                instruction.op3().src2_chan,
+                instruction.op3().src2_neg,
+                false}};
+        for (u32 i = 0; i < instruction.op.sources; ++i) {
+            Raw source = raw[i];
+            if (!op3 && i < 2) {
+                source.abs = i == 0 ? instruction.op2().src0_abs : instruction.op2().src1_abs;
+            }
+            const std::optional<AluSource> decoded = alu_source(
+                fmt::format("{}, source {}", at, i), source.sel, source.rel, source.chan, group);
+            if (!decoded.has_value()) {
+                return std::nullopt;
+            }
+            operation.sources[i] = *decoded;
+            operation.sources[i].absolute = source.abs;
+            operation.sources[i].negate = source.neg;
+        }
+        return operation;
+    }
+
+    [[nodiscard]] std::optional<AluSource> alu_source(
+        const std::string& at, u32 sel, bool relative, u32 chan, const latte::AluGroup& group) {
+        if (relative) {
+            return refuse(fmt::format("{} is a relative register; not translated yet", at));
+        }
+        AluSource source;
+        if (sel <= alu_src::register_last) {
+            if (out_.stage == Stage::Vertex && sel == 0 && !r0_written_[chan]) {
+                return refuse(fmt::format("{} reads R0.{} before the shader writes it: the vertex "
+                                          "and instance indices, which are not translated yet",
+                                          at,
+                                          "xyzw"[chan]));
+            }
+            source.kind = SourceKind::Register;
+            source.gpr = sel;
+            source.chan = chan;
+            return source;
+        }
+        if ((sel >= alu_src::kcache0_first && sel <= alu_src::kcache1_last) ||
+            (sel >= alu_src::const_file_first && sel <= alu_src::const_file_last)) {
+            return refuse(fmt::format("{} reads a uniform (KCACHE or the constant file); not "
+                                      "translated yet",
+                                      at));
+        }
+        source.kind = SourceKind::Value;
+        switch (sel) {
+            case alu_src::zero:
+                source.bits = 0x00000000;
+                return source;
+            case alu_src::one:
+                source.bits = 0x3F800000;
+                return source;
+            case alu_src::one_int:
+                source.bits = 1;
+                return source;
+            case alu_src::minus_one:
+                source.bits = 0xFFFFFFFF;
+                return source;
+            case alu_src::half:
+                source.bits = 0x3F000000;
+                return source;
+            case alu_src::literal:
+                source.bits = group.literals.at(chan); // the decoder read every one
+                return source;
+            case alu_src::previous_vector:
+                if (!previous_vector_[chan]) {
+                    return refuse(fmt::format("{} reads PV.{}, which the clause's previous group "
+                                              "did not set",
+                                              at,
+                                              "xyzw"[chan]));
+                }
+                source.kind = SourceKind::PreviousVector;
+                source.chan = chan;
+                return source;
+            case alu_src::previous_scalar:
+                if (!previous_scalar_) {
+                    return refuse(fmt::format(
+                        "{} reads PS, which the clause's previous group did not set", at));
+                }
+                source.kind = SourceKind::PreviousScalar;
+                return source;
+            default:
+                return refuse(
+                    fmt::format("{} reads source select {}; not translated yet", at, sel));
+        }
+    }
+
+    [[nodiscard]] std::nullopt_t refuse(std::string message) {
+        error_ = std::move(message);
+        return std::nullopt;
     }
 
     [[nodiscard]] bool pixel_inputs() {
@@ -442,6 +772,9 @@ private:
     const RegisterFile& registers_;
     Shader& out_;
     std::string& error_;
+    std::array<bool, 4> previous_vector_{}; ///< which of PV.x to .w the last group set
+    bool previous_scalar_ = false;          ///< whether it set PS
+    std::array<bool, 4> r0_written_{};      ///< a vertex shader's R0, component by component
 };
 
 // --- describe ----------------------------------------------------------------
@@ -498,6 +831,71 @@ struct StatementText {
                        s.src_gpr,
                        chars[static_cast<u32>(s.coordinates[0]) & 7U],
                        chars[static_cast<u32>(s.coordinates[1]) & 7U]);
+    }
+
+    void operator()(const AluGroup& group) const {
+        const auto to = std::back_inserter(out);
+        out += "  alu group\n";
+        for (const AluOperation& op : group.operations) {
+            fmt::format_to(to, "    {}: ", "xyzwt"[static_cast<u32>(op.unit)]);
+            if (op.write) {
+                fmt::format_to(to, "R{}.{}", op.dst_gpr, "xyzw"[op.dst_chan & 3U]);
+            } else {
+                out += "____";
+            }
+            fmt::format_to(to, " <- {}(", opcode_name(op.opcode));
+            for (u32 i = 0; i < source_count(op.opcode); ++i) {
+                if (i != 0) {
+                    out += ", ";
+                }
+                source_text(op.sources[i]);
+            }
+            out += ')';
+            switch (op.modifier) {
+                case OutputModifier::None:
+                    break;
+                case OutputModifier::Times2:
+                    out += " * 2";
+                    break;
+                case OutputModifier::Times4:
+                    out += " * 4";
+                    break;
+                case OutputModifier::Half:
+                    out += " / 2";
+                    break;
+            }
+            if (op.clamp) {
+                out += ", clamped";
+            }
+            out += '\n';
+        }
+    }
+
+    void source_text(const AluSource& s) const {
+        const auto to = std::back_inserter(out);
+        if (s.negate) {
+            out += '-';
+        }
+        if (s.absolute) {
+            out += '|';
+        }
+        switch (s.kind) {
+            case SourceKind::Register:
+                fmt::format_to(to, "R{}.{}", s.gpr, "xyzw"[s.chan & 3U]);
+                break;
+            case SourceKind::Value:
+                fmt::format_to(to, "0x{:08X}", s.bits);
+                break;
+            case SourceKind::PreviousVector:
+                fmt::format_to(to, "PV.{}", "xyzw"[s.chan & 3U]);
+                break;
+            case SourceKind::PreviousScalar:
+                out += "PS";
+                break;
+        }
+        if (s.absolute) {
+            out += '|';
+        }
     }
 
     void operator()(const ExportPosition& e) const {

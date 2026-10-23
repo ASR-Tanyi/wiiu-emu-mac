@@ -7,8 +7,11 @@
 // for the SQ_VTX_SEMANTIC that names it, a parameter's semantic is its
 // SPI_VS_OUT_ID byte, a pixel input is matched by semantic or takes its
 // default, a pixel export goes to the n-th enabled colour target); bursts;
-// a SAMPLE, with the bound texture's selects; and the refusal of everything
-// not translated yet, by name.
+// a SAMPLE, with the bound texture's selects; ALU clauses decoded from
+// microcode into their groups -- each unit's instruction, sources (registers,
+// literals, inline constants, PV and PS), modifiers, write mask, and a DOT4
+// across the four vector units -- with a vertex shader's R0 readable only
+// once written; and the refusal of everything not translated yet, by name.
 
 #include <wiiu/latte/resources.hpp>
 #include <wiiu/latte/shader_ir.hpp>
@@ -246,14 +249,16 @@ TEST_CASE("what is not translated yet is refused by name", "[latte][shader][ir]"
     const Registers registers;
     const std::vector<u32> fs = fetch_shader({float4_fetch(0, 0)});
 
-    // An ALU clause of one group: ADD R0.x, R0.x, R0.x.
+    // An ALU clause of one group: ADD R0.x, R0.x, R0.x -- in a vertex
+    // shader, R0 is the vertex and instance indices, not translated yet.
     const std::vector<u32> alu{2,
                                (8U << 26) | barrier,
                                exp0(60, 1, 0),
                                xyzw | exp_done | end_of_program,
                                1U << 31,
                                1U << 4};
-    CHECK(refused_vertex(alu, nullptr, registers).find("ALU clauses") != std::string::npos);
+    CHECK(refused_vertex(alu, nullptr, registers).find("reads R0.x before the shader writes it") !=
+          std::string::npos);
 
     // A vertex fetch in a texture clause in a pixel shader.
     const std::vector<u32> tex{
@@ -386,4 +391,273 @@ TEST_CASE("what a texture clause holds that is not translated yet is refused",
     bind_texture(registers, 2, TexDim::Cube);
     CHECK(refused_pixel(sampling_ps(2), registers).find("not 2D (SQ_TEX_DIM 3)") !=
           std::string::npos);
+}
+
+// --------------------------------------------------------------------------
+// ALU groups
+// --------------------------------------------------------------------------
+
+namespace {
+
+// ALU source selects (microcode.hpp's alu_src).
+constexpr u32 src_zero = 248;
+constexpr u32 src_one = 249;
+constexpr u32 src_literal = 253;
+constexpr u32 src_pv = 254;
+constexpr u32 src_ps = 255;
+
+struct Src {
+    u32 sel = src_zero;
+    u32 chan = 0;
+    bool neg = false;
+    bool abs = false;
+    bool rel = false;
+};
+
+/// An OP2's two words, from the field positions (microcode.hpp).
+struct Op2 {
+    u32 inst = 0;
+    u32 dst = 0;
+    u32 chan = 0;
+    Src a{};
+    Src b{};
+    bool write = true;
+    u32 omod = 0;
+    bool clamp = false;
+    u32 pred = 0;
+    bool last = false;
+};
+
+[[nodiscard]] u32 word0(const Src& a, const Src& b, u32 pred, bool last) {
+    return a.sel | (u32{a.rel} << 9) | (a.chan << 10) | (u32{a.neg} << 12) | (b.sel << 13) |
+           (u32{b.rel} << 22) | (b.chan << 23) | (u32{b.neg} << 25) | (pred << 29) |
+           (u32{last} << 31);
+}
+
+[[nodiscard]] std::array<u32, 2> op2(const Op2& o) {
+    return {word0(o.a, o.b, o.pred, o.last),
+            u32{o.a.abs} | (u32{o.b.abs} << 1) | (u32{o.write} << 4) | (o.omod << 5) |
+                (o.inst << 7) | (o.dst << 21) | (o.chan << 29) | (u32{o.clamp} << 31)};
+}
+
+/// An OP3's.
+struct Op3 {
+    u32 inst = 0;
+    u32 dst = 0;
+    u32 chan = 0;
+    Src a{};
+    Src b{};
+    Src c{};
+    bool clamp = false;
+    bool last = false;
+};
+
+[[nodiscard]] std::array<u32, 2> op3(const Op3& o) {
+    return {word0(o.a, o.b, 0, o.last),
+            o.c.sel | (u32{o.c.rel} << 9) | (o.c.chan << 10) | (u32{o.c.neg} << 12) |
+                (o.inst << 13) | (o.dst << 21) | (o.chan << 29) | (u32{o.clamp} << 31)};
+}
+
+constexpr u32 alu_add = 0x00;
+constexpr u32 alu_mul = 0x01;
+constexpr u32 alu_mov = 0x19;
+constexpr u32 alu_nop = 0x1A;
+constexpr u32 alu_floor = 0x14;
+constexpr u32 alu_dot4 = 0x50;
+constexpr u32 alu_muladd = 0x10;
+
+/// A program of ALU clauses, each a list of 64-bit slots, run in order,
+/// then one export: PIX0 (type 0) or POS0 (type 1) from `gpr`. `cf_inst`
+/// is each clause's ALU CF_INST.
+[[nodiscard]] std::vector<u32>
+alu_program(const std::vector<std::vector<std::array<u32, 2>>>& clauses,
+            u32 export_type,
+            u32 gpr,
+            u32 cf_inst = 8) {
+    const auto cf_slots = static_cast<u32>(clauses.size() + 1);
+    std::vector<u32> words;
+    u32 address = cf_slots;
+    for (const auto& clause : clauses) {
+        words.push_back(address);
+        words.push_back(((static_cast<u32>(clause.size()) - 1) << 18) | (cf_inst << 26) | barrier);
+        address += static_cast<u32>(clause.size());
+    }
+    words.push_back(exp0(export_type == 1 ? 60 : 0, export_type, gpr));
+    words.push_back(xyzw | exp_done | end_of_program);
+    for (const auto& clause : clauses) {
+        for (const auto& slot : clause) {
+            words.insert(words.end(), slot.begin(), slot.end());
+        }
+    }
+    return words;
+}
+
+/// The group the Metal test draws too (test_metal.cpp): R0 is the
+/// interpolated colour, R1 what is exported.
+[[nodiscard]] std::vector<std::array<u32, 2>> example_alu_clause() {
+    return {
+        // MUL R2.x, R0.y, 0.25; MOV ____, R0.y; MOV R0.y, 0.0 (on T, since Y
+        // is taken) -- which the X and Y units still read as it was.
+        op2({.inst = alu_mul, .dst = 2, .chan = 0, .a = {0, 1}, .b = {src_literal, 0}}),
+        op2({.inst = alu_mov, .dst = 2, .chan = 1, .a = {0, 1}, .write = false}),
+        op2({.inst = alu_mov, .dst = 0, .chan = 1, .a = {src_zero}, .last = true}),
+        {0x3E800000, 0},
+        // ADD R1.x, PV.x, PV.x, *2; MOV R1.y, R0.y; MUL R1.z, PS, PV.y;
+        // MULADD R1.w, PV.y, 2.0, PS, clamped.
+        op2({.inst = alu_add, .dst = 1, .chan = 0, .a = {src_pv, 0}, .b = {src_pv, 0}, .omod = 1}),
+        op2({.inst = alu_mov, .dst = 1, .chan = 1, .a = {0, 1}}),
+        op2({.inst = alu_mul, .dst = 1, .chan = 2, .a = {src_ps}, .b = {src_pv, 1}}),
+        op3({.inst = alu_muladd,
+             .dst = 1,
+             .chan = 3,
+             .a = {src_pv, 1},
+             .b = {src_literal, 0},
+             .c = {src_ps},
+             .clamp = true,
+             .last = true}),
+        {0x40000000, 0},
+        // DOT4 of R1 and (1, 1, 1, 0), written to R1.y alone.
+        op2({.inst = alu_dot4, .dst = 1, .chan = 0, .a = {1, 0}, .b = {src_one}, .write = false}),
+        op2({.inst = alu_dot4, .dst = 1, .chan = 1, .a = {1, 1}, .b = {src_one}}),
+        op2({.inst = alu_dot4, .dst = 1, .chan = 2, .a = {1, 2}, .b = {src_one}, .write = false}),
+        op2({.inst = alu_dot4,
+             .dst = 1,
+             .chan = 3,
+             .a = {1, 3},
+             .b = {src_zero},
+             .write = false,
+             .last = true}),
+    };
+}
+
+} // namespace
+
+TEST_CASE("an ALU clause is its groups, each unit's instruction with its sources",
+          "[latte][shader][ir][alu]") {
+    const Registers registers;
+    CHECK(pixel(alu_program({example_alu_clause()}, 0, 1), registers) ==
+          "pixel shader\n"
+          "  input R0 <- parameter 0 (semantic 0), perspective\n"
+          "  alu group\n"
+          "    x: R2.x <- MUL(R0.y, 0x3E800000)\n"
+          "    y: ____ <- MOV(R0.y)\n"
+          "    t: R0.y <- MOV(0x00000000)\n"
+          "  alu group\n"
+          "    x: R1.x <- ADD(PV.x, PV.x) * 2\n"
+          "    y: R1.y <- MOV(R0.y)\n"
+          "    z: R1.z <- MUL(PS, PV.y)\n"
+          "    w: R1.w <- MULADD(PV.y, 0x40000000, PS), clamped\n"
+          "  alu group\n"
+          "    x: ____ <- DOT4(R1.x, 0x3F800000)\n"
+          "    y: R1.y <- DOT4(R1.y, 0x3F800000)\n"
+          "    z: ____ <- DOT4(R1.z, 0x3F800000)\n"
+          "    w: ____ <- DOT4(R1.w, 0x00000000)\n"
+          "  colour 0 (target 0) <- R1.xyzw\n");
+}
+
+TEST_CASE("an ALU source's modifiers, the inline constants, and the MULADD forms",
+          "[latte][shader][ir][alu]") {
+    const Registers registers;
+    // MOV R1.x, -|R0.z|; MOV R1.y, 0.5; MOV R1.z, 1 (the integer); MOV R1.w,
+    // -1 (the integer), clamped, /2.
+    const std::vector<std::array<u32, 2>> moves{
+        op2({.inst = alu_mov, .dst = 1, .chan = 0, .a = {0, 2, true, true}}),
+        op2({.inst = alu_mov, .dst = 1, .chan = 1, .a = {252}}),
+        op2({.inst = alu_mov, .dst = 1, .chan = 2, .a = {250}}),
+        op2({.inst = alu_mov,
+             .dst = 1,
+             .chan = 3,
+             .a = {251},
+             .omod = 3,
+             .clamp = true,
+             .last = true}),
+        // MULADD_IEEE_M4 R2.x, R1.x, -R1.y, R0.w; MULADD_D2 R2.y, ...
+        op3({.inst = 0x16, .dst = 2, .chan = 0, .a = {1, 0}, .b = {1, 1, true}, .c = {0, 3}}),
+        op3({.inst = 0x13,
+             .dst = 2,
+             .chan = 1,
+             .a = {1, 2},
+             .b = {1, 3},
+             .c = {0, 0, true},
+             .last = true}),
+    };
+    const std::string text = pixel(alu_program({moves}, 0, 1), registers);
+    CHECK(text.find("    x: R1.x <- MOV(-|R0.z|)\n"
+                    "    y: R1.y <- MOV(0x3F000000)\n"
+                    "    z: R1.z <- MOV(0x00000001)\n"
+                    "    w: R1.w <- MOV(0xFFFFFFFF) / 2, clamped\n") != std::string::npos);
+    CHECK(text.find("    x: R2.x <- MULADD_IEEE(R1.x, -R1.y, R0.w) * 4\n"
+                    "    y: R2.y <- MULADD(R1.z, R1.w, -R0.x) / 2\n") != std::string::npos);
+}
+
+TEST_CASE("a vertex shader may read R0 once it has written it", "[latte][shader][ir][alu]") {
+    const Registers registers;
+    const std::vector<std::array<u32, 2>> clause{
+        op2({.inst = alu_mov, .dst = 0, .chan = 0, .a = {src_one}, .last = true}),
+        op2({.inst = alu_add, .dst = 0, .chan = 1, .a = {0, 0}, .b = {0, 0}, .last = true}),
+    };
+    CHECK(vertex(alu_program({clause}, 1, 0), nullptr, registers) ==
+          "vertex shader\n"
+          "  alu group\n"
+          "    x: R0.x <- MOV(0x3F800000)\n"
+          "  alu group\n"
+          "    y: R0.y <- ADD(R0.x, R0.x)\n"
+          "  position <- R0.xyzw\n");
+    // But not a component it has not.
+    const std::vector<std::array<u32, 2>> other{
+        op2({.inst = alu_mov, .dst = 0, .chan = 0, .a = {src_one}, .last = true}),
+        op2({.inst = alu_add, .dst = 0, .chan = 1, .a = {0, 0}, .b = {0, 3}, .last = true}),
+    };
+    CHECK(refused_vertex(alu_program({other}, 1, 0), nullptr, registers)
+              .find("reads R0.w before the shader writes it") != std::string::npos);
+    // Nor in the group that writes it: the group reads first.
+    const std::vector<std::array<u32, 2>> same{
+        op2({.inst = alu_mov, .dst = 0, .chan = 0, .a = {src_one}}),
+        op2({.inst = alu_mov, .dst = 1, .chan = 1, .a = {0, 0}, .last = true}),
+    };
+    CHECK(refused_vertex(alu_program({same}, 1, 0), nullptr, registers)
+              .find("reads R0.x before the shader writes it") != std::string::npos);
+}
+
+TEST_CASE("what an ALU clause holds that is not translated yet is refused",
+          "[latte][shader][ir][alu]") {
+    const Registers registers;
+    const auto refused = [&](const std::vector<std::array<u32, 2>>& clause, u32 cf_inst = 8) {
+        return refused_pixel(alu_program({clause}, 0, 1, cf_inst), registers);
+    };
+    const auto mov = [](Src a, bool last = true) {
+        return op2({.inst = alu_mov, .dst = 1, .a = a, .last = last});
+    };
+
+    // Uniforms: KCACHE, and the constant file.
+    CHECK(refused({mov({128})}).find("reads a uniform") != std::string::npos);
+    CHECK(refused({mov({300})}).find("reads a uniform") != std::string::npos);
+    // PV and PS where the previous group left nothing: the first group, a
+    // unit that ran a NOP, a T unit that ran nothing.
+    CHECK(refused({mov({src_pv})}).find("reads PV.x, which the clause's previous group") !=
+          std::string::npos);
+    CHECK(refused({op2({.inst = alu_nop, .chan = 1}),
+                   op2({.inst = alu_mov, .dst = 1, .a = {0}, .last = true}),
+                   mov({src_pv, 1})})
+              .find("reads PV.y") != std::string::npos);
+    CHECK(refused({mov({0}), mov({src_ps})}).find("reads PS") != std::string::npos);
+    // ...nor from one clause into the next.
+    CHECK(refused_pixel(alu_program({{mov({0})}, {mov({src_pv})}}, 0, 1), registers)
+              .find("reads PV.x") != std::string::npos);
+    // Another instruction.
+    CHECK(refused({op2({.inst = alu_floor, .dst = 1, .a = {0}, .last = true})})
+              .find("FLOOR is not translated yet") != std::string::npos);
+    // A predicated instruction, a relative source and destination.
+    CHECK(refused({op2({.inst = alu_mov, .dst = 1, .a = {0}, .pred = 2, .last = true})})
+              .find("is predicated") != std::string::npos);
+    CHECK(refused({mov({0, 0, false, false, true})}).find("relative register") !=
+          std::string::npos);
+    std::array<u32, 2> relative = mov({0});
+    relative[1] |= 1U << 28;
+    CHECK(refused({relative}).find("writes a relative register") != std::string::npos);
+    // A DOT4 on one unit.
+    CHECK(refused({op2({.inst = alu_dot4, .dst = 1, .a = {0}, .b = {0}, .last = true})})
+              .find("DOT4 on fewer than the four vector units") != std::string::npos);
+    // A clause that pushes first.
+    CHECK(refused({mov({0})}, 9).find("push, pop or branch") != std::string::npos);
 }

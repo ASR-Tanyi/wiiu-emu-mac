@@ -1810,6 +1810,140 @@ TEST_CASE("an emitted pixel shader samples its texture through the selects",
     backend->shutdown();
 }
 
+TEST_CASE("an emitted pixel shader runs its ALU groups", "[gpu][metal][msl][alu]") {
+    using namespace wiiu::latte;
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+    const TextureHandle target = make_target(*backend);
+
+    // decaf's example triangle, green at every vertex, with a pixel shader
+    // of three ALU groups (test_shader_ir.cpp decodes the same groups from
+    // microcode, and test_msl.cpp pins their MSL). With R0 the colour in:
+    //
+    //   x: MUL R2.x, R0.y, 0.25    y: MOV ____, R0.y    t: MOV R0.y, 0.0
+    //   x: ADD R1.x, PV.x, PV.x *2 y: MOV R1.y, R0.y
+    //   z: MUL R1.z, PS, PV.y      w: MULADD R1.w, PV.y, 2.0, PS, clamped
+    //   DOT4 of R1 and (1, 1, 1, 0), written to R1.y alone
+    //
+    // gives R1 = (1, 1, 0, 1): yellow. Had the T unit's write of R0.y been
+    // seen by the X unit in its own group, red would be 0; had the DOT4 been
+    // written to every unit's destination, blue would be 1.
+    constexpr ir::Swizzle xyzw{Sel::X, Sel::Y, Sel::Z, Sel::W};
+    const auto attribute = [&](u32 semantic, u32 gpr, u32 buffer) {
+        ir::VertexAttribute a;
+        a.semantic = semantic;
+        a.gpr = gpr;
+        a.buffer = buffer;
+        a.bytes = 16;
+        a.data_format = 0x23;
+        a.num_format = NumFormat::Scaled;
+        a.endian = Endian::Swap8In32;
+        a.components = xyzw;
+        return a;
+    };
+    const auto gpr = [](u32 number, u32 chan) {
+        return ir::AluSource{.kind = ir::SourceKind::Register, .gpr = number, .chan = chan};
+    };
+    const auto value = [](u32 bits) {
+        return ir::AluSource{.kind = ir::SourceKind::Value, .bits = bits};
+    };
+    const auto pv = [](u32 chan) {
+        return ir::AluSource{.kind = ir::SourceKind::PreviousVector, .chan = chan};
+    };
+    const ir::AluSource previous_scalar{.kind = ir::SourceKind::PreviousScalar};
+    const auto op = [](AluUnit unit,
+                       ir::AluOpcode opcode,
+                       u32 dst,
+                       u32 chan,
+                       std::array<ir::AluSource, 3> sources,
+                       bool write = true) {
+        ir::AluOperation o;
+        o.unit = unit;
+        o.opcode = opcode;
+        o.sources = sources;
+        o.write = write;
+        o.dst_gpr = dst;
+        o.dst_chan = chan;
+        return o;
+    };
+    using enum ir::AluOpcode;
+    ir::AluGroup first;
+    first.operations = {op(AluUnit::X, Mul, 2, 0, {gpr(0, 1), value(0x3E800000)}),
+                        op(AluUnit::Y, Mov, 2, 1, {gpr(0, 1)}, false),
+                        op(AluUnit::T, Mov, 0, 1, {value(0)})};
+    ir::AluGroup second;
+    second.operations = {op(AluUnit::X, Add, 1, 0, {pv(0), pv(0)}),
+                         op(AluUnit::Y, Mov, 1, 1, {gpr(0, 1)}),
+                         op(AluUnit::Z, Mul, 1, 2, {previous_scalar, pv(1)}),
+                         op(AluUnit::W, MulAdd, 1, 3, {pv(1), value(0x40000000), previous_scalar})};
+    second.operations[0].modifier = ir::OutputModifier::Times2;
+    second.operations[3].clamp = true;
+    ir::AluGroup third;
+    third.operations = {op(AluUnit::X, Dot4, 1, 0, {gpr(1, 0), value(0x3F800000)}, false),
+                        op(AluUnit::Y, Dot4, 1, 1, {gpr(1, 1), value(0x3F800000)}),
+                        op(AluUnit::Z, Dot4, 1, 2, {gpr(1, 2), value(0x3F800000)}, false),
+                        op(AluUnit::W, Dot4, 1, 3, {gpr(1, 3), value(0)}, false)};
+
+    ir::Shader vs;
+    vs.stage = ir::Stage::Vertex;
+    vs.attributes = {attribute(0, 1, 0), attribute(1, 2, 1)};
+    vs.body = {ir::FetchAttributes{},
+               ir::ExportPosition{.gpr = 2, .swizzle = xyzw},
+               ir::ExportParameter{.index = 0, .semantic = 0, .gpr = 1, .swizzle = xyzw}};
+    ir::Shader ps;
+    ps.stage = ir::Stage::Pixel;
+    ps.inputs = {ir::PixelInput{.gpr = 0, .source = ir::InputSource::Parameter, .semantic = 0}};
+    ps.body = {
+        first, second, third, ir::ExportColor{.index = 0, .target = 0, .gpr = 1, .swizzle = xyzw}};
+
+    PipelineDesc desc;
+    desc.label = "emitted ALU triangle";
+    std::string error;
+    REQUIRE(msl::emit_vertex(vs, &ps, desc.vertex_source, error));
+    REQUIRE(msl::emit_pixel(ps, desc.fragment_source, error));
+    desc.color_formats[0] = TextureFormat::BGRA8Unorm;
+    const PipelineHandle pipeline = backend->create_pipeline(desc, error);
+    INFO(error);
+    INFO(desc.fragment_source);
+    REQUIRE(pipeline.valid());
+
+    const BufferHandle colours =
+        shared_buffer(*backend,
+                      big_endian(std::array<f32, 12>{
+                          0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F}));
+    const BufferHandle positions = shared_buffer(
+        *backend,
+        big_endian(std::array<f32, 12>{
+            -1.0F, -1.0F, 0.0F, 1.0F, 1.0F, -1.0F, 0.0F, 1.0F, -1.0F, 1.0F, 0.0F, 1.0F}));
+    msl::FetchConstants constants;
+    constants.stride[0] = 16;
+    constants.stride[1] = 16;
+    constants.size[0] = 48;
+    constants.size[1] = 48;
+    const BufferHandle fetch =
+        shared_buffer(*backend, std::array<msl::FetchConstants, 1>{constants});
+
+    REQUIRE(backend->begin_render_pass(clear_pass(target, ClearColor{0.0F, 0.0F, 1.0F, 1.0F})));
+    backend->set_pipeline(pipeline);
+    backend->bind_buffer(ShaderStage::Vertex, msl::fetch_constants_slot, fetch, 0);
+    backend->bind_buffer(ShaderStage::Vertex, msl::first_attribute_buffer_slot + 0, colours, 0);
+    backend->bind_buffer(ShaderStage::Vertex, msl::first_attribute_buffer_slot + 1, positions, 0);
+    DrawCall call;
+    call.vertex_count = 3;
+    backend->draw(call);
+    backend->end_render_pass();
+    backend->submit();
+
+    std::vector<u8> pixels(static_cast<std::size_t>(kTarget) * kTarget * 4);
+    REQUIRE(backend->read_texture(target, pixels));
+    constexpr std::array<u8, 4> yellow{0x00, 0xFF, 0xFF, 0xFF}; // BGRA
+    CHECK(at(pixels, 2, kTarget - 3) == yellow);
+    CHECK(at(pixels, 2, 40) == yellow);
+    CHECK(at(pixels, 40, 61) == yellow);
+    CHECK(at(pixels, kTarget - 3, 2) == kBlue);
+    CHECK(backend->command_errors() == 0);
+    backend->shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // 7.8 — capture
 // ---------------------------------------------------------------------------

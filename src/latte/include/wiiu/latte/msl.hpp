@@ -38,6 +38,21 @@
 // Latte's samplers 16 and 17 are refused for now; and sampling in a vertex
 // shader, which Metal does with an explicit level, is not emitted yet.
 //
+// **An ALU group** is a block of its own: each unit's result into a
+// constant (`alu_x` to `alu_w`, `alu_t`), every source read there; then the
+// group's register writes; then `PV` (a `float4`, one component a vector
+// unit) and `PS` (a `float`) for the next group -- which is the hardware's
+// rule that a group reads before it writes, and why a T unit's write to a
+// register the X unit reads in the same group is not seen. A reduction is
+// computed once, as `reduction`, and is every vector unit's result. DX9's
+// multiply (MUL, MULADD, DOT4) is a helper, `mul_dx9`, and MAX and MIN are
+// `max_r700` and `min_r700`, R700's comparisons, so a NaN behaves as it
+// does there; each helper is written only into a shader that uses it. A
+// literal is its bits, `as_type<float>(0x...u)`, so nothing is lost to a
+// decimal round trip; 0.0, 0.5 and 1.0 are written as themselves. The _IEEE
+// forms are plain `*` and `+`; whether Metal's compiler fuses them, as
+// R700's MULADD_IEEE does not, is unchecked.
+//
 // Refused, as not translated yet: attribute formats other than 32-bit
 // floats (32, 32_32, 32_32_32 and 32_32_32_32, SCALED, as GX2 writes them),
 // byte swaps other than none and 8IN32, a semantic read twice with two

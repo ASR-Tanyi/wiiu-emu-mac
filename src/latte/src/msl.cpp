@@ -77,6 +77,227 @@ static uint4 fetch32(device const uchar* buffer, uint size, uint stride, uint in
 }
 )msl";
 
+// The ALU's helpers, each written into a shader that uses it. DX9's
+// multiply: zero times anything -- infinity and NaN too -- is zero. MAX and
+// MIN as R700 defines them, by comparison, so a NaN picks the second source.
+constexpr std::string_view mul_dx9_helper = R"msl(
+static float mul_dx9(float a, float b) {
+    return (a == 0.0f || b == 0.0f) ? 0.0f : a * b;
+}
+)msl";
+
+constexpr std::string_view max_helper = R"msl(
+static float max_r700(float a, float b) {
+    return a >= b ? a : b;
+}
+)msl";
+
+constexpr std::string_view min_helper = R"msl(
+static float min_r700(float a, float b) {
+    return a < b ? a : b;
+}
+)msl";
+
+/// What a shader's ALU groups need declared.
+struct AluUse {
+    bool any = false; ///< PV and PS
+    bool mul_dx9 = false;
+    bool max = false;
+    bool min = false;
+};
+
+void emit_alu_helpers(std::string& out, const AluUse& use) {
+    if (use.mul_dx9) {
+        out += mul_dx9_helper;
+    }
+    if (use.max) {
+        out += max_helper;
+    }
+    if (use.min) {
+        out += min_helper;
+    }
+}
+
+constexpr std::string_view chans = "xyzw";
+
+/// PV and PS, declared with the registers in a shader that has ALU groups.
+constexpr std::string_view previous_results = "    float4 PV = float4(0.0);\n"
+                                              "    float PS = 0.0;\n";
+
+/// A source's value, with its absolute value and negation.
+[[nodiscard]] std::string alu_source(const ir::AluSource& source) {
+    std::string value;
+    switch (source.kind) {
+        case ir::SourceKind::Register:
+            value = fmt::format("R{}.{}", source.gpr, chans[source.chan & 3U]);
+            break;
+        case ir::SourceKind::Value:
+            switch (source.bits) {
+                case 0x00000000:
+                    value = "0.0f";
+                    break;
+                case 0x3F800000:
+                    value = "1.0f";
+                    break;
+                case 0x3F000000:
+                    value = "0.5f";
+                    break;
+                default:
+                    value = fmt::format("as_type<float>(0x{:08X}u)", source.bits);
+                    break;
+            }
+            break;
+        case ir::SourceKind::PreviousVector:
+            value = fmt::format("PV.{}", chans[source.chan & 3U]);
+            break;
+        case ir::SourceKind::PreviousScalar:
+            value = "PS";
+            break;
+    }
+    if (source.absolute) {
+        value = fmt::format("abs({})", value);
+    }
+    if (source.negate) {
+        value = fmt::format("-{}", value);
+    }
+    return value;
+}
+
+/// An operation's result, before its modifier and clamp. A reduction's is
+/// the reduction's, from the four operations' sources.
+[[nodiscard]] std::string alu_result(const ir::AluOperation& op, const ir::AluGroup& group) {
+    const auto s = [&op](std::size_t i) { return alu_source(op.sources[i]); };
+    switch (op.opcode) {
+        case ir::AluOpcode::Mov:
+            return s(0);
+        case ir::AluOpcode::Add:
+            return fmt::format("{} + {}", s(0), s(1));
+        case ir::AluOpcode::Mul:
+            return fmt::format("mul_dx9({}, {})", s(0), s(1));
+        case ir::AluOpcode::MulIeee:
+            return fmt::format("{} * {}", s(0), s(1));
+        case ir::AluOpcode::Max:
+            return fmt::format("max_r700({}, {})", s(0), s(1));
+        case ir::AluOpcode::Min:
+            return fmt::format("min_r700({}, {})", s(0), s(1));
+        case ir::AluOpcode::MulAdd:
+            return fmt::format("mul_dx9({}, {}) + {}", s(0), s(1), s(2));
+        case ir::AluOpcode::MulAddIeee:
+            return fmt::format("{} * {} + {}", s(0), s(1), s(2));
+        case ir::AluOpcode::Dot4:
+        case ir::AluOpcode::Dot4Ieee: {
+            std::array<std::string, 4> terms;
+            for (const ir::AluOperation& unit : group.operations) {
+                if (unit.unit == AluUnit::T) {
+                    continue;
+                }
+                const std::string a = alu_source(unit.sources[0]);
+                const std::string b = alu_source(unit.sources[1]);
+                terms[static_cast<u32>(unit.unit)] = op.opcode == ir::AluOpcode::Dot4
+                                                         ? fmt::format("mul_dx9({}, {})", a, b)
+                                                         : fmt::format("{} * {}", a, b);
+            }
+            return fmt::format("{} + {} + {} + {}", terms[0], terms[1], terms[2], terms[3]);
+        }
+    }
+    return "0.0f";
+}
+
+/// One group: every result into its own constant, from sources read before
+/// any is written; then the writes; then PV and PS for the next group.
+void emit_alu_group(std::string& out, const ir::AluGroup& group) {
+    const auto to = std::back_inserter(out);
+    constexpr std::string_view units = "xyzwt";
+    out += "    {\n";
+    bool reduced = false;
+    for (const ir::AluOperation& op : group.operations) {
+        const bool reduction =
+            op.opcode == ir::AluOpcode::Dot4 || op.opcode == ir::AluOpcode::Dot4Ieee;
+        std::string value;
+        if (reduction) {
+            if (!reduced) {
+                fmt::format_to(to, "        const float reduction = {};\n", alu_result(op, group));
+                reduced = true;
+            }
+            value = "reduction";
+        } else {
+            value = alu_result(op, group);
+        }
+        switch (op.modifier) {
+            case ir::OutputModifier::None:
+                break;
+            case ir::OutputModifier::Times2:
+                value = fmt::format("({}) * 2.0f", value);
+                break;
+            case ir::OutputModifier::Times4:
+                value = fmt::format("({}) * 4.0f", value);
+                break;
+            case ir::OutputModifier::Half:
+                value = fmt::format("({}) * 0.5f", value);
+                break;
+        }
+        if (op.clamp) {
+            value = fmt::format("clamp({}, 0.0f, 1.0f)", value);
+        }
+        fmt::format_to(
+            to, "        const float alu_{} = {};\n", units[static_cast<u32>(op.unit)], value);
+    }
+    for (const ir::AluOperation& op : group.operations) {
+        if (op.write) {
+            fmt::format_to(to,
+                           "        R{}.{} = alu_{};\n",
+                           op.dst_gpr,
+                           chans[op.dst_chan & 3U],
+                           units[static_cast<u32>(op.unit)]);
+        }
+    }
+    for (const ir::AluOperation& op : group.operations) {
+        if (op.unit == AluUnit::T) {
+            out += "        PS = alu_t;\n";
+        } else {
+            fmt::format_to(to, "        PV.{0} = alu_{0};\n", units[static_cast<u32>(op.unit)]);
+        }
+    }
+    out += "    }\n";
+}
+
+/// The registers an ALU group reads and writes, and the helpers it uses.
+/// False for a destination no register has.
+[[nodiscard]] bool
+scan_alu(const ir::AluGroup& group, std::set<u32>& registers, AluUse& use, std::string& error) {
+    use.any = true;
+    for (const ir::AluOperation& op : group.operations) {
+        switch (op.opcode) {
+            case ir::AluOpcode::Mul:
+            case ir::AluOpcode::MulAdd:
+            case ir::AluOpcode::Dot4:
+                use.mul_dx9 = true;
+                break;
+            case ir::AluOpcode::Max:
+                use.max = true;
+                break;
+            case ir::AluOpcode::Min:
+                use.min = true;
+                break;
+            default:
+                break;
+        }
+        if (op.write) {
+            if (op.dst_gpr > 127 || op.dst_chan > 3) {
+                error = fmt::format("an ALU result is written to R{}.{}", op.dst_gpr, op.dst_chan);
+                return false;
+            }
+            registers.insert(op.dst_gpr);
+        }
+        for (const ir::AluSource& source : op.sources) {
+            if (source.kind == ir::SourceKind::Register) {
+                registers.insert(source.gpr);
+            }
+        }
+    }
+    return true;
+}
+
 /// Component `sel` of `source`, or nothing for one not written.
 [[nodiscard]] std::optional<std::string> component(Sel sel, std::string_view source) {
     switch (sel) {
@@ -208,6 +429,7 @@ bool emit_vertex(const ir::Shader& vertex,
 
     std::set<u32> registers;
     std::set<u32> buffers;
+    AluUse alu;
     for (const ir::VertexAttribute& attribute : vertex.attributes) {
         if (!float32_components(attribute.data_format).has_value() ||
             attribute.num_format != NumFormat::Scaled) {
@@ -258,6 +480,10 @@ bool emit_vertex(const ir::Shader& vertex,
         } else if (std::holds_alternative<ir::SampleTexture>(statement)) {
             error = "sampling a texture in a vertex shader is not emitted yet";
             return false;
+        } else if (const auto* group = std::get_if<ir::AluGroup>(&statement)) {
+            if (!scan_alu(*group, registers, alu, error)) {
+                return false;
+            }
         }
     }
     if (pixel != nullptr) {
@@ -271,6 +497,7 @@ bool emit_vertex(const ir::Shader& vertex,
     const auto to = std::back_inserter(out);
     out += prelude;
     out += fetch_helpers;
+    emit_alu_helpers(out, alu);
     out += "\nstruct VertexOut {\n    float4 position [[position]];\n";
     for (const u32 semantic : semantics) {
         fmt::format_to(to, "    float4 sem{0} [[user(sem{0})]];\n", semantic);
@@ -291,6 +518,9 @@ bool emit_vertex(const ir::Shader& vertex,
     }
     out += ") {\n";
     declare_registers(out, registers);
+    if (alu.any) {
+        out += previous_results;
+    }
     out += "    VertexOut out = {};\n";
 
     for (const ir::Statement& statement : vertex.body) {
@@ -308,6 +538,8 @@ bool emit_vertex(const ir::Shader& vertex,
                 assign(out, "        ", fmt::format("R{}", a.gpr), a.components, "v");
                 out += "    }\n";
             }
+        } else if (const auto* group = std::get_if<ir::AluGroup>(&statement)) {
+            emit_alu_group(out, *group);
         } else if (const auto* position = std::get_if<ir::ExportPosition>(&statement)) {
             assign(
                 out, "    ", "out.position", position->swizzle, fmt::format("R{}", position->gpr));
@@ -354,6 +586,7 @@ bool emit_pixel(const ir::Shader& pixel, std::string& out, std::string& error) {
     std::set<u32> targets;
     std::set<u32> textures;
     std::set<u32> samplers;
+    AluUse alu;
     for (const ir::Statement& statement : pixel.body) {
         if (const auto* color = std::get_if<ir::ExportColor>(&statement)) {
             registers.insert(color->gpr);
@@ -381,14 +614,20 @@ bool emit_pixel(const ir::Shader& pixel, std::string& out, std::string& error) {
             registers.insert(sample->dst_gpr);
             textures.insert(sample->texture);
             samplers.insert(sample->sampler);
+        } else if (const auto* group = std::get_if<ir::AluGroup>(&statement)) {
+            if (!scan_alu(*group, registers, alu, error)) {
+                return false;
+            }
         } else {
-            error = "a pixel shader statement that is not a sample or a colour export";
+            error = "a pixel shader statement that is not a sample, an ALU group or a colour "
+                    "export";
             return false;
         }
     }
 
     const auto to = std::back_inserter(out);
     out += prelude;
+    emit_alu_helpers(out, alu);
     const bool has_inputs = position || !semantics.empty();
     if (has_inputs) {
         out += "\nstruct PixelIn {\n";
@@ -424,6 +663,9 @@ bool emit_pixel(const ir::Shader& pixel, std::string& out, std::string& error) {
                    fragment_entry,
                    fmt::join(parameters, ",\n                    "));
     declare_registers(out, registers);
+    if (alu.any) {
+        out += previous_results;
+    }
     for (const ir::PixelInput& input : pixel.inputs) {
         switch (input.source) {
             case ir::InputSource::Parameter:
@@ -444,6 +686,10 @@ bool emit_pixel(const ir::Shader& pixel, std::string& out, std::string& error) {
     for (const ir::Statement& statement : pixel.body) {
         if (const auto* sample = std::get_if<ir::SampleTexture>(&statement)) {
             emit_sample(out, *sample);
+            continue;
+        }
+        if (const auto* group = std::get_if<ir::AluGroup>(&statement)) {
+            emit_alu_group(out, *group);
             continue;
         }
         const auto& color = std::get<ir::ExportColor>(statement);

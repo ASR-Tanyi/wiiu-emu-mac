@@ -488,7 +488,9 @@ TEST_CASE_METHOD(DrawFixture,
     CHECK_FALSE(built);
     CHECK(error.find("no vertex shader") != std::string::npos);
 
-    // A vertex shader whose program has an ALU clause: ADD R0.x, R0.x, R0.x.
+    // A vertex shader whose ALU clause reads R0 before writing it: ADD R0.x,
+    // R0.x, R0.x. R0 holds the vertex and instance indices, not translated
+    // yet.
     put_program(memory,
                 kVertexProgram,
                 {2,
@@ -512,7 +514,7 @@ TEST_CASE_METHOD(DrawFixture,
     run_gpu();
     CHECK_FALSE(built);
     CHECK(error.find("the vertex shader at physical") != std::string::npos);
-    CHECK(error.find("ALU clauses") != std::string::npos);
+    CHECK(error.find("reads R0.x before the shader writes it") != std::string::npos);
 }
 
 // --------------------------------------------------------------------------

@@ -6,13 +6,17 @@
 // does not write included; each attribute index and component select; each
 // interpolation's qualifier; OpenGL's clip-space depth brought to Metal's
 // when asked; a sample, through the texture's selects and then its own,
-// with each texture and sampler bound once at its unit's slot; and the
-// refusal of what is not emitted yet.
+// with each texture and sampler bound once at its unit's slot; ALU groups,
+// word for word -- every source read before any result is written, a
+// reduction computed once and written where each unit's write mask says,
+// each opcode, source modifier and output modifier, and only the helpers a
+// shader uses; and the refusal of what is not emitted yet.
 
 #include <wiiu/latte/msl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <string>
 #include <variant>
 
@@ -372,4 +376,220 @@ TEST_CASE("what is not emitted yet is refused", "[latte][shader][msl]") {
     sampling_vertex.body.push_back(sampling_pixel().body[0]);
     CHECK_FALSE(msl::emit_vertex(sampling_vertex, nullptr, out, error));
     CHECK(error.find("vertex shader is not emitted yet") != std::string::npos);
+}
+
+// --------------------------------------------------------------------------
+// ALU groups
+// --------------------------------------------------------------------------
+
+namespace {
+
+[[nodiscard]] ir::AluSource gpr_source(u32 gpr, u32 chan) {
+    return {.kind = ir::SourceKind::Register, .gpr = gpr, .chan = chan};
+}
+
+[[nodiscard]] ir::AluSource value(u32 bits) {
+    return {.kind = ir::SourceKind::Value, .bits = bits};
+}
+
+[[nodiscard]] ir::AluSource pv(u32 chan) {
+    return {.kind = ir::SourceKind::PreviousVector, .chan = chan};
+}
+
+[[nodiscard]] ir::AluSource previous_scalar() {
+    return {.kind = ir::SourceKind::PreviousScalar};
+}
+
+[[nodiscard]] ir::AluOperation operation(AluUnit unit,
+                                         ir::AluOpcode opcode,
+                                         u32 dst_gpr,
+                                         u32 dst_chan,
+                                         std::array<ir::AluSource, 3> sources,
+                                         bool write = true) {
+    ir::AluOperation op;
+    op.unit = unit;
+    op.opcode = opcode;
+    op.sources = sources;
+    op.write = write;
+    op.dst_gpr = dst_gpr;
+    op.dst_chan = dst_chan;
+    return op;
+}
+
+/// The three groups test_shader_ir.cpp decodes and test_metal.cpp draws:
+/// R0 in, R1 out.
+[[nodiscard]] ir::Shader alu_pixel() {
+    using enum ir::AluOpcode;
+    ir::Shader ps = example_pixel();
+    ir::AluGroup first;
+    first.operations = {
+        operation(AluUnit::X, Mul, 2, 0, {gpr_source(0, 1), value(0x3E800000)}),
+        operation(AluUnit::Y, Mov, 2, 1, {gpr_source(0, 1)}, false),
+        operation(AluUnit::T, Mov, 0, 1, {value(0)}),
+    };
+    ir::AluGroup second;
+    second.operations = {
+        operation(AluUnit::X, Add, 1, 0, {pv(0), pv(0)}),
+        operation(AluUnit::Y, Mov, 1, 1, {gpr_source(0, 1)}),
+        operation(AluUnit::Z, Mul, 1, 2, {previous_scalar(), pv(1)}),
+        operation(AluUnit::W, MulAdd, 1, 3, {pv(1), value(0x40000000), previous_scalar()}),
+    };
+    second.operations[0].modifier = ir::OutputModifier::Times2;
+    second.operations[3].clamp = true;
+    ir::AluGroup third;
+    third.operations = {
+        operation(AluUnit::X, Dot4, 1, 0, {gpr_source(1, 0), value(0x3F800000)}, false),
+        operation(AluUnit::Y, Dot4, 1, 1, {gpr_source(1, 1), value(0x3F800000)}),
+        operation(AluUnit::Z, Dot4, 1, 2, {gpr_source(1, 2), value(0x3F800000)}, false),
+        operation(AluUnit::W, Dot4, 1, 3, {gpr_source(1, 3), value(0)}, false),
+    };
+    ps.body = {
+        first, second, third, ir::ExportColor{.index = 0, .target = 0, .gpr = 1, .swizzle = kXyzw}};
+    return ps;
+}
+
+} // namespace
+
+TEST_CASE("an ALU group reads every source before it writes", "[latte][shader][msl][alu]") {
+    const std::string text = pixel(alu_pixel());
+    // The helper it uses, and not the ones it does not.
+    CHECK(text.find("static float mul_dx9(float a, float b) {\n"
+                    "    return (a == 0.0f || b == 0.0f) ? 0.0f : a * b;\n"
+                    "}\n") != std::string::npos);
+    CHECK(text.find("max_r700") == std::string::npos);
+    // Each group: its results, then its writes, then PV and PS. So the T
+    // unit's R0.y = 0 is not seen by the X and Y units that read R0.y in
+    // the same group; the reduction is computed once and written only where
+    // a unit's write mask says.
+    CHECK(from(text, "fragment") == "fragment PixelOut fragment_main(PixelIn in [[stage_in]]) {\n"
+                                    "    float4 R0 = float4(0.0);\n"
+                                    "    float4 R1 = float4(0.0);\n"
+                                    "    float4 R2 = float4(0.0);\n"
+                                    "    float4 PV = float4(0.0);\n"
+                                    "    float PS = 0.0;\n"
+                                    "    R0 = in.sem0;\n"
+                                    "    PixelOut out = {};\n"
+                                    "    {\n"
+                                    "        const float alu_x = mul_dx9(R0.y, "
+                                    "as_type<float>(0x3E800000u));\n"
+                                    "        const float alu_y = R0.y;\n"
+                                    "        const float alu_t = 0.0f;\n"
+                                    "        R2.x = alu_x;\n"
+                                    "        R0.y = alu_t;\n"
+                                    "        PV.x = alu_x;\n"
+                                    "        PV.y = alu_y;\n"
+                                    "        PS = alu_t;\n"
+                                    "    }\n"
+                                    "    {\n"
+                                    "        const float alu_x = (PV.x + PV.x) * 2.0f;\n"
+                                    "        const float alu_y = R0.y;\n"
+                                    "        const float alu_z = mul_dx9(PS, PV.y);\n"
+                                    "        const float alu_w = clamp(mul_dx9(PV.y, "
+                                    "as_type<float>(0x40000000u)) + PS, 0.0f, 1.0f);\n"
+                                    "        R1.x = alu_x;\n"
+                                    "        R1.y = alu_y;\n"
+                                    "        R1.z = alu_z;\n"
+                                    "        R1.w = alu_w;\n"
+                                    "        PV.x = alu_x;\n"
+                                    "        PV.y = alu_y;\n"
+                                    "        PV.z = alu_z;\n"
+                                    "        PV.w = alu_w;\n"
+                                    "    }\n"
+                                    "    {\n"
+                                    "        const float reduction = mul_dx9(R1.x, 1.0f) + "
+                                    "mul_dx9(R1.y, 1.0f) + mul_dx9(R1.z, 1.0f) + mul_dx9(R1.w, "
+                                    "0.0f);\n"
+                                    "        const float alu_x = reduction;\n"
+                                    "        const float alu_y = reduction;\n"
+                                    "        const float alu_z = reduction;\n"
+                                    "        const float alu_w = reduction;\n"
+                                    "        R1.y = alu_y;\n"
+                                    "        PV.x = alu_x;\n"
+                                    "        PV.y = alu_y;\n"
+                                    "        PV.z = alu_z;\n"
+                                    "        PV.w = alu_w;\n"
+                                    "    }\n"
+                                    "    out.color0.x = R1.x;\n"
+                                    "    out.color0.y = R1.y;\n"
+                                    "    out.color0.z = R1.z;\n"
+                                    "    out.color0.w = R1.w;\n"
+                                    "    return out;\n"
+                                    "}\n");
+
+    // A shader with no ALU has neither the helpers nor PV and PS.
+    const std::string plain = pixel(example_pixel());
+    CHECK(plain.find("mul_dx9") == std::string::npos);
+    CHECK(plain.find("PV") == std::string::npos);
+}
+
+TEST_CASE("each ALU opcode, source modifier and output modifier, as MSL",
+          "[latte][shader][msl][alu]") {
+    using enum ir::AluOpcode;
+    ir::AluSource negated = gpr_source(0, 2);
+    negated.negate = true;
+    ir::AluSource both = gpr_source(0, 3);
+    both.negate = true;
+    both.absolute = true;
+    ir::AluGroup group;
+    group.operations = {
+        operation(AluUnit::X, MulIeee, 1, 0, {negated, value(0x3F000000)}),
+        operation(AluUnit::Y, Max, 1, 1, {both, value(0xC0400000)}),
+        operation(AluUnit::Z, Min, 1, 2, {gpr_source(0, 0), gpr_source(0, 1)}),
+        operation(AluUnit::W, MulAddIeee, 1, 3, {gpr_source(0, 0), gpr_source(0, 1), negated}),
+        operation(AluUnit::T, MulAdd, 2, 0, {gpr_source(0, 0), gpr_source(0, 1), gpr_source(0, 2)}),
+    };
+    group.operations[1].modifier = ir::OutputModifier::Times4;
+    group.operations[2].modifier = ir::OutputModifier::Half;
+    group.operations[4].clamp = true;
+    group.operations[4].modifier = ir::OutputModifier::Times2;
+    ir::AluGroup dot;
+    dot.operations = {
+        operation(AluUnit::X, Dot4Ieee, 3, 0, {gpr_source(1, 0), gpr_source(2, 0)}),
+        operation(AluUnit::Y, Dot4Ieee, 3, 1, {gpr_source(1, 1), gpr_source(2, 0)}),
+        operation(AluUnit::Z, Dot4Ieee, 3, 2, {gpr_source(1, 2), gpr_source(2, 0)}, false),
+        operation(AluUnit::W, Dot4Ieee, 3, 3, {gpr_source(1, 3), gpr_source(2, 0)}, false),
+    };
+    ir::Shader ps = example_pixel();
+    ps.body = {group, dot, ir::ExportColor{.index = 0, .target = 0, .gpr = 3, .swizzle = kXyzw}};
+    const std::string text = pixel(ps);
+    CHECK(text.find("        const float alu_x = -R0.z * 0.5f;\n"
+                    "        const float alu_y = (max_r700(-abs(R0.w), "
+                    "as_type<float>(0xC0400000u))) * 4.0f;\n"
+                    "        const float alu_z = (min_r700(R0.x, R0.y)) * 0.5f;\n"
+                    "        const float alu_w = R0.x * R0.y + -R0.z;\n"
+                    "        const float alu_t = clamp((mul_dx9(R0.x, R0.y) + R0.z) * 2.0f, 0.0f, "
+                    "1.0f);\n"
+                    "        R1.x = alu_x;\n"
+                    "        R1.y = alu_y;\n"
+                    "        R1.z = alu_z;\n"
+                    "        R1.w = alu_w;\n"
+                    "        R2.x = alu_t;\n") != std::string::npos);
+    // DOT4_IEEE's multiplies are IEEE's; the result goes to every unit that
+    // writes.
+    CHECK(text.find("        const float reduction = R1.x * R2.x + R1.y * R2.x + R1.z * R2.x + "
+                    "R1.w * R2.x;\n") != std::string::npos);
+    CHECK(text.find("        R3.x = alu_x;\n"
+                    "        R3.y = alu_y;\n"
+                    "        PV.x = alu_x;\n") != std::string::npos);
+
+    // In a vertex shader too, with the helpers and PV beside the fetch.
+    ir::Shader vs = example_vertex();
+    ir::AluGroup scale;
+    scale.operations = {operation(AluUnit::X, Mul, 2, 0, {gpr_source(2, 0), value(0x3F000000)})};
+    vs.body.insert(vs.body.begin() + 1, scale);
+    const std::string vertex_text = vertex(vs);
+    // Only the helpers it uses.
+    CHECK(vertex_text.find("static float mul_dx9(float a, float b)") != std::string::npos);
+    CHECK(vertex_text.find("max_r700") == std::string::npos);
+    CHECK(text.find("static float max_r700(float a, float b) {\n"
+                    "    return a >= b ? a : b;\n"
+                    "}\n") != std::string::npos);
+    CHECK(text.find("static float min_r700(float a, float b) {\n"
+                    "    return a < b ? a : b;\n"
+                    "}\n") != std::string::npos);
+    CHECK(vertex_text.find("    float4 PV = float4(0.0);\n"
+                           "    float PS = 0.0;\n"
+                           "    VertexOut out = {};\n") != std::string::npos);
+    CHECK(vertex_text.find("        const float alu_x = mul_dx9(R2.x, 0.5f);\n"
+                           "        R2.x = alu_x;\n") != std::string::npos);
 }
