@@ -46,7 +46,8 @@
 // copy of a surface the GPU holds, which fills a scan frame's texture rather
 // than its bytes (a flip then hands the frontend that texture), and draws,
 // into render target 0's surface, tested against the depth buffer's when
-// they test or write depth or stencil. Without one, as in most tests, the clear
+// they test or write depth or stencil, with the textures their pixel
+// shaders sample uploaded from guest memory. Without one, as in most tests, the clear
 // and the copy are done on guest memory, on the CPU, and nothing draws.
 //
 // What is not here yet: swap interval 0's flip-without-waiting (it waits for
@@ -62,8 +63,10 @@
 #include <wiiu/latte/pipeline_cache.hpp>
 #include <wiiu/latte/pm4.hpp>
 #include <wiiu/latte/registers.hpp>
+#include <wiiu/latte/sampler_cache.hpp>
 #include <wiiu/latte/surface_cache.hpp>
 #include <wiiu/latte/surface_copy.hpp>
+#include <wiiu/latte/texture_cache.hpp>
 #include <wiiu/latte/timeline.hpp>
 #include <wiiu/memory/memory.hpp>
 
@@ -455,6 +458,16 @@ public:
         return index_cache_.get();
     }
 
+    /// The textures draws have sampled, or none before the first.
+    [[nodiscard]] const latte::TextureCache* texture_cache() const noexcept {
+        return texture_cache_.get();
+    }
+
+    /// The samplers draws have sampled with, or none without a backend.
+    [[nodiscard]] const latte::SamplerCache* sampler_cache() const noexcept {
+        return sampler_cache_.get();
+    }
+
     /// The pipelines draws have been made with, or none without a backend.
     [[nodiscard]] const latte::PipelineCache* pipelines() const noexcept {
         return pipelines_.get();
@@ -558,6 +571,8 @@ private:
     std::unique_ptr<latte::DepthStencilCache> depth_stencils_;
     std::unique_ptr<latte::GuestBuffers> guest_buffers_; ///< made at the first draw
     std::unique_ptr<latte::IndexCache> index_cache_;     ///< and at the first indexed one
+    std::unique_ptr<latte::TextureCache> texture_cache_; ///< and at the first that samples
+    std::unique_ptr<latte::SamplerCache> sampler_cache_;
     DrawStats draw_stats_;
     std::array<ScanTextures, scan_target_count> scan_textures_{};
     std::vector<gpu::TextureHandle> retired_textures_;

@@ -184,6 +184,7 @@ enum class AddressMode : u8 {
     MirrorRepeat,
     ClampToEdge,
     ClampToBorder,
+    MirrorClampToEdge, ///< mirrored once, then the edge: Latte's MIRROR_ONCE
 };
 
 enum class CompareFunction : u8 {

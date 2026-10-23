@@ -19,6 +19,7 @@
 #include <wiiu/hle/gx2_fetch_shader.hpp>
 #include <wiiu/hle/gx2_shader.hpp>
 #include <wiiu/hle/gx2_surface.hpp>
+#include <wiiu/hle/gx2_texture.hpp>
 #include <wiiu/hle/registry.hpp>
 #include <wiiu/latte/formats.hpp>
 #include <wiiu/latte/guest_buffers.hpp>
@@ -1460,6 +1461,54 @@ TEST_CASE("decaf's example triangle, drawn through GX2's own calls", "[gpu][meta
             set_depth_buffer(0.25F);
             call("GX2DrawEx", {4, 3, 0, 1});
             green = {0, 0, 255, 255};
+        }
+        SECTION("sampling a texture GX2 bound, with a sampler GX2 made") {
+            // The pixel shader made to sample texture 0 with sampler 0 at its
+            // input's XY -- the vertex colour, green, so (0, 1) -- into R1,
+            // and export R1. The texture is orange throughout; clamped, the
+            // corner it reads is orange too.
+            constexpr ppcaddr_t kSamplingProgram = 0x10022800;
+            constexpr ppcaddr_t kSamplingStruct = 0x10023000;
+            constexpr ppcaddr_t kTexture = 0x10007000;
+            constexpr ppcaddr_t kSampler = 0x10007200;
+            constexpr ppcaddr_t kTexImage = 0x10900000;
+            put_program(kSamplingProgram,
+                        {2,
+                         (1U << 23) | (1U << 31),
+                         1U << 15,
+                         xyzw | (0x28U << 23) | (1U << 31) | (1U << 21),
+                         0x10,
+                         1U | (xyzw << 9) | 0xF0000000U,
+                         (1U << 23) | (4U << 26) | (4U << 29),
+                         0});
+            hle::gx2::PixelShader sampling = ps;
+            sampling.size = 32;
+            sampling.data = kSamplingProgram;
+            REQUIRE(hle::gx2::write_guest(memory, kSamplingStruct, sampling));
+            call("GX2SetPixelShader", {kSamplingStruct});
+
+            hle::gx2::Texture texture{};
+            texture.surface.dim = 1;
+            texture.surface.width = 16;
+            texture.surface.height = 16;
+            texture.surface.depth = 1;
+            texture.surface.mip_levels = 1;
+            texture.surface.format = 0x01A;
+            texture.surface.use = hle::gx2::surface_use_texture;
+            REQUIRE(hle::gx2::calc_surface_size_and_alignment(texture.surface));
+            texture.surface.image = kTexImage;
+            texture.comp_map = 0x00010203;
+            for (u32 at = 0; at < texture.surface.image_size; at += 4) {
+                const std::array<u8, 4> orange{0xFF, 0x80, 0x00, 0xFF};
+                REQUIRE(memory.write_bytes(kTexImage + at, orange));
+            }
+            REQUIRE(hle::gx2::write_guest(memory, kTexture, texture));
+            call("GX2InitTextureRegs", {kTexture});
+            call("GX2SetPixelTexture", {kTexture, 0});
+            call("GX2InitSampler", {kSampler, 2, 1}); // clamp, bilinear
+            call("GX2SetPixelSampler", {kSampler, 0});
+            call("GX2DrawEx", {4, 3, 0, 1});
+            green = {0xFF, 0x80, 0x00, 0xFF};
         }
         SECTION("from GX2's big-endian 16-bit indices") {
             constexpr ppcaddr_t kIndices = 0x10040200;

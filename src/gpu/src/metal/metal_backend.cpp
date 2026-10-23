@@ -189,6 +189,8 @@ using metal::Ref;
             return MTL::SamplerAddressModeClampToEdge;
         case AddressMode::ClampToBorder:
             return MTL::SamplerAddressModeClampToBorderColor;
+        case AddressMode::MirrorClampToEdge:
+            return MTL::SamplerAddressModeMirrorClampToEdge;
         case AddressMode::Repeat:
             break;
     }

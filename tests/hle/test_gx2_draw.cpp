@@ -14,8 +14,10 @@
 // guest memory and their fetch constants, the pipeline built once, an
 // indexed draw's indices converted to the host's order once, the blending
 // and culling GX2's colour and polygon calls set, the depth buffer
-// GX2SetDepthBuffer named tested as GX2's depth calls say; what is not drawn
-// yet refused by name, and nothing drawn without a GPU.
+// GX2SetDepthBuffer named tested as GX2's depth calls say, the textures a
+// pixel shader samples uploaded and bound at their units with their
+// samplers; what is not drawn yet refused by name, and nothing drawn without
+// a GPU.
 
 #include <wiiu/common/log.hpp>
 #include <wiiu/cpu/state.hpp>
@@ -786,9 +788,10 @@ TEST_CASE_METHOD(GpuDrawFixture,
     CHECK(backend.rejected() == 0);
 }
 
-TEST_CASE_METHOD(GpuDrawFixture,
-                 "a draw that samples a texture is refused until its textures are bound",
-                 "[hle][gx2][draw][gpu]") {
+TEST_CASE_METHOD(
+    GpuDrawFixture,
+    "a draw that samples has its textures uploaded and its samplers made, at their units",
+    "[hle][gx2][draw][gpu]") {
     // The example's pixel shader made to sample: a TEX clause reading
     // texture 0 with sampler 0 at R0.xy into R1, and R1 exported.
     constexpr ppcaddr_t kTexture = 0x10032000;
@@ -824,12 +827,46 @@ TEST_CASE_METHOD(GpuDrawFixture,
     call("GX2InitTextureRegs", {kTexture});
     call("GX2SetPixelTexture", {kTexture, 0});
 
+    // A point-sampled, clamped sampler at the pixel stage's sampler 0.
+    constexpr ppcaddr_t kSampler = 0x10032200;
+    call("GX2InitSampler", {kSampler, 2, 0});
+    call("GX2SetPixelSampler", {kSampler, 0});
+
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    for (const std::string& problem : os.gpu.problems()) {
+        UNSCOPED_INFO(problem);
+    }
+    CHECK(os.gpu.draw_stats().drawn == 1);
+    REQUIRE(os.gpu.texture_cache() != nullptr);
+    CHECK(os.gpu.texture_cache()->stats().uploads == 1);
+    REQUIRE(os.gpu.sampler_cache() != nullptr);
+    CHECK(os.gpu.sampler_cache()->size() == 1);
+    CHECK(backend.recorded("bind_texture fragment [0] = "));
+    CHECK(backend.recorded("bind_sampler fragment [0] = "));
+    CHECK(backend.recorded("draw vertices 3"));
+
+    // The next draw finds both.
+    call("GX2DrawEx", {4, 3, 0, 1});
+    run_gpu();
+    CHECK(os.gpu.draw_stats().drawn == 2);
+    CHECK(os.gpu.texture_cache()->stats().uploads == 1);
+    CHECK(os.gpu.texture_cache()->stats().hits == 1);
+    CHECK(os.gpu.sampler_cache()->size() == 1);
+
+    // A texture the cache cannot upload yet refuses the draw, by name.
+    texture.surface.format = 0x022; // 32_32_32_32: not uploaded yet
+    REQUIRE(gx2::write_guest(memory, kTexture, texture));
+    call("GX2InitTextureRegs", {kTexture});
+    call("GX2SetPixelTexture", {kTexture, 0});
     call("GX2DrawEx", {4, 3, 0, 1});
     run_gpu();
     CHECK(os.gpu.draw_stats().refused == 1);
-    CHECK(
-        os.gpu.problems().contains("a draw whose pixel shader samples a texture is not drawn yet"));
-    CHECK_FALSE(backend.recorded("draw vertices"));
+    bool named = false;
+    for (const std::string& problem : os.gpu.problems()) {
+        named = named || problem.starts_with("a draw's texture 0: format 0x22");
+    }
+    CHECK(named);
     CHECK(backend.rejected() == 0);
 }
 

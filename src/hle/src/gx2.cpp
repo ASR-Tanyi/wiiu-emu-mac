@@ -14,6 +14,8 @@
 #include <wiiu/latte/draw_shaders.hpp>
 #include <wiiu/latte/draw_state.hpp>
 #include <wiiu/latte/pm4.hpp>
+#include <wiiu/latte/resources.hpp>
+#include <wiiu/latte/samplers.hpp>
 #include <wiiu/latte/vertex_inputs.hpp>
 #include <wiiu/memory/map.hpp>
 
@@ -22,7 +24,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <utility>
 #include <variant>
+#include <vector>
 
 namespace wiiu::hle::gx2 {
 
@@ -120,6 +124,7 @@ void Gpu::initialize(memory::Memory& memory, u32 main_core, const InitAttributes
         // Windows onto the memory there was, and copies made from it.
         guest_buffers_.reset();
         index_cache_.reset();
+        texture_cache_.reset();
     }
     memory_ = &memory;
     processor_.set_memory(&memory);
@@ -333,6 +338,8 @@ void Gpu::attach_backend(gpu::GpuBackend* backend) {
     copier_.shutdown();
     guest_buffers_.reset();
     index_cache_.reset();
+    texture_cache_.reset();
+    sampler_cache_.reset();
     depth_stencils_.reset();
     pipelines_.reset();
     surfaces_.reset();
@@ -343,6 +350,7 @@ void Gpu::attach_backend(gpu::GpuBackend* backend) {
     surfaces_ = std::make_unique<latte::SurfaceCache>(*backend_);
     pipelines_ = std::make_unique<latte::PipelineCache>(*backend_);
     depth_stencils_ = std::make_unique<latte::DepthStencilCache>(*backend_);
+    sampler_cache_ = std::make_unique<latte::SamplerCache>(*backend_);
     std::string error;
     if (!copier_.initialize(*backend_, error)) {
         // Clears still run on the GPU; copies of what they made cannot, and
@@ -356,10 +364,11 @@ void Gpu::reset() {
     if (surfaces_ != nullptr) {
         surfaces_->clear();
     }
-    // Pipelines hold nothing of the title's and stay; windows onto its
-    // memory, and copies of its indices, do not.
+    // Pipelines and samplers hold nothing of the title's and stay; windows
+    // onto its memory, and copies of its indices and textures, do not.
     guest_buffers_.reset();
     index_cache_.reset();
+    texture_cache_.reset();
     draw_stats_ = {};
     registers_->reset();
     processor_.reset_state();
@@ -565,13 +574,44 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
         problem = "a draw's shaders: " + error;
         return false;
     }
-    // Its textures and samplers are not bound yet; Metal would refuse the
-    // draw for want of them.
-    if (std::ranges::any_of(shaders.pixel_ir.body, [](const latte::ir::Statement& statement) {
-            return std::holds_alternative<latte::ir::SampleTexture>(statement);
-        })) {
-        problem = "a draw whose pixel shader samples a texture is not drawn yet";
-        return false;
+    // The textures and samplers its pixel shader samples, at the units the
+    // shader names: each texture uploaded from guest memory (or found), each
+    // sampler made (or found) from its words.
+    std::vector<std::pair<u32, gpu::TextureHandle>> textures;
+    std::vector<std::pair<u32, gpu::SamplerHandle>> samplers;
+    for (const latte::ir::Statement& statement : shaders.pixel_ir.body) {
+        const auto* sample = std::get_if<latte::ir::SampleTexture>(&statement);
+        if (sample == nullptr) {
+            continue;
+        }
+        const auto bound = [](const auto& list, u32 unit) {
+            return std::ranges::any_of(list,
+                                       [unit](const auto& entry) { return entry.first == unit; });
+        };
+        if (!bound(textures, sample->texture)) {
+            if (texture_cache_ == nullptr) {
+                texture_cache_ = std::make_unique<latte::TextureCache>(*backend_, *memory_);
+            }
+            const std::optional<latte::CachedTexture> texture = texture_cache_->texture(
+                latte::texture_resource(registers, latte::resource::ps_base + sample->texture),
+                error);
+            if (!texture.has_value()) {
+                problem = fmt::format("a draw's texture {}: {}", sample->texture, error);
+                return false;
+            }
+            textures.emplace_back(sample->texture, texture->texture);
+        }
+        if (!bound(samplers, sample->sampler)) {
+            const gpu::SamplerHandle handle = sampler_cache_->sampler(
+                latte::texture_sampler(registers, latte::sampler::ps_base + sample->sampler),
+                latte::border_color(registers, latte::sampler::ps_border_base, sample->sampler));
+            if (!handle.valid()) {
+                problem =
+                    fmt::format("the backend made no sampler for sampler {}", sample->sampler);
+                return false;
+            }
+            samplers.emplace_back(sample->sampler, handle);
+        }
     }
     const gpu::PipelineHandle pipeline = pipelines_->pipeline(
         latte::PipelineKey{.vertex_msl = shaders.vertex_msl,
@@ -650,6 +690,12 @@ bool Gpu::draw_on_gpu(const latte::DrawCommand& draw,
         backend_->set_blend_color(latte::blend_color(registers));
     }
     latte::bind_vertex_inputs(*backend_, inputs);
+    for (const auto& [unit, texture] : textures) {
+        backend_->bind_texture(gpu::ShaderStage::Fragment, unit, texture);
+    }
+    for (const auto& [unit, sampler] : samplers) {
+        backend_->bind_sampler(gpu::ShaderStage::Fragment, unit, sampler);
+    }
     gpu::DrawCall call;
     if (indices.has_value()) {
         call.index_buffer = indices->buffer;
