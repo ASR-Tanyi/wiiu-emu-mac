@@ -488,11 +488,15 @@ TEST_CASE_METHOD(DrawFixture,
     CHECK_FALSE(built);
     CHECK(error.find("no vertex shader") != std::string::npos);
 
-    // A vertex shader whose program has an ALU clause.
-    put_program(
-        memory,
-        kVertexProgram,
-        {2, (8U << 26) | (1U << 31), 60U | (1U << 13), 0x688U | (0x28U << 23) | (1U << 21), 0, 0});
+    // A vertex shader whose program has an ALU clause: ADD R0.x, R0.x, R0.x.
+    put_program(memory,
+                kVertexProgram,
+                {2,
+                 (8U << 26) | (1U << 31),
+                 60U | (1U << 13),
+                 0x688U | (0x28U << 23) | (1U << 21),
+                 1U << 31,
+                 1U << 4});
     gx2::VertexShader vs{};
     vs.size = 24;
     vs.data = kVertexProgram;

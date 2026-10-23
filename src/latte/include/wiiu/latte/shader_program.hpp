@@ -10,9 +10,22 @@
 // vertex shader's registers the value goes. A texture fetch clause is how a
 // shader samples: each fetch saying what to do (SAMPLE and its forms, a
 // gradient, a size query), with which resource and sampler, from which
-// register's coordinates, into which register's components. ALU clauses
-// follow; until then they are listed, as the control flow names them, and
-// empty.
+// register's coordinates, into which register's components. An ALU clause
+// is groups of up to five instructions -- one each for the X, Y, Z and W
+// units and the transcendental T, the last marked LAST -- each followed by
+// the literal constants its instructions read, two to a 64-bit slot.
+//
+// Which unit an instruction runs on is decaf's rule, which Cemu's shares:
+// one only the T unit runs goes there; otherwise its destination channel's
+// unit, or T if an earlier instruction of the group has that one -- unless
+// only the vector units run it, when two to one unit is a collision. The
+// literal count is one more than the highest channel any instruction reads
+// a literal at.
+//
+// An ALU group is refused if an instruction is not one decaf's table names,
+// two instructions want one unit, it runs past five instructions or its
+// clause, or a field holds a value decaf's disassembler aborts on (a bank
+// swizzle past the unit's six or four, PRED_SEL 1).
 //
 // A vertex fetch is refused if it is not one R700 has: FETCH or SEMANTIC.
 // A texture fetch cannot be: its five bits all name an R700 instruction, the
@@ -87,11 +100,45 @@ struct TextureFetch {
     [[nodiscard]] f32 offset(u32 axis) const noexcept;
 };
 
+/// The unit an ALU instruction runs on.
+enum class AluUnit : u8 {
+    X,
+    Y,
+    Z,
+    W,
+    T,
+};
+
+/// One ALU instruction: its two words, what it is, and its unit.
+struct AluInstruction {
+    u32 word0 = 0;
+    u32 word1 = 0;
+    AluOp op;
+    AluUnit unit = AluUnit::X;
+
+    [[nodiscard]] AluWord0 alu0() const noexcept { return {.raw = word0}; }
+
+    [[nodiscard]] AluWord1 alu1() const noexcept { return {.raw = word1}; }
+
+    [[nodiscard]] AluWord1Op2 op2() const noexcept { return {.raw = word1}; }
+
+    [[nodiscard]] AluWord1Op3 op3() const noexcept { return {.raw = word1}; }
+
+    [[nodiscard]] bool is_op3() const noexcept { return alu1().encoding != 0; }
+};
+
+/// An ALU instruction group, and the literals after it.
+struct AluGroup {
+    std::vector<AluInstruction> instructions;
+    std::vector<u32> literals;
+};
+
 /// A clause, and what is decoded of it.
 struct DecodedClause {
     Clause clause;
     std::vector<VertexFetch> vertex_fetches;   ///< a VTX clause's, in order
     std::vector<TextureFetch> texture_fetches; ///< a TEX clause's, in order
+    std::vector<AluGroup> alu_groups;          ///< an ALU clause's, in order
 };
 
 struct ShaderProgram {
@@ -123,6 +170,15 @@ struct ShaderProgram {
 /// the flags, the coordinates not normalised and the offsets, where set. A
 /// vertex fetch's words are printed as a vertex fetch.
 [[nodiscard]] std::string disassemble(const TextureFetch& fetch);
+
+/// One ALU instruction, as decaf's disassembler prints it: "MULADD
+/// R1.x, R0.x, KC0[0].x, (0x3F800000, 1)", the name -- with an OP2's output
+/// modifier -- padded to fifteen, the destination ("____" for an OP2 that
+/// writes nothing), the sources, and the flags. `group` is the group's
+/// number in the program's count, which PV and PS name the one before;
+/// `literals` the group's.
+[[nodiscard]] std::string
+disassemble(const AluInstruction& instruction, u32 group, std::span<const u32> literals);
 
 /// The whole program, each clause's contents beneath the instruction that
 /// runs it.

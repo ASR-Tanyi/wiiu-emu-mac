@@ -8,7 +8,10 @@
 // four words a fetch.
 //
 // So far: the three forms of a control-flow instruction -- the common one,
-// the ALU clause's and the export's -- a vertex fetch, and a texture fetch.
+// the ALU clause's and the export's -- a vertex fetch, a texture fetch, and
+// an ALU instruction, in its two forms (OP2, up to two sources, and OP3,
+// three), with decaf's table of which instruction is which: its name, its
+// sources, and which units run it.
 // The field positions are decaf's and Cemu's, which agree on every one of
 // them but a texture fetch's LOD bias, which Cemu reads from word 2 on top
 // of the source selects and decaf from word 1's free bits 21 to 27; decaf's
@@ -20,6 +23,9 @@
 
 #include <wiiu/common/bitfield.hpp>
 #include <wiiu/common/types.hpp>
+
+#include <optional>
+#include <string_view>
 
 namespace wiiu::latte {
 
@@ -387,6 +393,115 @@ union TexWord2 {
     BitField<26, 3, Sel> src_sel_z;
     BitField<29, 3, Sel> src_sel_w;
 };
+
+/// An ALU instruction's first word: its first two sources -- each a select
+/// (a register, a constant, a literal, an inline value, the previous
+/// group's result), a channel, and whether it is relative and negated --
+/// how relative ones are indexed, the predicate it runs under, and whether it
+/// is the last of its group.
+union AluWord0 {
+    u32 raw;
+    BitField<0, 9, u32> src0_sel;
+    BitField<9, 1, bool> src0_rel;
+    BitField<10, 2, u32> src0_chan;
+    BitField<12, 1, bool> src0_neg;
+    BitField<13, 9, u32> src1_sel;
+    BitField<22, 1, bool> src1_rel;
+    BitField<23, 2, u32> src1_chan;
+    BitField<25, 1, bool> src1_neg;
+    BitField<26, 3, u32> index_mode; ///< AR.x, .y, .z, .w, or the loop index (4)
+    BitField<29, 2, u32> pred_sel;   ///< off (0), zero (2), one (3)
+    BitField<31, 1, bool> last;
+};
+
+/// The second, as both forms have it: the destination, the bank swizzle,
+/// and the clamp. ENCODING, its three bits, is zero for an OP2.
+union AluWord1 {
+    u32 raw;
+    BitField<15, 3, u32> encoding;
+    BitField<18, 3, u32> bank_swizzle;
+    BitField<21, 7, u32> dst_gpr;
+    BitField<28, 1, bool> dst_rel;
+    BitField<29, 2, u32> dst_chan;
+    BitField<31, 1, bool> clamp;
+};
+
+/// An OP2's second word: its sources' absolute values, what it updates, its
+/// write mask and output modifier, and its eleven-bit instruction.
+union AluWord1Op2 {
+    u32 raw;
+    BitField<0, 1, bool> src0_abs;
+    BitField<1, 1, bool> src1_abs;
+    BitField<2, 1, bool> update_execute_mask;
+    BitField<3, 1, bool> update_pred;
+    BitField<4, 1, bool> write_mask;
+    BitField<5, 2, u32> omod; ///< off, *2, *4, /2
+    BitField<7, 11, u32> alu_inst;
+};
+
+/// An OP3's: the third source, and its five-bit instruction.
+union AluWord1Op3 {
+    u32 raw;
+    BitField<0, 9, u32> src2_sel;
+    BitField<9, 1, bool> src2_rel;
+    BitField<10, 2, u32> src2_chan;
+    BitField<12, 1, bool> src2_neg;
+    BitField<13, 5, u32> alu_inst;
+};
+
+/// What an ALU source select names (SQ_ALU_SRC).
+namespace alu_src {
+inline constexpr u32 register_last = 127;
+inline constexpr u32 kcache0_first = 128;
+inline constexpr u32 kcache0_last = 159;
+inline constexpr u32 kcache1_first = 160;
+inline constexpr u32 kcache1_last = 191;
+inline constexpr u32 loop_index = 238;
+inline constexpr u32 zero = 248;            ///< 0.0
+inline constexpr u32 one = 249;             ///< 1.0
+inline constexpr u32 one_int = 250;         ///< 1
+inline constexpr u32 minus_one = 251;       ///< -1
+inline constexpr u32 half = 252;            ///< 0.5
+inline constexpr u32 literal = 253;         ///< one of the group's literals
+inline constexpr u32 previous_vector = 254; ///< PV: the previous group's vector result
+inline constexpr u32 previous_scalar = 255; ///< PS: its transcendental result
+inline constexpr u32 const_file_first = 256;
+inline constexpr u32 const_file_last = 511;
+} // namespace alu_src
+
+/// What an ALU instruction is: decaf's flags.
+namespace alu_flag {
+inline constexpr u32 vector = 1U << 0;         ///< runs on the X, Y, Z and W units
+inline constexpr u32 transcendental = 1U << 1; ///< runs on the T unit
+inline constexpr u32 reduction = 1U << 2;      ///< reads all four vector units' sources
+inline constexpr u32 pred_set = 1U << 3;
+inline constexpr u32 int_in = 1U << 4;
+inline constexpr u32 int_out = 1U << 5;
+inline constexpr u32 uint_in = 1U << 6;
+inline constexpr u32 uint_out = 1U << 7;
+} // namespace alu_flag
+
+/// An ALU instruction, by its number: decaf's name, how many sources it
+/// reads, and its flags.
+struct AluOp {
+    std::string_view name;
+    u32 sources = 0;
+    u32 flags = 0;
+
+    /// Only the T unit runs it; only the vector units do.
+    [[nodiscard]] bool transcendental_only() const noexcept {
+        return (flags & alu_flag::vector) == 0 && (flags & alu_flag::transcendental) != 0;
+    }
+
+    [[nodiscard]] bool vector_only() const noexcept {
+        return (flags & alu_flag::transcendental) == 0 && (flags & alu_flag::vector) != 0;
+    }
+};
+
+/// The OP2 or OP3 instruction with this number, or nothing for a number
+/// decaf's table does not name.
+[[nodiscard]] std::optional<AluOp> alu_op2(u32 inst) noexcept;
+[[nodiscard]] std::optional<AluOp> alu_op3(u32 inst) noexcept;
 
 /// Bytes in a control-flow instruction and in a vertex or texture fetch.
 inline constexpr u32 cf_instruction_bytes = 8;

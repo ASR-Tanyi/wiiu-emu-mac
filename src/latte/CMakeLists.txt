@@ -15,6 +15,7 @@ wiiu_add_library(latte
         src/formats.cpp
         src/guest_buffers.cpp
         src/index_cache.cpp
+        src/microcode.cpp
         src/msl.cpp
         src/pipeline_cache.cpp
         src/pm4.cpp

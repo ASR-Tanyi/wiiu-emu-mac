@@ -246,9 +246,13 @@ TEST_CASE("what is not translated yet is refused by name", "[latte][shader][ir]"
     const Registers registers;
     const std::vector<u32> fs = fetch_shader({float4_fetch(0, 0)});
 
-    // An ALU clause, in a program with room for it.
-    const std::vector<u32> alu{
-        2, (8U << 26) | barrier, exp0(60, 1, 0), xyzw | exp_done | end_of_program, 0, 0};
+    // An ALU clause of one group: ADD R0.x, R0.x, R0.x.
+    const std::vector<u32> alu{2,
+                               (8U << 26) | barrier,
+                               exp0(60, 1, 0),
+                               xyzw | exp_done | end_of_program,
+                               1U << 31,
+                               1U << 4};
     CHECK(refused_vertex(alu, nullptr, registers).find("ALU clauses") != std::string::npos);
 
     // A vertex fetch in a texture clause in a pixel shader.
