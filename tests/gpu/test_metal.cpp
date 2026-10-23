@@ -23,7 +23,9 @@
 #include <wiiu/latte/formats.hpp>
 #include <wiiu/latte/guest_buffers.hpp>
 #include <wiiu/latte/msl.hpp>
+#include <wiiu/latte/surface.hpp>
 #include <wiiu/latte/surface_copy.hpp>
+#include <wiiu/latte/texture_cache.hpp>
 #include <wiiu/memory/map.hpp>
 #include <wiiu/memory/memory.hpp>
 
@@ -1073,6 +1075,78 @@ TEST_CASE("guest memory is wrapped for the GPU in place", "[gpu][metal][p22]") {
         CHECK(backend->memory_stats().imported == 2);
         buffers.clear();
         CHECK(backend->memory_stats().imported == 0);
+    }
+    backend->shutdown();
+}
+
+TEST_CASE("a tiled texture in guest memory is uploaded as plain rows", "[gpu][metal][texture]") {
+    const std::unique_ptr<GpuBackend> backend = live_backend();
+    {
+        // A 64x64 RGBA8 image, 2D-tiled with a swizzle, written where the
+        // layout puts each pixel; the resource GX2 would write for it; and
+        // the texture the cache makes, read back from Metal.
+        memory::Memory memory;
+        std::string error;
+        REQUIRE(memory.initialize(memory::default_regions(), error));
+        constexpr ppcaddr_t kImage = 0x10100000;
+        constexpr u32 kSwizzle = 0x300;
+        latte::SurfaceDesc desc;
+        desc.tile_mode = latte::TileMode::Tiled2DThin1;
+        desc.format = 0x1A;
+        desc.width = 64;
+        desc.height = 64;
+        const std::optional<latte::SurfaceLayout> layout = latte::compute_layout(desc);
+        REQUIRE(layout.has_value());
+        const latte::BankPipeSwizzle split = latte::split_swizzle(kSwizzle);
+        for (u32 y = 0; y < 64; ++y) {
+            for (u32 x = 0; x < 64; ++x) {
+                const u64 at =
+                    latte::element_offset(desc, *layout, x, y, 0, 0, split.pipe, split.bank);
+                const std::array<u8, 4> pixel{
+                    static_cast<u8>(x * 4), static_cast<u8>(y * 4), static_cast<u8>(x ^ y), 0xFF};
+                REQUIRE(memory.write_bytes(kImage + static_cast<u32>(at), pixel));
+            }
+        }
+        const memory::Region* const region = memory.region_of(kImage);
+        REQUIRE(region != nullptr);
+        physaddr_t physical = 0;
+        REQUIRE(memory::to_physical(*region, kImage, physical));
+
+        latte::TextureResource resource;
+        resource.word0.raw = 0;
+        resource.word0.dim = latte::TexDim::D2;
+        resource.word0.tile_mode = static_cast<u32>(latte::TileMode::Tiled2DThin1);
+        resource.word0.pitch = (layout->pitch / 8) - 1;
+        resource.word0.width = 63;
+        resource.word1.raw = 0;
+        resource.word1.height = 63;
+        resource.word1.data_format = 0x1A;
+        resource.base = physical ^ kSwizzle;
+        resource.word4.raw = 0;
+        resource.word6.raw = 0;
+        resource.word6.type = latte::ResourceType::ValidTexture;
+
+        latte::TextureCache cache(*backend, memory);
+        const std::optional<latte::CachedTexture> texture = cache.texture(resource, error);
+        INFO(error);
+        REQUIRE(texture.has_value());
+        backend->submit();
+        std::vector<u8> pixels(std::size_t{64} * 64 * 4);
+        REQUIRE(backend->read_texture(texture->texture, pixels));
+        u32 wrong = 0;
+        for (u32 y = 0; y < 64; ++y) {
+            for (u32 x = 0; x < 64; ++x) {
+                const std::size_t at = ((std::size_t{y} * 64) + x) * 4;
+                if (pixels[at] != static_cast<u8>(x * 4) ||
+                    pixels[at + 1] != static_cast<u8>(y * 4) ||
+                    pixels[at + 2] != static_cast<u8>(x ^ y) || pixels[at + 3] != 0xFF) {
+                    ++wrong;
+                }
+            }
+        }
+        CHECK(wrong == 0);
+        CHECK(backend->command_errors() == 0);
+        cache.clear();
     }
     backend->shutdown();
 }

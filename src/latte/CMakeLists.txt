@@ -24,6 +24,7 @@ wiiu_add_library(latte
         src/surface.cpp
         src/surface_cache.cpp
         src/surface_copy.cpp
+        src/texture_cache.cpp
         src/vertex_inputs.cpp
         src/timeline.cpp
     HEADERS
@@ -51,6 +52,7 @@ wiiu_add_library(latte
         include/wiiu/latte/surface.hpp
         include/wiiu/latte/surface_cache.hpp
         include/wiiu/latte/surface_copy.hpp
+        include/wiiu/latte/texture_cache.hpp
         include/wiiu/latte/vertex_inputs.hpp
         include/wiiu/latte/timeline.hpp
         include/wiiu/latte/viewport.hpp
