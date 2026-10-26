@@ -140,6 +140,47 @@ void os_set_thread_priority(Call& call) {
     call.state.gpr[3] = existing != nullptr ? 1U : 0U;
 }
 
+// --- thread-specific values and the cleanup callback ------------------------
+
+/// `u32 OSGetThreadSpecific(u32 id)`, of the calling thread. wut keeps its
+/// newlib reentrancy structure in one, so every `printf` comes through here.
+void os_get_thread_specific(Call& call) {
+    const u32 id = call.next_word();
+    const Thread* const thread = scheduler().current();
+    if (thread == nullptr || id >= thread->specific.size()) {
+        WIIU_LOG_ERROR(Coreinit, "OSGetThreadSpecific({}): no such value", id);
+        call.state.gpr[3] = 0;
+        return;
+    }
+    call.state.gpr[3] = thread->specific[id];
+}
+
+/// `void OSSetThreadSpecific(u32 id, u32 value)`.
+void os_set_thread_specific(Call& call) {
+    const u32 id = call.next_word();
+    const u32 value = call.next_word();
+    Thread* const thread = scheduler().current();
+    if (thread == nullptr || id >= thread->specific.size()) {
+        WIIU_LOG_ERROR(Coreinit, "OSSetThreadSpecific({}, 0x{:08X}): no such value", id, value);
+        return;
+    }
+    thread->specific[id] = value;
+}
+
+/// `OSThreadCleanupCallbackFn OSSetThreadCleanupCallback(OSThread*, fn)`:
+/// the previous one back.
+void os_set_thread_cleanup_callback(Call& call) {
+    const u32 handle = call.next_word();
+    const u32 callback = call.next_word();
+    Thread* const thread = scheduler().find(handle);
+    if (thread == nullptr) {
+        call.state.gpr[3] = 0;
+        return;
+    }
+    call.state.gpr[3] = thread->cleanup_callback;
+    thread->cleanup_callback = callback;
+}
+
 // --- mutexes ---------------------------------------------------------------
 
 void os_init_mutex(Call& call) {
@@ -405,6 +446,95 @@ void os_unlock_fast_mutex(Call& call) {
     // As with OSMutex: the waiter this wakes is the new owner, because it
     // resumes past its own lock call rather than retrying it.
     mutex.owner = scheduler().unblock_one(handle);
+}
+
+// --- spin locks ------------------------------------------------------------
+//
+// An OSSpinLock is the title's: the owning OSThread* at 0x0 and the
+// recursion count at 0x8, sixteen bytes in all (decaf's layout), and they
+// are kept there, where the title can see them. A thread that finds one held
+// waits blocked on its address rather than spinning, since threads here take
+// turns on one host thread and a spin would only burn its timeslice; the
+// release hands the lock to the waiter, which resumes past its acquire as
+// a mutex's does. Two things Cafe OS does are not done yet: raising the
+// holder to priority 0, and -- for the uninterruptible forms -- turning
+// interrupts off, which are not modelled at all.
+
+inline constexpr u32 spin_lock_owner_offset = 0x0;
+inline constexpr u32 spin_lock_recursion_offset = 0x8;
+
+/// Take `lock` for the calling thread, if it is free or already the
+/// thread's. False if another thread holds it.
+[[nodiscard]] bool try_take_spin_lock(Call& call, u32 lock) {
+    const u32 self = scheduler().current_handle();
+    u32 owner = 0;
+    static_cast<void>(call.memory.try_read<u32>(lock + spin_lock_owner_offset, owner));
+    if (owner != 0 && owner == self) {
+        u32 recursion = 0;
+        static_cast<void>(call.memory.try_read<u32>(lock + spin_lock_recursion_offset, recursion));
+        static_cast<void>(
+            call.memory.try_write<u32>(lock + spin_lock_recursion_offset, recursion + 1));
+        return true;
+    }
+    if (owner != 0) {
+        return false;
+    }
+    static_cast<void>(call.memory.try_write<u32>(lock + spin_lock_owner_offset, self));
+    return true;
+}
+
+void release_spin_lock(Call& call, u32 lock) {
+    u32 recursion = 0;
+    static_cast<void>(call.memory.try_read<u32>(lock + spin_lock_recursion_offset, recursion));
+    if (recursion > 0) {
+        static_cast<void>(
+            call.memory.try_write<u32>(lock + spin_lock_recursion_offset, recursion - 1));
+        return;
+    }
+
+    u32 owner = 0;
+    static_cast<void>(call.memory.try_read<u32>(lock + spin_lock_owner_offset, owner));
+    if (owner != scheduler().current_handle()) {
+        // Cafe OS stops here (decaf aborts); the lock is left as it is.
+        WIIU_LOG_ERROR(Coreinit,
+                       "spin lock 0x{:08X} released by 0x{:08X}, but 0x{:08X} holds it",
+                       lock,
+                       scheduler().current_handle(),
+                       owner);
+        return;
+    }
+    static_cast<void>(
+        call.memory.try_write<u32>(lock + spin_lock_owner_offset, scheduler().unblock_one(lock)));
+}
+
+/// `void OSInitSpinLock(OSSpinLock*)`.
+void os_init_spin_lock(Call& call) {
+    const u32 lock = call.next_word();
+    static_cast<void>(call.memory.try_write<u32>(lock + spin_lock_owner_offset, 0));
+    static_cast<void>(call.memory.try_write<u32>(lock + spin_lock_recursion_offset, 0));
+}
+
+/// `BOOL OSAcquireSpinLock(OSSpinLock*)`, and the uninterruptible form:
+/// TRUE, once it is the caller's.
+void os_acquire_spin_lock(Call& call) {
+    const u32 lock = call.next_word();
+    call.state.gpr[3] = 1; // before blocking: see the top of the file
+    if (!try_take_spin_lock(call, lock)) {
+        scheduler().block(call.state, BlockReason::SpinLock, lock);
+    }
+}
+
+/// `BOOL OSTryAcquireSpinLock(OSSpinLock*)`, and the uninterruptible form.
+void os_try_acquire_spin_lock(Call& call) {
+    const u32 lock = call.next_word();
+    call.state.gpr[3] = try_take_spin_lock(call, lock) ? 1U : 0U;
+}
+
+/// `BOOL OSReleaseSpinLock(OSSpinLock*)`, and the uninterruptible form.
+void os_release_spin_lock(Call& call) {
+    const u32 lock = call.next_word();
+    release_spin_lock(call, lock);
+    call.state.gpr[3] = 1;
 }
 
 // --- rendezvous ------------------------------------------------------------
@@ -757,7 +887,8 @@ ppcaddr_t system_message_queue(Context& context, memory::Memory& memory) {
         return context.system_message_queue;
     }
 
-    ExpandedHeap* const heap = context.heaps.find(context.heaps.default_handle());
+    // coreinit's own memory, not the title's (heap.hpp).
+    ExpandedHeap* const heap = context.heaps.find(context.heaps.system_handle());
     if (heap == nullptr) {
         WIIU_LOG_ERROR(Coreinit, "no heap to allocate the system message queue from");
         return 0;
@@ -803,6 +934,15 @@ void Context::reset() {
     alarms.clear();
     busy_fs_blocks.clear();
     system_message_queue = 0;
+    system_info = 0;
+    home_button_menu = true;
+    fsa_clients.clear();
+    next_fsa_client = 1;
+
+    // The trampoline is coreinit's, registered once, and stays.
+    const ppcaddr_t preinit_returned = startup.returned;
+    startup = Startup{};
+    startup.returned = preinit_returned;
     next_async_id = async_id_base;
 
     // Handles the title opened, not the devices behind them: a device is the
@@ -916,7 +1056,7 @@ u32 invoke_guest_callback(Context& context,
         stack = slot.stack;
         handle = slot.handle;
     } else {
-        ExpandedHeap* const heap = context.heaps.find(context.heaps.default_handle());
+        ExpandedHeap* const heap = context.heaps.find(context.heaps.system_handle());
         if (heap == nullptr) {
             WIIU_LOG_ERROR(Coreinit, "no heap to allocate a callback stack from");
             return 0;
@@ -992,6 +1132,9 @@ void register_threads(Registry& registry, Context& context) {
     registry.add("coreinit", "OSIsThreadTerminated", os_is_thread_terminated);
     registry.add("coreinit", "OSGetThreadPriority", os_get_thread_priority);
     registry.add("coreinit", "OSSetThreadPriority", os_set_thread_priority);
+    registry.add("coreinit", "OSGetThreadSpecific", os_get_thread_specific);
+    registry.add("coreinit", "OSSetThreadSpecific", os_set_thread_specific);
+    registry.add("coreinit", "OSSetThreadCleanupCallback", os_set_thread_cleanup_callback);
 
     registry.add("coreinit", "OSInitMutex", os_init_mutex);
     registry.add("coreinit", "OSInitMutexEx", os_init_mutex);
@@ -1021,6 +1164,14 @@ void register_threads(Registry& registry, Context& context) {
     registry.add("coreinit", "OSFastMutex_Lock", os_lock_fast_mutex);
     registry.add("coreinit", "OSFastMutex_TryLock", os_try_lock_fast_mutex);
     registry.add("coreinit", "OSFastMutex_Unlock", os_unlock_fast_mutex);
+
+    registry.add("coreinit", "OSInitSpinLock", os_init_spin_lock);
+    registry.add("coreinit", "OSAcquireSpinLock", os_acquire_spin_lock);
+    registry.add("coreinit", "OSTryAcquireSpinLock", os_try_acquire_spin_lock);
+    registry.add("coreinit", "OSReleaseSpinLock", os_release_spin_lock);
+    registry.add("coreinit", "OSUninterruptibleSpinLock_Acquire", os_acquire_spin_lock);
+    registry.add("coreinit", "OSUninterruptibleSpinLock_TryAcquire", os_try_acquire_spin_lock);
+    registry.add("coreinit", "OSUninterruptibleSpinLock_Release", os_release_spin_lock);
 
     registry.add("coreinit", "OSInitRendezvous", os_init_rendezvous);
     registry.add("coreinit", "OSWaitRendezvous", os_wait_rendezvous);

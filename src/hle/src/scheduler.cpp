@@ -51,6 +51,8 @@ std::string_view block_reason_name(BlockReason reason) noexcept {
             return "join";
         case BlockReason::Sleep:
             return "sleep";
+        case BlockReason::SpinLock:
+            return "spin lock";
     }
     return "?";
 }
@@ -565,6 +567,16 @@ void Scheduler::exit_current(cpu::CoreState& state, s32 value) {
 
     thread->state = ThreadState::Exited;
     thread->exit_value = value;
+
+    if (thread->cleanup_callback != 0) {
+        // wut sets one on every thread that touches newlib, to free its
+        // reentrancy structure; not calling it leaks that, and nothing else.
+        WIIU_LOG_WARN(Coreinit,
+                      "thread '{}' exits with a cleanup callback at 0x{:08X}, which is not "
+                      "called yet",
+                      thread->name,
+                      thread->cleanup_callback);
+    }
 
     for (const auto& [joiner, out_address] : thread->joiners) {
         if (on_exit_ && out_address != 0) {

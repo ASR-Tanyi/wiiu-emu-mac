@@ -147,28 +147,119 @@ TEST_CASE_METHOD(CoreinitFixture, "MEMAllocFromDefaultHeap returns usable memory
     CHECK(call("MEMGetSizeForMBlockExpHeap", {address}) == 0U);
 }
 
-TEST_CASE_METHOD(CoreinitFixture, "MEM1 and the default heap are distinct", "[hle][heap]") {
+TEST_CASE_METHOD(CoreinitFixture,
+                 "MEM1 is a frame heap and MEM2 the expanded default heap",
+                 "[hle][heap]") {
+    // As Cafe OS makes them before a title runs (decaf's CoreInitDefaultHeap).
     const u32 mem1 = call("MEMGetBaseHeapHandle", {0});
     const u32 mem2 = call("MEMGetBaseHeapHandle", {1});
-    CHECK(mem1 != mem2);
+    CHECK(mem1 == memory::mem1_base); // a frame heap's handle is its address
+    CHECK(memory.read<u32>(mem1) == frame_heap::tag);
+    CHECK(mem2 == os.heaps.default_handle());
 
-    const u32 from_mem1 = call("MEMAllocFromExpHeapEx", {mem1, 128, 32});
-    REQUIRE(from_mem1 != 0U);
-    CHECK(from_mem1 >= memory::mem1_base);
-    CHECK(from_mem1 < memory::mem1_base + memory::mem1_size);
+    const u32 from_mem1 = call("MEMAllocFromFrmHeapEx", {mem1, 128, 32});
+    CHECK(from_mem1 == memory::mem1_base + 0x60); // past the 0x4C header, 32-aligned
+    // An expanded-heap call on it is refused: it is not one.
+    CHECK(call("MEMAllocFromExpHeapEx", {mem1, 128, 32}) == 0U);
+
+    // The foreground bucket is not modelled: no heap. Anything else, none.
+    CHECK(call("MEMGetBaseHeapHandle", {8}) == 0U);
+    CHECK(call("MEMGetBaseHeapHandle", {2}) == 0U);
+
+    // MEMSetBaseHeapHandle hands back the old one.
+    CHECK(call("MEMSetBaseHeapHandle", {1, 0x12345678}) == mem2);
+    CHECK(call("MEMGetBaseHeapHandle", {1}) == 0x12345678U);
 }
 
 TEST_CASE_METHOD(CoreinitFixture,
                  "freeing through the default heap finds the right one",
                  "[hle][heap]") {
-    // A title can free a MEM1 block through MEMFreeToDefaultHeap, so the heap
-    // is looked up from the address rather than assumed.
-    const u32 mem1 = call("MEMGetBaseHeapHandle", {0});
-    const u32 address = call("MEMAllocFromExpHeapEx", {mem1, 128, 32});
+    // A title can free a block of an expanded heap of its own through
+    // MEMFreeToDefaultHeap, so the heap is looked up from the address rather
+    // than assumed.
+    constexpr ppcaddr_t base = memory::data_heap_base + 0x00100000;
+    const u32 heap = call("MEMCreateExpHeapEx", {base, 0x10000, 0});
+    const u32 address = call("MEMAllocFromExpHeapEx", {heap, 128, 32});
     REQUIRE(address != 0U);
 
     call("MEMFreeToDefaultHeap", {address});
     CHECK(call("MEMGetSizeForMBlockExpHeap", {address}) == 0U);
+}
+
+TEST_CASE_METHOD(CoreinitFixture,
+                 "a frame heap allocates from both ends and frees by state",
+                 "[hle][heap]") {
+    constexpr ppcaddr_t base = memory::data_heap_base + 0x00200000;
+    const u32 heap = call("MEMCreateFrmHeapEx", {base + 2, 0x1000, 0});
+    CHECK(heap == base + 4); // the start aligned to 4
+    // The header's fields, where wut documents them.
+    CHECK(memory.read<u32>(heap + 0x18) == heap + 0x4C);   // dataStart
+    CHECK(memory.read<u32>(heap + 0x1C) == base + 0x1000); // dataEnd, aligned down
+    CHECK(memory.read<u32>(heap + 0x40) == heap + 0x4C);   // head
+    CHECK(memory.read<u32>(heap + 0x44) == base + 0x1000); // tail
+    const u32 data = heap + 0x4C;
+    const u32 end = base + 0x1000;
+
+    // Head allocations go up, tail ones down; a negative alignment is the tail.
+    const u32 a = call("MEMAllocFromFrmHeapEx", {heap, 0x10, 4});
+    const u32 b = call("MEMAllocFromFrmHeapEx", {heap, 0x10, 16});
+    const u32 t = call("MEMAllocFromFrmHeapEx", {heap, 0x20, static_cast<u32>(-32)});
+    CHECK(a == data);
+    CHECK(b == ((a + 0x10 + 15) & ~15U));
+    CHECK(t == ((end - 0x20) & ~31U));
+
+    // WHB's console: record a state, allocate, free back to it -- the
+    // state's own sixteen bytes with it.
+    const u32 before = memory.read<u32>(heap + 0x40);
+    CHECK(call("MEMRecordStateForFrmHeap", {heap, 0xDECAF}) == 1U);
+    CHECK(memory.read<u32>(heap + 0x48) == before); // the state is allocated from the head
+    const u32 frame = call("MEMAllocFromFrmHeapEx", {heap, 0x100, 4});
+    CHECK(frame == before + 0x10);
+    CHECK(call("MEMRecordStateForFrmHeap", {heap, 0xBEEF}) == 1U);
+    static_cast<void>(call("MEMAllocFromFrmHeapEx", {heap, 0x40, 4}));
+    // Freeing by the older tag drops the newer state too.
+    CHECK(call("MEMFreeByStateToFrmHeap", {heap, 0xDECAF}) == 1U);
+    CHECK(memory.read<u32>(heap + 0x40) == before);
+    CHECK(memory.read<u32>(heap + 0x48) == 0U);
+    CHECK(call("MEMFreeByStateToFrmHeap", {heap, 0xDECAF}) == 0U); // gone
+    CHECK(call("MEMFreeByStateToFrmHeap", {heap, 0}) == 0U);       // no state at all
+
+    // What is left between the head and the tail.
+    CHECK(call("MEMGetAllocatableSizeForFrmHeapEx", {heap, 4}) == t - before);
+    // Too much is refused, from either end.
+    CHECK(call("MEMAllocFromFrmHeapEx", {heap, 0x1000, 4}) == 0U);
+    CHECK(call("MEMAllocFromFrmHeapEx", {heap, 0x1000, static_cast<u32>(-4)}) == 0U);
+    // A zero-byte allocation takes one byte, as coreinit's does.
+    const u32 zero = call("MEMAllocFromFrmHeapEx", {heap, 0, 4});
+    CHECK(memory.read<u32>(heap + 0x40) == zero + 1);
+
+    // Freeing the tail end alone, then the head.
+    call("MEMFreeToFrmHeap", {heap, 2});
+    CHECK(memory.read<u32>(heap + 0x44) == end);
+    CHECK(memory.read<u32>(heap + 0x40) != data);
+    call("MEMFreeToFrmHeap", {heap, 1});
+    CHECK(memory.read<u32>(heap + 0x40) == data);
+
+    // Adjusting cuts the heap down to its head: its size from the header.
+    static_cast<void>(call("MEMAllocFromFrmHeapEx", {heap, 0x20, 4}));
+    CHECK(call("MEMAdjustFrmHeap", {heap}) == 0x4C + 0x20U);
+    CHECK(call("MEMGetAllocatableSizeForFrmHeapEx", {heap, 4}) == 0U);
+
+    // Destroyed, it is no frame heap; the calls refuse it.
+    CHECK(call("MEMDestroyFrmHeap", {heap}) == heap);
+    CHECK(call("MEMAllocFromFrmHeapEx", {heap, 4, 4}) == 0U);
+    // As they refuse what never was one.
+    CHECK(call("MEMRecordStateForFrmHeap", {os.heaps.default_handle(), 1}) == 0U);
+}
+
+TEST_CASE_METHOD(CoreinitFixture, "a zeroing frame heap zeroes", "[hle][heap]") {
+    constexpr ppcaddr_t base = memory::data_heap_base + 0x00300000;
+    REQUIRE(memory.fill(base, 0x200, 0xAB));
+    const u32 heap = call("MEMCreateFrmHeapEx", {base, 0x200, 1}); // MEM_HEAP_FLAG_ZERO_ALLOCATED
+    const u32 block = call("MEMAllocFromFrmHeapEx", {heap, 8, 4});
+    CHECK(memory.read<u32>(block) == 0U);
+    CHECK(memory.read<u32>(block + 4) == 0U);
+    CHECK(memory.read<u8>(block + 8) == 0xABU);
 }
 
 // ---------------------------------------------------------------------------

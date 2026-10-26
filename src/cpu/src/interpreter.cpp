@@ -784,7 +784,9 @@ StepResult Interpreter::execute_logical(Opcode id, Instruction inst) {
             break;
 
         // D-form logical operations take an unsigned immediate and never
-        // treat rA as zero.
+        // treat rA as zero. They have no Rc bit: bit 31 is the immediate's
+        // low bit, so `ori r9,r27,1` is not a record form. andi. and andis.
+        // always record; the others never do.
         case Opcode::Andi:
             result = s & inst.uimm.value();
             record = true;
@@ -795,15 +797,19 @@ StepResult Interpreter::execute_logical(Opcode id, Instruction inst) {
             break;
         case Opcode::Ori:
             result = s | inst.uimm.value();
+            record = false;
             break;
         case Opcode::Oris:
             result = s | (inst.uimm.value() << 16);
+            record = false;
             break;
         case Opcode::Xori:
             result = s ^ inst.uimm.value();
+            record = false;
             break;
         case Opcode::Xoris:
             result = s ^ (inst.uimm.value() << 16);
+            record = false;
             break;
 
         default:

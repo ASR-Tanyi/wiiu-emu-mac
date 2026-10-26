@@ -20,6 +20,7 @@
 #include <wiiu/common/types.hpp>
 #include <wiiu/cpu/state.hpp>
 
+#include <array>
 #include <deque>
 #include <functional>
 #include <map>
@@ -54,6 +55,7 @@ enum class BlockReason : u8 {
     MessageQueue,
     Join,
     Sleep,
+    SpinLock,
 };
 
 [[nodiscard]] std::string_view block_reason_name(BlockReason reason) noexcept;
@@ -120,6 +122,17 @@ struct Thread {
     /// Threads waiting on this one, with where each wants the exit value
     /// written.
     std::vector<std::pair<u32, ppcaddr_t>> joiners;
+
+    /// OSSetThreadSpecific's sixteen values. Cafe OS keeps them in the guest
+    /// OSThread (`specific`, at 0x57C); they are kept here instead, because
+    /// the main thread has no guest OSThread to keep them in. A title reading
+    /// the field directly would not see them -- none has been seen to.
+    std::array<u32, 16> specific{};
+
+    /// OSSetThreadCleanupCallback's function, which Cafe OS calls as the
+    /// thread exits with the thread and its stack. Recorded, and not called
+    /// yet: `exit_current` says so when a thread leaves one behind.
+    ppcaddr_t cleanup_callback = 0;
 
     [[nodiscard]] bool runnable() const noexcept { return state == ThreadState::Ready; }
 };

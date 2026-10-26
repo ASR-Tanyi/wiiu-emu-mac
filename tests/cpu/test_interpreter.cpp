@@ -199,6 +199,31 @@ TEST_CASE_METHOD(CpuFixture, "record bit updates CR0", "[cpu][interp]") {
     CHECK(state.cr.field(0) == ConditionRegister::gt);
 }
 
+TEST_CASE_METHOD(CpuFixture, "an odd logical immediate is not a record bit", "[cpu][interp]") {
+    // ori, oris, xori and xoris have no Rc bit: bit 31 is the immediate's
+    // low bit. Reading it as Rc rewrote CR0 behind the compiler's back --
+    // newlib's malloc compares, ORs in a flag with `ori r9,r27,1`, then
+    // branches on the compare, and took the wrong branch: every malloc in a
+    // wut title failed.
+    state.gpr[27] = 0x1000;
+    for (const u32 word : {0x63690001U,    // ori   r9,r27,1
+                           0x67690001U,    // oris  r9,r27,1
+                           0x6B690001U,    // xori  r9,r27,1
+                           0x6F690001U}) { // xoris r9,r27,1
+        INFO(disassemble(word, kLoadAddress));
+        state.cr.set_field(0, ConditionRegister::eq);
+        REQUIRE(exec(word) == StepResult::Ok);
+        CHECK(state.cr.field(0) == ConditionRegister::eq);
+    }
+    CHECK(state.gpr[9] == 0x00011000U); // the last, xoris
+
+    // andi. is a record form whatever its immediate.
+    state.cr.set_field(0, ConditionRegister::gt);
+    REQUIRE(exec(0x73690001U) == StepResult::Ok); // andi. r9,r27,1
+    CHECK(state.gpr[9] == 0U);
+    CHECK(state.cr.field(0) == ConditionRegister::eq);
+}
+
 TEST_CASE_METHOD(CpuFixture, "CR0 carries the sticky summary overflow bit", "[cpu][interp]") {
     state.xer.set_overflow(true); // sets SO too
     state.gpr[4] = 1;

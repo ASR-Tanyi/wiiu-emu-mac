@@ -111,7 +111,20 @@ callback on a thread of its own, the handler redirects the thread it is already
 on — saving where the title was going, pointing it at the callback with the
 return address set to an `sc` trampoline of ours, and putting it back when the
 chain ends. That is how a callback runs on the caller's own stack and is
-finished before the call returns, which is what the title expects.
+finished before the call returns, which is what the title expects. A title's
+start is the same trick before it has begun: an RPX that exports
+`__preinit_user` — every one built with wut — is sent through it first, with
+the base heaps' handles on a frame of its own and a trampoline as the return
+address, and the trampoline applies what it left there and sends the thread on
+to the entry point.
+
+Where a structure is the title's to see, it lives in guest memory, as Cafe OS
+keeps it: a frame heap's header and recorded states, a spin lock's holder and
+count, OSScreen's frames. Where nothing in the title can see it, it is kept on
+the host: an expanded heap's block list, a mutex's waiters, a thread's sixteen
+specific values (the main thread has no guest `OSThread` to hold them). What
+coreinit allocates for itself comes from a system heap of its own, since a
+title may take all of MEM2 for its own allocator, and wut's does.
 
 Three properties of the scheduler are load-bearing beyond it. Waiters are
 ordered by priority and then by how long they have waited, because Cafe OS

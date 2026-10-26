@@ -53,7 +53,8 @@ options:
       --cpu-surfaces      with --run --window, do GX2's clears and scan-out
                           copies on guest memory rather than the GPU, to
                           compare the two (ADR-006)
-      --frames N          with --window alone, stop after N frames
+      --frames N          stop after N frames: with --window alone, N
+                          presented; with --run, N flips of the TV screen
       --gpu-validation    run under Metal's API and shader validation
       --gpu-hud           show Metal's performance HUD over the window
       --capture-frame N   write a GPU capture of frame N (open it in Xcode)
@@ -744,6 +745,28 @@ int main(int argc, char** argv) {
             gpu_attachment.attach(coreinit.gpu, display.backend());
         }
     }
+    bool frame_limit_reached = false;
+    if (args.frames != 0) {
+        // A title's main loop does not return by itself: --frames stops it
+        // after so many flips of the TV, with or without a window. With one,
+        // the window's hook still gets every flip first.
+        auto present = std::move(coreinit.screens.on_flip);
+        coreinit.screens.on_flip =
+            [present = std::move(present),
+             limit = args.frames,
+             flips = wiiu::u64{0},
+             &frame_limit_reached](const wiiu::hle::coreinit::ScreenFlip& flip,
+                                   const wiiu::memory::Memory& guest) mutable {
+                if (present && !present(flip, guest)) {
+                    return false;
+                }
+                if (flip.screen == wiiu::hle::coreinit::ScreenId::Tv && ++flips >= limit) {
+                    frame_limit_reached = true;
+                    return false;
+                }
+                return true;
+            };
+    }
 
     wiiu::cpu::CoreState state;
     wiiu::hle::LoadedModule module;
@@ -755,6 +778,15 @@ int main(int argc, char** argv) {
     }
     for (const std::string& warning : load_result.warnings) {
         WIIU_LOG_WARN(Loader, "{}", warning);
+    }
+
+    // An RPX built with wut exports __preinit_user, and Cafe OS's loader
+    // calls it before the entry point: wut sets up its malloc there.
+    if (std::string preinit_error; !wiiu::hle::coreinit::start_with_preinit(
+            coreinit, memory, state, module.find_export("__preinit_user"), preinit_error)) {
+        WIIU_LOG_ERROR(Loader, "{}", preinit_error);
+        wiiu::log::shutdown();
+        return 1;
     }
 
     wiiu::cpu::Interpreter interpreter{state, memory};
@@ -780,7 +812,12 @@ int main(int argc, char** argv) {
     const bool closed_by_user = coreinit.screens.stop_requested;
     coreinit.screens.on_flip = nullptr;
     gpu_attachment.release();
-    if (closed_by_user) {
+    if (frame_limit_reached) {
+        WIIU_LOG_INFO(Frontend,
+                      "stopped after {} TV frames and {} instructions",
+                      args.frames,
+                      report.instructions);
+    } else if (closed_by_user) {
         WIIU_LOG_INFO(Frontend,
                       "window closed after {} frames and {} instructions",
                       display.presented(),

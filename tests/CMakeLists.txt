@@ -82,7 +82,9 @@ if(Python3_FOUND AND WIIU_PPC_AS)
         "${fixture_dir}/homebrew.rpx"
         "${fixture_dir}/threaded.rpx"
         "${fixture_dir}/clock.rpx"
-        "${fixture_dir}/dataimport.rpx")
+        "${fixture_dir}/dataimport.rpx"
+        "${fixture_dir}/preinit.rpx"
+        "${fixture_dir}/sleeper.rpx")
 
     add_custom_command(
         OUTPUT ${fixtures}

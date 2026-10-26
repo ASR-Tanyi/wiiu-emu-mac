@@ -353,6 +353,20 @@ TEST_CASE_METHOD(ThreadedMachine,
     CHECK(output[1] == "sum 1..10 = 55");
 }
 
+TEST_CASE_METHOD(ThreadedMachine,
+                 "a lone thread sleeping in a loop is not a deadlock",
+                 "[hle][scheduler][program]") {
+    // Draw, flip, sleep: every OSScreen homebrew's main loop. Each sleep is
+    // an idle skip that wakes the only thread, and the run loop counted those
+    // as skips that achieved nothing -- the thread it woke was running, not
+    // waiting to run -- so the 1024th frame was reported as a deadlock.
+    const RunReport report = run_module("sleeper.rpx");
+    INFO("outcome: " << run_outcome_name(report.outcome));
+    CHECK(report.outcome == RunOutcome::Returned);
+    CHECK(state.gpr[3] == 7U);
+    CHECK(report.skipped_ticks >= 1100U * 1000U);
+}
+
 // ---------------------------------------------------------------------------
 // Phase 6.5 — the rest of the synchronisation primitives
 // ---------------------------------------------------------------------------
@@ -377,6 +391,7 @@ struct SyncFixture {
     static constexpr u32 kOutbox = 0x10001800; ///< where a receiver wants its message
     static constexpr u32 kOutboxB = 0x10001820;
     static constexpr u32 kMessage = 0x10001900; ///< the message a sender is sending
+    static constexpr u32 kSpin = 0x10001A00;
 
     SyncFixture() {
         std::string error;
@@ -491,6 +506,72 @@ TEST_CASE_METHOD(SyncFixture,
     CHECK(state_of(kMain) == ThreadState::Ready);
     CHECK(os.sync.fast_mutexes[kFast].owner == kMain);
     CHECK(call("OSFastMutex_TryLock", {kFast}) == 0U); // and nobody else can take it
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "a spin lock is recursive for its holder and handed to a waiter",
+                 "[hle][scheduler][sync]") {
+    spawn_ready(kWorkerA);
+
+    // The lock is the title's sixteen bytes: the holder at 0x0, the
+    // recursion count at 0x8. wut's newlib glue reads neither, but a title
+    // could, so they are kept where Cafe OS keeps them.
+    REQUIRE(memory.try_write<u32>(kSpin, 0xDEADBEEF));
+    static_cast<void>(call("OSInitSpinLock", {kSpin}));
+    CHECK(memory.read<u32>(kSpin) == 0U);
+
+    CHECK(call("OSUninterruptibleSpinLock_Acquire", {kSpin}) == 1U);
+    CHECK(memory.read<u32>(kSpin) == kMain);
+    CHECK(call("OSUninterruptibleSpinLock_Acquire", {kSpin}) == 1U);
+    CHECK(memory.read<u32>(kSpin + 8) == 1U);
+    CHECK(call("OSUninterruptibleSpinLock_Release", {kSpin}) == 1U);
+    CHECK(memory.read<u32>(kSpin + 8) == 0U);
+    CHECK(memory.read<u32>(kSpin) == kMain); // still held, once
+
+    // The worker finds it held: trying fails, acquiring waits.
+    static_cast<void>(call("OSYieldThread", {}));
+    REQUIRE(os.scheduler.current_handle() == kWorkerA);
+    CHECK(call("OSUninterruptibleSpinLock_TryAcquire", {kSpin}) == 0U);
+    static_cast<void>(call("OSUninterruptibleSpinLock_Acquire", {kSpin}));
+    CHECK(state_of(kWorkerA) == ThreadState::Blocked);
+    REQUIRE(os.scheduler.current_handle() == kMain);
+
+    // Releasing hands it over: the waiter resumes past its acquire, so it
+    // has to be the holder already.
+    static_cast<void>(call("OSUninterruptibleSpinLock_Release", {kSpin}));
+    CHECK(memory.read<u32>(kSpin) == kWorkerA);
+    CHECK(state_of(kWorkerA) == ThreadState::Ready);
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "thread-specific values belong to the calling thread",
+                 "[hle][scheduler][sync]") {
+    spawn_ready(kWorkerA);
+
+    // wut keeps newlib's per-thread state in value 15: a value that leaked
+    // between threads would give two threads one errno, and worse.
+    static_cast<void>(call("OSSetThreadSpecific", {15, 0x1234}));
+    CHECK(call("OSGetThreadSpecific", {15}) == 0x1234U);
+
+    static_cast<void>(call("OSYieldThread", {}));
+    REQUIRE(os.scheduler.current_handle() == kWorkerA);
+    CHECK(call("OSGetThreadSpecific", {15}) == 0U);
+    static_cast<void>(call("OSSetThreadSpecific", {15, 0x5678}));
+
+    static_cast<void>(call("OSYieldThread", {}));
+    REQUIRE(os.scheduler.current_handle() == kMain);
+    CHECK(call("OSGetThreadSpecific", {15}) == 0x1234U);
+
+    // There are sixteen.
+    CHECK(call("OSGetThreadSpecific", {16}) == 0U);
+}
+
+TEST_CASE_METHOD(SyncFixture,
+                 "a thread's cleanup callback is swapped for the previous one",
+                 "[hle][scheduler][sync]") {
+    CHECK(call("OSSetThreadCleanupCallback", {kMain, 0x02000100}) == 0U);
+    CHECK(call("OSSetThreadCleanupCallback", {kMain, 0x02000200}) == 0x02000100U);
+    CHECK(os.scheduler.find(kMain)->cleanup_callback == 0x02000200U);
 }
 
 TEST_CASE_METHOD(SyncFixture,

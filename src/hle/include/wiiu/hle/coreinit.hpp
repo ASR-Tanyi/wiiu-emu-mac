@@ -257,6 +257,35 @@ static_assert(ios_async_id_limit == async_id_base,
 /// jumps straight there.
 inline constexpr u64 ios_async_latency_ticks = fs_async_latency_ticks;
 
+/// A title's way in, as far as Cafe OS's loader takes it: an RPX that
+/// exports `__preinit_user` has it called before its entry point, with
+/// pointers to the MEM1, foreground and MEM2 base heap handles, and the
+/// handles it leaves there become the base heaps (decaf's
+/// `__OSDynLoad_InitFromCoreInit`). wut's sets up its malloc there, from all
+/// of MEM2. The call goes out on the main thread and comes back to a
+/// trampoline, `__preinit_user_returned`, which sends the thread on to the
+/// entry point as the loader left it.
+struct Startup {
+    /// The trampoline's address, resolved when coreinit is registered.
+    ppcaddr_t returned = 0;
+
+    /// While a preinit runs: the stack frame the handles are in, and the
+    /// entry point with the registers the loader gave it. `frame` is zero
+    /// otherwise.
+    ppcaddr_t frame = 0;
+    ppcaddr_t entry = 0;
+    u32 r3 = 0;
+    u32 r4 = 0;
+    u32 lr = 0;
+};
+
+/// The frame `start_with_preinit` puts on the stack: the back chain, the
+/// word a callee saves the return address in, then the three handles.
+inline constexpr u32 preinit_frame_size = 0x20;
+inline constexpr u32 preinit_mem1_offset = 0x8;
+inline constexpr u32 preinit_foreground_offset = 0xC;
+inline constexpr u32 preinit_mem2_offset = 0x10;
+
 struct Context {
     HeapManager heaps;
     FileSystem filesystem;
@@ -272,6 +301,19 @@ struct Context {
     gx2::Gpu gpu;
 
     std::map<u32, Alarm> alarms;
+
+    Startup startup;
+
+    /// OSGetSystemInfo's block, in the system heap; zero until asked for.
+    ppcaddr_t system_info = 0;
+
+    /// OSEnableHomeButtonMenu's setting: on until a title turns it off, as
+    /// decaf starts it.
+    bool home_button_menu = true;
+
+    /// The FSA clients open, by handle, and the next handle to give out.
+    std::set<s32> fsa_clients;
+    s32 next_fsa_client = 1;
 
     /// Guest memory, remembered by the calls that can complete later.
     ///
@@ -374,6 +416,22 @@ void set_active_context(Context* context) noexcept;
 /// Register the implemented functions, plus stubs for the ones a typical
 /// program touches on the way to main().
 void register_all(Registry& registry, Context& context);
+
+/// Send `state` -- a core the loader has pointed at an RPX's entry point --
+/// through the RPX's `__preinit_user` first, at `preinit`; zero, as for a
+/// module without one, leaves it alone. Call it before the state is adopted
+/// as the main thread. False, with `error`, if the stack cannot take the
+/// frame or coreinit has not been registered.
+[[nodiscard]] bool start_with_preinit(Context& context,
+                                      memory::Memory& memory,
+                                      cpu::CoreState& state,
+                                      ppcaddr_t preinit,
+                                      std::string& error);
+
+/// What a title calls on its way to main(): `__preinit_user`'s return, the
+/// system information, the FSA client (coreinit_startup.cpp). Called by
+/// register_all.
+void register_startup(Registry& registry, Context& context);
 
 /// Threads, mutexes, events and semaphores (6.4 / 6.5). Called by
 /// register_all; separate because the blocking rules differ.

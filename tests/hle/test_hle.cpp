@@ -2,7 +2,9 @@
 #include <wiiu/cpu/interpreter.hpp>
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/loader.hpp>
+#include <wiiu/hle/proc_ui.hpp>
 #include <wiiu/hle/registry.hpp>
+#include <wiiu/hle/system_libraries.hpp>
 #include <wiiu/loader/rpl.hpp>
 #include <wiiu/loader/vfs.hpp>
 
@@ -10,6 +12,7 @@
 
 #include <bit>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -482,6 +485,61 @@ TEST_CASE("the load region stays the loader's, and a data import is a pointer to
     CHECK(machine.registry.resolve_data("coreinit", "__OSCurrentThread") == 0);
 }
 
+TEST_CASE("an RPX's __preinit_user runs before its entry point", "[hle][loader]") {
+    // Cafe OS's loader calls it with pointers to the MEM1, foreground and
+    // MEM2 base heap handles, and the handles it leaves there become the
+    // base heaps. wut's sets up malloc there: skipping it leaves every
+    // allocation failing, long after the cause.
+    Machine machine;
+    LoadedModule module;
+    const LoadResult result = machine.load("preinit.rpx", module);
+    INFO("error: " << result.error);
+    REQUIRE(result.ok);
+    const ppcaddr_t preinit = module.find_export("__preinit_user");
+    CHECK(preinit == 0x02000010U);
+    CHECK(module.find_export("main") == 0U);
+
+    const u32 stack = machine.state.gpr[1];
+    const u32 mem1 = machine.os.heaps.base(BaseHeap::Mem1);
+    const u32 mem2 = machine.os.heaps.base(BaseHeap::Mem2);
+    REQUIRE(machine.os.heaps.base(BaseHeap::Foreground) == 0U);
+
+    std::string error;
+    REQUIRE(
+        coreinit::start_with_preinit(machine.os, machine.memory, machine.state, preinit, error));
+    CHECK(machine.state.pc == preinit);
+
+    const RunReport report = run(machine.interpreter, machine.memory, machine.registry);
+    CHECK(report.outcome == RunOutcome::Returned);
+
+    // The preinit was handed the MEM2 handle, and ran first: the entry point
+    // read what it recorded.
+    CHECK(machine.state.gpr[4] == mem2);
+    // The entry point had the loader's stack, as if nothing had run before it.
+    CHECK(machine.state.gpr[3] == stack);
+
+    // What the preinit left is the base heaps now; what it did not change
+    // stays.
+    CHECK(machine.os.heaps.base(BaseHeap::Foreground) == 0x12345678U);
+    CHECK(machine.os.heaps.base(BaseHeap::Mem1) == mem1);
+    CHECK(machine.os.heaps.base(BaseHeap::Mem2) == mem2);
+    CHECK(machine.os.startup.frame == 0U);
+}
+
+TEST_CASE("a module without __preinit_user is entered directly", "[hle][loader]") {
+    Machine machine;
+    LoadedModule module;
+    REQUIRE(machine.load("homebrew.rpx", module).ok);
+    const cpu::CoreState before = machine.state;
+
+    std::string error;
+    REQUIRE(coreinit::start_with_preinit(
+        machine.os, machine.memory, machine.state, module.find_export("__preinit_user"), error));
+    CHECK(machine.state.pc == before.pc);
+    CHECK(machine.state.gpr[1] == before.gpr[1]);
+    CHECK(machine.state.lr == before.lr);
+}
+
 TEST_CASE("a wut-built RPX loads with every relocation applied", "[hle][loader][wut]") {
     // scripts/wut-samples.sh builds wut's helloworld sample: compiled against
     // wut and newlib and made an RPX by elf2rpl, as a homebrew is. Not every
@@ -507,6 +565,78 @@ TEST_CASE("a wut-built RPX loads with every relocation applied", "[hle][loader][
         CHECK(std::ranges::find(module.resolved_imports, std::string{"coreinit."} + name) !=
               module.resolved_imports.end());
     }
+}
+
+TEST_CASE("wut's helloworld reaches its main loop and draws its console", "[hle][wut]") {
+    // The whole of a wut title's start-up: __preinit_user's malloc heap,
+    // newlib's per-thread state in a thread-specific value, the spin locks
+    // around malloc, the FSA client for the SD card, WHBProc's ProcUI loop,
+    // and WHBLogConsole's OSScreen frames. It prints a line, then a line a
+    // second, and draws them every frame.
+    if (!std::filesystem::exists(data_path("wut/helloworld.rpx"))) {
+        SKIP("tests/loader/data/wut/helloworld.rpx is not built (scripts/wut-samples.sh)");
+    }
+    Machine machine;
+    procui::State procui;
+    procui::register_all(machine.registry, machine.os, procui);
+    register_system_libraries(machine.registry);
+
+    LoadedModule module;
+    const LoadResult result = machine.load("wut/helloworld.rpx", module);
+    INFO("error: " << result.error);
+    REQUIRE(result.ok);
+    std::string error;
+    REQUIRE(coreinit::start_with_preinit(
+        machine.os, machine.memory, machine.state, module.find_export("__preinit_user"), error));
+    static_cast<void>(machine.os.scheduler.adopt_main(machine.state, main_thread_handle));
+
+    // What the console puts on the TV, row by row.
+    std::map<u32, std::string> rows;
+    Function* const put = machine.registry.find("coreinit", "OSScreenPutFontEx");
+    REQUIRE(put != nullptr);
+    put->handler = [inner = put->handler, &rows](Call& call) {
+        if (call.state.gpr[3] == 0 && call.state.gpr[6] != 0) {
+            rows[call.state.gpr[5]] = call.read_string(call.state.gpr[6]);
+        }
+        inner(call);
+    };
+
+    // Twenty-five frames, a tenth of a second each, and the last one's
+    // corner pixel: the console's background.
+    constexpr u64 frames = 25;
+    u64 flips = 0;
+    u32 corner = 0;
+    machine.os.screens.on_flip = [&](const coreinit::ScreenFlip& flip,
+                                     const memory::Memory& memory) {
+        if (flip.screen != coreinit::ScreenId::Tv) {
+            return true;
+        }
+        const u32 last = (flip.geometry.height - 1) * flip.geometry.pitch * 4;
+        corner = memory.read<u32>(flip.address + last);
+        return ++flips < frames;
+    };
+
+    const RunReport report = run(machine.interpreter,
+                                 machine.memory,
+                                 machine.registry,
+                                 {.scheduler = &machine.os.scheduler});
+    INFO("outcome: " << run_outcome_name(report.outcome));
+    CHECK(report.outcome == RunOutcome::Halted);
+    CHECK(machine.os.screens.stop_requested);
+    CHECK(flips == frames);
+    for (const Function* function : machine.registry.unimplemented_called()) {
+        UNSCOPED_INFO(function->library << "." << function->name);
+    }
+    CHECK(machine.registry.unimplemented_called().empty());
+
+    CHECK(rows[0] == "Hello World!\n");
+    // Then the time, once a second: two and a half seconds is three lines.
+    const std::string still_here = "I'm still here.\n";
+    for (u32 row = 1; row <= 3; ++row) {
+        INFO("row " << row << ": " << rows[row]);
+        CHECK(rows[row].ends_with(still_here));
+    }
+    CHECK(corner == 0x993333FFU);
 }
 
 TEST_CASE("the run loop stops on a fault rather than looping", "[hle][loader]") {

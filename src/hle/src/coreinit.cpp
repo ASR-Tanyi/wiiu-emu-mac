@@ -203,20 +203,107 @@ void ic_invalidate_range(Call& call, u32 address, u32 size) {
 
 namespace {
 
-u32 mem_get_base_heap_handle(Call&, u32 index) {
-    if (active() == nullptr) {
-        return 0;
-    }
-    // MEM_BASE_HEAP_MEM1 is 0, MEM2 is 1, FG is 2. The foreground bucket is
-    // not modelled separately, so it shares MEM1's.
+/// MEM_BASE_HEAP_MEM1 is 0, MEM2 is 1, FG is 8; anything else is no heap.
+[[nodiscard]] bool base_heap_type(u32 index, BaseHeap& out) {
     switch (index) {
         case 0:
-            return active()->heaps.mem1_handle();
+            out = BaseHeap::Mem1;
+            return true;
         case 1:
-            return active()->heaps.mem2_handle();
+            out = BaseHeap::Mem2;
+            return true;
+        case 8:
+            out = BaseHeap::Foreground;
+            return true;
         default:
-            return active()->heaps.mem1_handle();
+            return false;
     }
+}
+
+u32 mem_get_base_heap_handle(Call&, u32 index) {
+    BaseHeap type{};
+    if (active() == nullptr || !base_heap_type(index, type)) {
+        return 0;
+    }
+    const u32 handle = active()->heaps.base(type);
+    if (handle == 0 && type == BaseHeap::Foreground) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            WIIU_LOG_WARN(Coreinit,
+                          "MEMGetBaseHeapHandle(MEM_BASE_HEAP_FG): the foreground bucket is not "
+                          "modelled; no heap");
+        }
+    }
+    return handle;
+}
+
+/// `MEMHeapHandle MEMSetBaseHeapHandle(MEMBaseHeapType, MEMHeapHandle)`: the
+/// old one back.
+u32 mem_set_base_heap_handle(Call&, u32 index, u32 handle) {
+    BaseHeap type{};
+    if (active() == nullptr || !base_heap_type(index, type)) {
+        return 0;
+    }
+    return active()->heaps.set_base(type, handle);
+}
+
+// Frame heaps live in guest memory (heap.hpp): each call checks the handle
+// is one, and refuses one that is not, saying so.
+[[nodiscard]] bool frame_heap_handle(Call& call, u32 handle, std::string_view what) {
+    if (frame_heap::is_frame_heap(call.memory, handle)) {
+        return true;
+    }
+    WIIU_LOG_WARN(Coreinit, "{}({:#010x}): not a frame heap", what, handle);
+    return false;
+}
+
+u32 mem_create_frm_heap_ex(Call& call, u32 base, u32 size, u32 flags) {
+    return frame_heap::create(call.memory, base, size, flags);
+}
+
+u32 mem_destroy_frm_heap(Call& call, u32 handle) {
+    return frame_heap_handle(call, handle, "MEMDestroyFrmHeap")
+               ? frame_heap::destroy(call.memory, handle)
+               : 0;
+}
+
+u32 mem_alloc_from_frm_heap_ex(Call& call, u32 handle, u32 size, s32 alignment) {
+    return frame_heap_handle(call, handle, "MEMAllocFromFrmHeapEx")
+               ? frame_heap::allocate(call.memory, handle, size, alignment)
+               : 0;
+}
+
+void mem_free_to_frm_heap(Call& call, u32 handle, u32 mode) {
+    if (frame_heap_handle(call, handle, "MEMFreeToFrmHeap")) {
+        frame_heap::free(call.memory, handle, mode);
+    }
+}
+
+u32 mem_record_state_for_frm_heap(Call& call, u32 handle, u32 tag) {
+    return frame_heap_handle(call, handle, "MEMRecordStateForFrmHeap") &&
+                   frame_heap::record_state(call.memory, handle, tag)
+               ? 1
+               : 0;
+}
+
+u32 mem_free_by_state_to_frm_heap(Call& call, u32 handle, u32 tag) {
+    return frame_heap_handle(call, handle, "MEMFreeByStateToFrmHeap") &&
+                   frame_heap::free_by_state(call.memory, handle, tag)
+               ? 1
+               : 0;
+}
+
+u32 mem_adjust_frm_heap(Call& call, u32 handle) {
+    return frame_heap_handle(call, handle, "MEMAdjustFrmHeap")
+               ? frame_heap::adjust(call.memory, handle)
+               : 0;
+}
+
+u32 mem_get_allocatable_size_for_frm_heap_ex(Call& call, u32 handle, s32 alignment) {
+    return frame_heap_handle(call, handle, "MEMGetAllocatableSizeForFrmHeapEx")
+               ? frame_heap::allocatable_size(call.memory, handle, alignment)
+               : 0;
 }
 
 u32 mem_alloc_from_default_heap(Call&, u32 size) {
@@ -681,6 +768,7 @@ void fs_get_async_result(Call& call) {
 void register_all(Registry& registry, Context& context) {
     detail::set_active_context(&context);
     register_threads(registry, context);
+    register_startup(registry, context);
     register_time(registry, context);
     register_ios(registry, context);
     register_screen(registry, context);
@@ -700,6 +788,16 @@ void register_all(Registry& registry, Context& context) {
     registry.add("coreinit", "strlen", strlen_impl);
 
     registry.add("coreinit", "MEMGetBaseHeapHandle", mem_get_base_heap_handle);
+    registry.add("coreinit", "MEMSetBaseHeapHandle", mem_set_base_heap_handle);
+    registry.add("coreinit", "MEMCreateFrmHeapEx", mem_create_frm_heap_ex);
+    registry.add("coreinit", "MEMDestroyFrmHeap", mem_destroy_frm_heap);
+    registry.add("coreinit", "MEMAllocFromFrmHeapEx", mem_alloc_from_frm_heap_ex);
+    registry.add("coreinit", "MEMFreeToFrmHeap", mem_free_to_frm_heap);
+    registry.add("coreinit", "MEMRecordStateForFrmHeap", mem_record_state_for_frm_heap);
+    registry.add("coreinit", "MEMFreeByStateToFrmHeap", mem_free_by_state_to_frm_heap);
+    registry.add("coreinit", "MEMAdjustFrmHeap", mem_adjust_frm_heap);
+    registry.add(
+        "coreinit", "MEMGetAllocatableSizeForFrmHeapEx", mem_get_allocatable_size_for_frm_heap_ex);
     registry.add("coreinit", "MEMAllocFromDefaultHeap", mem_alloc_from_default_heap);
     registry.add("coreinit", "MEMAllocFromDefaultHeapEx", mem_alloc_from_default_heap_ex);
     registry.add("coreinit", "MEMFreeToDefaultHeap", mem_free_to_default_heap);

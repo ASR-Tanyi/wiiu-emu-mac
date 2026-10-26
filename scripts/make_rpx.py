@@ -736,6 +736,137 @@ _start:
           note="imports in the load region, a data import called through")
 
 
+def build_sleeper(path: Path):
+    """An RPX whose one thread sleeps in a loop, 1100 times, then returns 7.
+
+    Every OSScreen homebrew's main loop is this shape: draw, flip, sleep.
+    With nothing else to run, each sleep is an idle skip; the run loop must
+    tell that from a deadlock, however many of them there are.
+    """
+    obj = assemble_object("""
+\t.text
+\t.globl _start
+_start:
+\tmflr\t0
+\tstwu\t1,-16(1)
+\tstw\t0,20(1)
+\tstw\t31,12(1)
+\tli\t31,1100
+loop:
+\tli\t3,0
+\tli\t4,1000\t# OSSleepTicks(1000): the ticks are a pair, r3:r4
+\tbl\tOSSleepTicks
+\taddic.\t31,31,-1
+\tbne\tloop
+\tlwz\t31,12(1)
+\tlwz\t0,20(1)
+\tmtlr\t0
+\taddi\t1,1,16
+\tli\t3,7
+\tblr
+""")
+
+    _, headers, data, name_of = read_object(obj)
+    by_name = {name_of(h): (i, h) for i, h in enumerate(headers) if name_of(h)}
+    text_index, text_header = by_name[".text"]
+    _, symtab_header = by_name[".symtab"]
+    _, strtab_header = by_name[".strtab"]
+
+    text = data(text_header)
+    symtab = bytearray(data(symtab_header))
+    strtab = data(strtab_header)
+
+    text_addr = TEXT_BASE
+    new_text, new_import = 1, 2
+
+    for i in range(len(symtab) // 16):
+        at = i * 16
+        name_off, value, size, info, other, shndx = struct.unpack_from(">IIIBBH", symtab, at)
+        if shndx == text_index:
+            shndx, value = new_text, value + text_addr
+        elif shndx == 0 and name_off != 0:
+            shndx = new_import
+        struct.pack_into(">IIIBBH", symtab, at, name_off, value, size, info, other, shndx)
+
+    relocations = bytearray()
+    for header in headers:
+        if header["type"] != SHT_RELA or header["info"] != text_index:
+            continue
+        raw = data(header)
+        for j in range(len(raw) // 12):
+            offset, info, addend = struct.unpack_from(">IIi", raw, j * 12)
+            relocations += struct.pack(">IIi", offset + text_addr, info, addend)
+
+    sections = [
+        Section(".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, text_addr, text, align=32),
+        Section(".fimport_coreinit", SHT_RPL_IMPORTS, SHF_ALLOC, 0x10008000,
+                build_imports("coreinit", 1), align=4),
+        Section(".symtab", SHT_SYMTAB, 0, 0, bytes(symtab), link=4, entsize=16, align=4),
+        Section(".strtab", 3, 0, 0, strtab, align=1),
+        Section(".rela.text", SHT_RELA, 0, 0, bytes(relocations),
+                link=3, info=new_text, entsize=12, align=4),
+        Section(".rplfileinfo", SHT_RPL_FILEINFO, 0, 0,
+                build_file_info(text_size=len(text), data_size=0,
+                                load_size=0x1000, flags=RPL_IS_RPX,
+                                name="sleeper.rpx"), align=4),
+    ]
+    build(path, sections, entry=text_addr, note="sleeps 1100 times on one thread")
+
+
+def build_preinit(path: Path):
+    """An RPX that exports __preinit_user, as one built with wut does. Cafe
+    OS's loader calls it before the entry point with pointers to the MEM1,
+    foreground and MEM2 base heap handles: this one records the MEM2 handle
+    it was given and leaves a foreground handle behind; the entry point then
+    hands back the stack pointer it was given and what the preinit recorded,
+    so a test can see both ran, in that order, each as it should.
+    """
+    entry = assemble("""
+        lis     9,0x1000
+        lwz     4,0(9)
+        mr      3,1
+        blr
+    """)
+    preinit = assemble("""
+        mflr    0
+        stwu    1,-16(1)
+        stw     0,20(1)
+        lwz     6,0(5)
+        lis     9,0x1000
+        stw     6,0(9)
+        lis     7,0x1234
+        ori     7,7,0x5678
+        stw     7,0(4)
+        lwz     0,20(1)
+        mtlr    0
+        addi    1,1,16
+        blr
+    """)
+    text = entry + preinit
+    preinit_addr = TEXT_BASE + len(entry)
+    exports = build_exports([(preinit_addr, "__preinit_user")])
+    data = bytes(4)
+
+    build(
+        path,
+        [
+            Section(".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR,
+                    TEXT_BASE, text, align=32),
+            Section(".data", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE,
+                    0x10000000, data, align=32),
+            # In the load region, where elf2rpl puts it.
+            Section(".fexports", SHT_RPL_EXPORTS, SHF_ALLOC | SHF_EXECINSTR,
+                    0xC0000000, exports, align=4),
+            Section(".rplfileinfo", SHT_RPL_FILEINFO, 0, 0,
+                    build_file_info(text_size=len(text), data_size=len(data),
+                                    load_size=len(exports), flags=RPL_IS_RPX,
+                                    name="preinit.rpx"), align=4),
+        ],
+        entry=TEXT_BASE,
+        note=f"exports __preinit_user at {preinit_addr:#010x}",
+    )
+
+
 def main() -> int:
     if shutil.which("powerpc-linux-gnu-as") is None:
         print("powerpc-linux-gnu-as not found; cannot rebuild fixtures", file=sys.stderr)
@@ -818,6 +949,8 @@ def main() -> int:
     build_threaded(OUTPUT_DIR / "threaded.rpx")
     build_clock(OUTPUT_DIR / "clock.rpx")
     build_dataimport(OUTPUT_DIR / "dataimport.rpx")
+    build_preinit(OUTPUT_DIR / "preinit.rpx")
+    build_sleeper(OUTPUT_DIR / "sleeper.rpx")
 
     return 0
 

@@ -13,6 +13,11 @@ using wiiu::log::Channel;
 
 } // namespace
 
+ppcaddr_t LoadedModule::find_export(std::string_view symbol) const {
+    const auto found = exports.find(symbol);
+    return found == exports.end() ? 0 : found->second;
+}
+
 LoadResult load_module(const loader::Rpl& rpl,
                        memory::Memory& memory,
                        Registry& registry,
@@ -32,6 +37,12 @@ LoadResult load_module(const loader::Rpl& rpl,
 
     out.delta = options.load_base == 0 ? 0 : static_cast<s32>(options.load_base - text->address);
     out.entry = rpl.entry + static_cast<u32>(out.delta);
+
+    for (const loader::ExportTable& table : rpl.exports) {
+        for (const loader::Export& entry : table.entries) {
+            out.exports[entry.name] = entry.value + static_cast<u32>(out.delta);
+        }
+    }
 
     // --- resolve imports ---------------------------------------------------
     //
@@ -323,7 +334,16 @@ RunReport run(cpu::Interpreter& interpreter,
                 // still moving and no amount of clock will help. Without this
                 // the loop spins on the clock forever: it runs no
                 // instructions, so the budget never advances either.
-                if (scheduler->runnable_count() == 0) {
+                //
+                // The thread the skip woke counts, whether it is waiting to
+                // run or -- the only thread there is, picked straight away --
+                // already running. Counting only the waiting ones made every
+                // frame of a one-thread title that sleeps a frame at a time a
+                // skip that achieved nothing, and the 1024th a deadlock.
+                const Thread* const running = scheduler->current();
+                const bool woke = scheduler->runnable_count() != 0 ||
+                                  (running != nullptr && running->state == ThreadState::Running);
+                if (!woke) {
                     if (++idle_skips_without_progress >= max_idle_skips_without_progress) {
                         report.outcome = RunOutcome::Deadlocked;
                         break;

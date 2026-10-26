@@ -13,7 +13,10 @@
 #include <wiiu/loader/rpl.hpp>
 #include <wiiu/memory/memory.hpp>
 
+#include <functional>
+#include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace wiiu::hle {
@@ -26,6 +29,14 @@ struct LoadedModule {
     /// Imports resolved, by "library.symbol".
     std::vector<std::string> resolved_imports;
     std::vector<std::string> unresolved_imports;
+
+    /// What it exports, functions and data alike, where they landed. An RPX
+    /// exports little: wut's export `__preinit_user`, which Cafe OS calls
+    /// before the entry point (coreinit's `start_with_preinit`).
+    std::map<std::string, ppcaddr_t, std::less<>> exports;
+
+    /// An export's address, or zero if there is no such export.
+    [[nodiscard]] ppcaddr_t find_export(std::string_view symbol) const;
 };
 
 struct LoadResult {

@@ -53,7 +53,7 @@ inbox(State& state, coreinit::Context& context, memory::Memory& memory, u32 thre
         return existing->second;
     }
 
-    ExpandedHeap* const heap = context.heaps.find(context.heaps.default_handle());
+    ExpandedHeap* const heap = context.heaps.find(context.heaps.system_handle());
     if (heap == nullptr) {
         return 0;
     }

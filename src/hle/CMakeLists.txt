@@ -5,6 +5,7 @@ wiiu_add_library(hle
         src/coreinit.cpp
         src/coreinit_ios.cpp
         src/coreinit_screen.cpp
+        src/coreinit_startup.cpp
         src/coreinit_thread.cpp
         src/coreinit_time.cpp
         src/filesystem.cpp
