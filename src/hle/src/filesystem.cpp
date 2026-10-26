@@ -53,12 +53,42 @@ std::string_view fs_status_name(FsStatus status) noexcept {
 }
 
 void FileSystem::reset() {
+    // The card stays in its slot; a new title mounts it again.
+    if (sd_card_mounted_ && vfs_ != nullptr) {
+        vfs_->unmount(sd_card_path);
+    }
+    sd_card_mounted_ = false;
     clients_.clear();
     files_.clear();
     directories_.clear();
     next_client_ = client_base;
     next_file_ = file_base;
     next_directory_ = directory_base;
+}
+
+FsStatus FileSystem::mount_sd_card() {
+    if (!has_sd_card()) {
+        return FsStatus::NotFound;
+    }
+    if (vfs_ == nullptr) {
+        return FsStatus::FatalError;
+    }
+    if (sd_card_mounted_) {
+        return FsStatus::Exists;
+    }
+    vfs_->mount(std::string{sd_card_path}, std::make_shared<loader::HostMount>(sd_card_));
+    sd_card_mounted_ = true;
+    WIIU_LOG_INFO(Coreinit, "SD card {} mounted at {}", sd_card_.string(), sd_card_path);
+    return FsStatus::Ok;
+}
+
+FsStatus FileSystem::unmount(std::string_view target) {
+    if (!sd_card_mounted_ || target != sd_card_path || vfs_ == nullptr) {
+        return FsStatus::NotFound;
+    }
+    vfs_->unmount(sd_card_path);
+    sd_card_mounted_ = false;
+    return FsStatus::Ok;
 }
 
 u32 FileSystem::add_client() {

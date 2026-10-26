@@ -111,7 +111,10 @@ callback on a thread of its own, the handler redirects the thread it is already
 on — saving where the title was going, pointing it at the callback with the
 return address set to an `sc` trampoline of ours, and putting it back when the
 chain ends. That is how a callback runs on the caller's own stack and is
-finished before the call returns, which is what the title expects. A title's
+finished before the call returns, which is what the title expects. Any
+handler can do the same for one function through `coreinit::call_guest` --
+GX2R's allocator is a guest function a title hands GX2, and creating a buffer
+calls it -- giving what to do when it returns, which can call another. A title's
 start is the same trick before it has begun: an RPX that exports
 `__preinit_user` — every one built with wut — is sent through it first, with
 the base heaps' handles on a frame of its own and a trampoline as the return

@@ -15,13 +15,19 @@
 //
 // Guessing at the rest would be worse than leaving them out: a stub registered
 // under a name no title imports is dead code that reads like a specification.
+//
+// Two get more than a name, because WHB's UDP log -- which most homebrew
+// starts first -- calls them: nsysnet's sockets open, take options and send,
+// into no network (what goes to WHB's log port is logged here), and nn_ac
+// accepts a connection request it never completes.
 #pragma once
 
 #include <wiiu/hle/registry.hpp>
 
 namespace wiiu::hle {
 
-/// Register the start-up stubs for `nsysnet`, `nn_save` and `nn_acp`.
+/// Register `nsysnet`, `nn_ac`, and the start-up stubs for `nn_save` and
+/// `nn_acp`.
 void register_system_libraries(Registry& registry);
 
 } // namespace wiiu::hle

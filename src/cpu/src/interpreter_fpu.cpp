@@ -551,19 +551,22 @@ void Interpreter::compare_floats(u32 field, f64 lhs, f64 rhs, bool ordered) noex
 // --------------------------------------------------------------------------
 
 StepResult Interpreter::execute_fp_load_store(Opcode id, Instruction inst) {
-    const bool indexed =
-        id == Opcode::Lfsx || id == Opcode::Lfdx || id == Opcode::Stfsx || id == Opcode::Stfdx;
+    const bool indexed = id == Opcode::Lfsx || id == Opcode::Lfdx || id == Opcode::Stfsx ||
+                         id == Opcode::Stfdx || id == Opcode::Lfsux || id == Opcode::Lfdux ||
+                         id == Opcode::Stfsux || id == Opcode::Stfdux || id == Opcode::Stfiwx;
     const ppcaddr_t address = indexed ? effective_address_indexed(inst) : effective_address(inst);
 
-    const bool update =
-        id == Opcode::Lfsu || id == Opcode::Lfdu || id == Opcode::Stfsu || id == Opcode::Stfdu;
+    const bool update = id == Opcode::Lfsu || id == Opcode::Lfdu || id == Opcode::Stfsu ||
+                        id == Opcode::Stfdu || id == Opcode::Lfsux || id == Opcode::Lfdux ||
+                        id == Opcode::Stfsux || id == Opcode::Stfdux;
 
     switch (id) {
         // A single-precision load widens to double in the register: the
         // register file only holds doubles.
         case Opcode::Lfs:
         case Opcode::Lfsu:
-        case Opcode::Lfsx: {
+        case Opcode::Lfsx:
+        case Opcode::Lfsux: {
             u32 raw = 0;
             if (!read_guest<u32>(address, raw)) {
                 return StepResult::MemoryFault;
@@ -574,7 +577,8 @@ StepResult Interpreter::execute_fp_load_store(Opcode id, Instruction inst) {
 
         case Opcode::Lfd:
         case Opcode::Lfdu:
-        case Opcode::Lfdx: {
+        case Opcode::Lfdx:
+        case Opcode::Lfdux: {
             u64 raw = 0;
             if (!read_guest<u64>(address, raw)) {
                 return StepResult::MemoryFault;
@@ -586,6 +590,7 @@ StepResult Interpreter::execute_fp_load_store(Opcode id, Instruction inst) {
         case Opcode::Stfs:
         case Opcode::Stfsu:
         case Opcode::Stfsx:
+        case Opcode::Stfsux:
             // A loop that stores is doing work, not waiting (P2).
             note_side_effect();
             if (!write_guest<u32>(address,
@@ -597,8 +602,20 @@ StepResult Interpreter::execute_fp_load_store(Opcode id, Instruction inst) {
         case Opcode::Stfd:
         case Opcode::Stfdu:
         case Opcode::Stfdx:
+        case Opcode::Stfdux:
             note_side_effect();
             if (!write_guest<u64>(address, std::bit_cast<u64>(state_.fpr[inst.frs].ps0))) {
+                return StepResult::MemoryFault;
+            }
+            break;
+
+        // The low word of the register as it is, no conversion: what fctiw
+        // and fctiwz leave there is the integer, and this is how a compiler
+        // gets it into memory.
+        case Opcode::Stfiwx:
+            note_side_effect();
+            if (!write_guest<u32>(address,
+                                  static_cast<u32>(std::bit_cast<u64>(state_.fpr[inst.frs].ps0)))) {
                 return StepResult::MemoryFault;
             }
             break;

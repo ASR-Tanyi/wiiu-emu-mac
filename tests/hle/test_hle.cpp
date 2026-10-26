@@ -1,5 +1,6 @@
 #include <wiiu/common/log.hpp>
 #include <wiiu/cpu/interpreter.hpp>
+#include <wiiu/gpu/null_backend.hpp>
 #include <wiiu/hle/coreinit.hpp>
 #include <wiiu/hle/loader.hpp>
 #include <wiiu/hle/proc_ui.hpp>
@@ -13,6 +14,7 @@
 #include <bit>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -502,7 +504,7 @@ TEST_CASE("an RPX's __preinit_user runs before its entry point", "[hle][loader]"
     const u32 stack = machine.state.gpr[1];
     const u32 mem1 = machine.os.heaps.base(BaseHeap::Mem1);
     const u32 mem2 = machine.os.heaps.base(BaseHeap::Mem2);
-    REQUIRE(machine.os.heaps.base(BaseHeap::Foreground) == 0U);
+    REQUIRE(machine.os.heaps.base(BaseHeap::Foreground) == memory::foreground_bucket_base);
 
     std::string error;
     REQUIRE(
@@ -637,6 +639,125 @@ TEST_CASE("wut's helloworld reaches its main loop and draws its console", "[hle]
         CHECK(rows[row].ends_with(still_here));
     }
     CHECK(corner == 0x993333FFU);
+}
+
+TEST_CASE("wut's helloworld says good bye and exits when asked to", "[hle][wut]") {
+    // The way out: ProcUI tells the title it is exiting, WHB's loop stops,
+    // the title prints its last line, waits a second, shuts ProcUI down and
+    // returns from main -- and wut's crt ends the process with coreinit's
+    // exit, which ends the run.
+    if (!std::filesystem::exists(data_path("wut/helloworld.rpx"))) {
+        SKIP("tests/loader/data/wut/helloworld.rpx is not built (scripts/wut-samples.sh)");
+    }
+    Machine machine;
+    procui::State procui;
+    procui::register_all(machine.registry, machine.os, procui);
+    register_system_libraries(machine.registry);
+
+    LoadedModule module;
+    REQUIRE(machine.load("wut/helloworld.rpx", module).ok);
+    std::string error;
+    REQUIRE(coreinit::start_with_preinit(
+        machine.os, machine.memory, machine.state, module.find_export("__preinit_user"), error));
+    static_cast<void>(machine.os.scheduler.adopt_main(machine.state, main_thread_handle));
+
+    std::map<u32, std::string> rows;
+    Function* const put = machine.registry.find("coreinit", "OSScreenPutFontEx");
+    REQUIRE(put != nullptr);
+    put->handler = [inner = put->handler, &rows](Call& call) {
+        if (call.state.gpr[3] == 0 && call.state.gpr[6] != 0) {
+            rows[call.state.gpr[5]] = call.read_string(call.state.gpr[6]);
+        }
+        inner(call);
+    };
+
+    // Three frames in, the HOME menu's "close": an exit request.
+    u64 flips = 0;
+    machine.os.screens.on_flip = [&](const coreinit::ScreenFlip& flip, const memory::Memory&) {
+        if (flip.screen == coreinit::ScreenId::Tv && ++flips == 3) {
+            REQUIRE(procui.request_exit(machine.os, machine.memory));
+        }
+        return true;
+    };
+
+    const RunReport report = run(machine.interpreter,
+                                 machine.memory,
+                                 machine.registry,
+                                 {.scheduler = &machine.os.scheduler});
+    INFO("outcome: " << run_outcome_name(report.outcome));
+    CHECK(report.outcome == RunOutcome::Returned);
+    CHECK(machine.os.exit_status == std::optional<s32>{0});
+    CHECK(machine.registry.unimplemented_called().empty());
+
+    // Its last frame: the good bye under what came before.
+    bool good_bye = false;
+    for (const auto& [row, text] : rows) {
+        good_bye = good_bye || text == "Exiting... good bye.\n";
+    }
+    CHECK(good_bye);
+}
+
+TEST_CASE("wut's gx2_triangle draws its triangle every frame", "[hle][wut][gx2]") {
+    // WHBGfx and GX2R: the scan buffers in the foreground bucket, the shaders
+    // read from the SD card with WHB's file calls and loaded by wut's GFD
+    // parser, the vertices in GX2R buffers its allocator makes -- a call out
+    // to the guest and back -- locked, written and unlocked every frame, and
+    // two draws a frame, the TV's and the GamePad's. The null backend takes
+    // the GPU's work, so every draw goes the whole way through translation
+    // and is encoded, and none is refused.
+    if (!std::filesystem::exists(data_path("wut/gx2_triangle.rpx"))) {
+        SKIP("tests/loader/data/wut/gx2_triangle.rpx is not built (scripts/wut-samples.sh)");
+    }
+    Machine machine;
+    procui::State procui;
+    procui::register_all(machine.registry, machine.os, procui);
+    register_system_libraries(machine.registry);
+    machine.os.filesystem.set_sd_card(data_path("wut/sdcard"));
+
+    gpu::NullBackend backend;
+    std::string error;
+    REQUIRE(backend.initialize(error));
+    machine.os.gpu.attach_backend(&backend);
+
+    LoadedModule module;
+    const LoadResult result = machine.load("wut/gx2_triangle.rpx", module);
+    INFO("error: " << result.error);
+    REQUIRE(result.ok);
+    REQUIRE(coreinit::start_with_preinit(
+        machine.os, machine.memory, machine.state, module.find_export("__preinit_user"), error));
+    static_cast<void>(machine.os.scheduler.adopt_main(machine.state, main_thread_handle));
+
+    constexpr u64 frames = 5;
+    u64 flips = 0;
+    bool textures = true;
+    machine.os.screens.on_flip = [&](const coreinit::ScreenFlip& flip, const memory::Memory&) {
+        if (flip.screen != coreinit::ScreenId::Tv) {
+            return true;
+        }
+        textures = textures && flip.texture.valid(); // drawn on the GPU, shown from it
+        return ++flips < frames;
+    };
+
+    const RunReport report = run(machine.interpreter,
+                                 machine.memory,
+                                 machine.registry,
+                                 {.scheduler = &machine.os.scheduler});
+    machine.os.gpu.attach_backend(nullptr);
+    INFO("outcome: " << run_outcome_name(report.outcome));
+    CHECK(report.outcome == RunOutcome::Halted);
+    CHECK(flips == frames);
+    CHECK(textures);
+    for (const Function* function : machine.registry.unimplemented_called()) {
+        UNSCOPED_INFO(function->library << "." << function->name);
+    }
+    CHECK(machine.registry.unimplemented_called().empty());
+
+    // Two draws a frame; the frame in flight when the run stopped may have
+    // drawn its TV half already.
+    const gx2::DrawStats& stats = machine.os.gpu.draw_stats();
+    CHECK(stats.drawn >= 2 * (frames - 1));
+    CHECK(stats.refused == 0U);
+    CHECK(stats.empty == 0U);
 }
 
 TEST_CASE("the run loop stops on a fault rather than looping", "[hle][loader]") {

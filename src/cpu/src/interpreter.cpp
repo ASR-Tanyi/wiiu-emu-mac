@@ -367,6 +367,7 @@ StepResult Interpreter::execute(Opcode id, Instruction inst) {
         case Opcode::Crorc:
         case Opcode::Crxor:
         case Opcode::Mcrf:
+        case Opcode::Mcrxr:
             return execute_condition(id, inst);
 
         case Opcode::Mfspr:
@@ -401,15 +402,20 @@ StepResult Interpreter::execute(Opcode id, Instruction inst) {
         case Opcode::Lfs:
         case Opcode::Lfsu:
         case Opcode::Lfsx:
+        case Opcode::Lfsux:
         case Opcode::Lfd:
         case Opcode::Lfdu:
         case Opcode::Lfdx:
+        case Opcode::Lfdux:
         case Opcode::Stfs:
         case Opcode::Stfsu:
         case Opcode::Stfsx:
+        case Opcode::Stfsux:
         case Opcode::Stfd:
         case Opcode::Stfdu:
         case Opcode::Stfdx:
+        case Opcode::Stfdux:
+        case Opcode::Stfiwx:
             return execute_fp_load_store(id, inst);
 
         case Opcode::PsqL:
@@ -961,6 +967,12 @@ StepResult Interpreter::execute_condition(Opcode id, Instruction inst) {
         state_.cr.set_field(inst.crfd, state_.cr.field(inst.crfs));
         return StepResult::Ok;
     }
+    if (id == Opcode::Mcrxr) {
+        // XER's SO, OV and CA into the field, and cleared in XER.
+        state_.cr.set_field(inst.crfd, state_.xer.value >> 28);
+        state_.xer.value &= ~0xF0000000U;
+        return StepResult::Ok;
+    }
 
     const bool a = state_.cr.bit(inst.crba);
     const bool b = state_.cr.bit(inst.crbb);
@@ -1009,12 +1021,15 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
             case Opcode::Lbzx:
             case Opcode::Lbzux:
             case Opcode::Lhax:
+            case Opcode::Lhaux:
             case Opcode::Lhzx:
             case Opcode::Lhzux:
             case Opcode::Lwzx:
             case Opcode::Lwzux:
             case Opcode::Stbx:
+            case Opcode::Stbux:
             case Opcode::Sthx:
+            case Opcode::Sthux:
             case Opcode::Stwx:
             case Opcode::Stwux:
             case Opcode::Lhbrx:
@@ -1041,8 +1056,11 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
             case Opcode::Sthu:
             case Opcode::Stwu:
             case Opcode::Lbzux:
+            case Opcode::Lhaux:
             case Opcode::Lhzux:
             case Opcode::Lwzux:
+            case Opcode::Stbux:
+            case Opcode::Sthux:
             case Opcode::Stwux:
                 return true;
             default:
@@ -1080,7 +1098,8 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
 
         case Opcode::Lha:
         case Opcode::Lhau:
-        case Opcode::Lhax: {
+        case Opcode::Lhax:
+        case Opcode::Lhaux: {
             u16 half = 0;
             if (!read_guest<u16>(address, half)) {
                 return StepResult::MemoryFault;
@@ -1151,6 +1170,7 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
         case Opcode::Stb:
         case Opcode::Stbu:
         case Opcode::Stbx:
+        case Opcode::Stbux:
             is_load = false;
             if (!write_guest<u8>(address, static_cast<u8>(state_.gpr[inst.rs]))) {
                 return StepResult::MemoryFault;
@@ -1160,6 +1180,7 @@ StepResult Interpreter::execute_load_store(Opcode id, Instruction inst) {
         case Opcode::Sth:
         case Opcode::Sthu:
         case Opcode::Sthx:
+        case Opcode::Sthux:
             is_load = false;
             if (!write_guest<u16>(address, static_cast<u16>(state_.gpr[inst.rs]))) {
                 return StepResult::MemoryFault;

@@ -590,6 +590,16 @@ void Scheduler::exit_current(cpu::CoreState& state, s32 value) {
     static_cast<void>(reschedule(state));
 }
 
+void Scheduler::exit_all(s32 value) {
+    for (auto& [handle, thread] : threads_) {
+        if (thread.state != ThreadState::Exited) {
+            thread.state = ThreadState::Exited;
+            thread.exit_value = value;
+            thread.joiners.clear();
+        }
+    }
+}
+
 bool Scheduler::join(cpu::CoreState& state, u32 handle, ppcaddr_t out_address, s32& value) {
     Thread* const target = find(handle);
     if (target == nullptr) {

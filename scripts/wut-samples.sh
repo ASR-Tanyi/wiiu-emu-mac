@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Build wut's `helloworld` sample into tests/loader/data/wut/helloworld.rpx.
+# Build wut's `helloworld` and `gx2_triangle` samples into tests/loader/data/wut/.
 #
 # A real-toolchain RPX: compiled against wut and newlib and turned into an RPX
 # by wut-tools' elf2rpl, which is what the loader has to read in the end. Like
-# every RPX here it is built, never committed (*.rpx is ignored), and the tests
-# that want it skip when it is not there.
+# every RPX here it is built, never committed (tests/loader/data/wut/ is
+# ignored), and the tests that want them skip when they are not there.
+#
+# gx2_triangle reads its shaders from the SD card, at
+# /vol/external01/wut/content/pos_col_shader.gsh; wut's sample content is
+# copied to tests/loader/data/wut/sdcard/, which is what the emulator mounts
+# as the card (`--sdcard`, or the `sdcard` setting).
 #
 # Two ways to get one:
 #
@@ -55,15 +60,28 @@ fetch() {
 
 mkdir -p "$WORK/src" "$OUT"
 fetch wut https://github.com/devkitPro/wut.git "$WUT_COMMIT"
-SAMPLE="$WORK/src/wut/samples/make/helloworld"
+SAMPLES="$WORK/src/wut/samples/cmake"
+
+# The SD card: wut's sample content where the samples look for it.
+rm -rf "$OUT/sdcard"
+mkdir -p "$OUT/sdcard/wut"
+cp -R "$SAMPLES/content" "$OUT/sdcard/wut/content"
 
 # --- with devkitPro --------------------------------------------------------
 if [ -n "${DEVKITPRO:-}" ] && [ -f "$DEVKITPRO/wut/share/wut_rules" ]; then
     echo "devkitPro at $DEVKITPRO: building with devkitPPC"
-    export DEVKITPPC="${DEVKITPPC:-$DEVKITPRO/devkitPPC}"
-    make -C "$SAMPLE" -j"$JOBS"
-    cp "$SAMPLE/helloworld.rpx" "$OUT/helloworld.rpx"
-    echo "wrote $OUT/helloworld.rpx"
+    DEVKITPPC="${DEVKITPPC:-$DEVKITPRO/devkitPPC}"
+    mkdir -p "$WORK"
+    # As wut_rules builds a sample: MACHDEP, wut.specs, -lwut.
+    for sample in helloworld gx2_triangle; do
+        "$DEVKITPPC/bin/powerpc-eabi-gcc" -DESPRESSO -mcpu=750 -meabi -mhard-float \
+            -O2 -ffunction-sections -fdata-sections -D__WIIU__ -D__WUT__ \
+            -I"$DEVKITPRO/wut/include" "$SAMPLES/$sample/main.c" \
+            -specs="$DEVKITPRO/wut/share/wut.specs" -L"$DEVKITPRO/wut/lib" -lwut \
+            -o "$WORK/$sample.elf"
+        "$DEVKITPRO/tools/bin/elf2rpl" "$WORK/$sample.elf" "$OUT/$sample.rpx"
+        echo "wrote $OUT/$sample.rpx"
+    done
     exit 0
 fi
 
@@ -203,7 +221,7 @@ if [ ! -x "$BIN/elf2rpl" ]; then
         -o "$BIN/rplimportgen"
 fi
 
-# libwut: what helloworld can pull in.
+# libwut: what the samples can pull in.
 W="$WORK/src/wut"
 OBJ="$WORK/libwut"
 rm -rf "$OBJ"
@@ -220,7 +238,7 @@ for s in "$W"/libraries/wutcrt/*.s; do
 done
 for c in "$W"/libraries/wutcrt/*.c "$W"/libraries/wutnewlib/*.c "$W"/libraries/wutmalloc/*.c \
          "$W"/libraries/wutdefaultheap/*.c "$W"/libraries/libwhb/src/*.c \
-         "$W"/libraries/libgfd/src/*.c; do
+         "$W"/libraries/libgfd/src/*.c "$W"/libraries/wutsocket/*.c; do
     powerpc-eabi-gcc "${CFLAGS[@]}" -c "$c" \
         -o "$OBJ/$(basename "$(dirname "$c")")_$(basename "$c" .c).o"
 done
@@ -231,14 +249,16 @@ done
 rm -f "$OBJ/libwut.a"
 powerpc-eabi-ar rcs "$OBJ/libwut.a" "$OBJ"/*.o
 
-# The sample, linked by wut's own script as wut.specs links it.
-powerpc-eabi-gcc "${CFLAGS[@]}" -c "$SAMPLE/source/main.c" -o "$WORK/helloworld.o"
-powerpc-eabi-ld -T "$W/share/wut.ld" --gc-sections --emit-relocs --no-eh-frame-hdr \
-    -z nocopyreloc -static -z noexecstack \
-    "$DKP/lib/ecrti.o" "$WORK/helloworld.o" -L"$OBJ" -L"$DKP/powerpc-eabi/lib" \
-    --start-group -lwut -lc -lm -lsysbase "$(powerpc-linux-gnu-gcc -print-libgcc-file-name)" \
-    --end-group "$DKP/lib/ecrtn.o" -o "$WORK/helloworld.elf"
-# The Linux toolchain marks every object's stack; elf2rpl knows no such section.
-powerpc-eabi-objcopy --remove-section=.note.GNU-stack "$WORK/helloworld.elf"
-elf2rpl "$WORK/helloworld.elf" "$OUT/helloworld.rpx"
-echo "wrote $OUT/helloworld.rpx"
+# The samples, linked by wut's own script as wut.specs links them.
+for sample in helloworld gx2_triangle; do
+    powerpc-eabi-gcc "${CFLAGS[@]}" -c "$SAMPLES/$sample/main.c" -o "$WORK/$sample.o"
+    powerpc-eabi-ld -T "$W/share/wut.ld" --gc-sections --emit-relocs --no-eh-frame-hdr \
+        -z nocopyreloc -static -z noexecstack \
+        "$DKP/lib/ecrti.o" "$WORK/$sample.o" -L"$OBJ" -L"$DKP/powerpc-eabi/lib" \
+        --start-group -lwut -lc -lm -lsysbase "$(powerpc-linux-gnu-gcc -print-libgcc-file-name)" \
+        --end-group "$DKP/lib/ecrtn.o" -o "$WORK/$sample.elf"
+    # The Linux toolchain marks every object's stack; elf2rpl knows no such section.
+    powerpc-eabi-objcopy --remove-section=.note.GNU-stack "$WORK/$sample.elf"
+    elf2rpl "$WORK/$sample.elf" "$OUT/$sample.rpx"
+    echo "wrote $OUT/$sample.rpx"
+done

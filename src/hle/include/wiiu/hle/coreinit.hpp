@@ -18,6 +18,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -286,6 +287,30 @@ inline constexpr u32 preinit_mem1_offset = 0x8;
 inline constexpr u32 preinit_foreground_offset = 0xC;
 inline constexpr u32 preinit_mem2_offset = 0x10;
 
+/// What a handler does when a guest function it called returns: given the
+/// call -- on the thread that made it, about to return to the handler's
+/// caller -- and the function's r3. It sets what the handler returns.
+using GuestReturn = std::function<void(Call& call, u32 result)>;
+
+/// A guest function a handler has called and not yet had back: where the
+/// thread goes when it returns, and what is done then.
+struct GuestCallFrame {
+    ppcaddr_t resume = 0;
+    u64 generation = 0; ///< the thread's, so a reused handle is not mistaken for it
+    GuestReturn then;
+};
+
+/// coreinit's own pointers to the default heap's functions -- the words
+/// a title's data imports of `MEMAllocFromDefaultHeap`, `…Ex` and
+/// `MEMFreeToDefaultHeap` name, which wut replaces with its malloc's.
+/// Whatever coreinit allocates "from the default heap" goes through them,
+/// as GX2R's default allocator does.
+struct DefaultHeapCells {
+    ppcaddr_t alloc = 0;
+    ppcaddr_t alloc_ex = 0;
+    ppcaddr_t free = 0;
+};
+
 struct Context {
     HeapManager heaps;
     FileSystem filesystem;
@@ -304,6 +329,13 @@ struct Context {
 
     Startup startup;
 
+    /// Guest functions handlers have called (`call_guest`), by thread, the
+    /// innermost last; and the trampoline they return to.
+    std::map<u32, std::vector<GuestCallFrame>> guest_calls;
+    ppcaddr_t guest_call_returned = 0;
+
+    DefaultHeapCells default_heap_cells;
+
     /// OSGetSystemInfo's block, in the system heap; zero until asked for.
     ppcaddr_t system_info = 0;
 
@@ -314,6 +346,14 @@ struct Context {
     /// The FSA clients open, by handle, and the next handle to give out.
     std::set<s32> fsa_clients;
     s32 next_fsa_client = 1;
+
+    /// nsysnet's sockets: descriptors, and the next to give out. There is
+    /// no network behind them (system_libraries.cpp).
+    std::set<s32> sockets;
+    s32 next_socket = 1;
+
+    /// The status a title gave `exit`, once it has.
+    std::optional<s32> exit_status;
 
     /// Guest memory, remembered by the calls that can complete later.
     ///
@@ -486,6 +526,21 @@ inline constexpr u32 callback_stack_size = 0x4000;
                                         ppcaddr_t entry,
                                         std::span<const u32> arguments,
                                         s32 priority = default_priority);
+
+/// Call a guest function from inside a handler, and carry on when it
+/// returns: what GX2R's allocator needs, and anything else Cafe OS calls
+/// through a pointer the title gave it before answering. The thread that
+/// called the handler runs `function` there and then, with `arguments` in
+/// r3 onward, on its own stack -- a handler has no frame, so the word a
+/// callee saves its return address in is free -- and its return address set
+/// to a trampoline, `__guest_call_returned`. The trampoline sends the thread
+/// back where the handler would have returned it and runs `then`, which sets
+/// r3, and can call another guest function in turn.
+///
+/// Only a raw handler can do this: a wrapped one writes its return value
+/// into r3 after it returns, over the function's first argument. A function
+/// of zero is not called; `then` runs at once with 0.
+void call_guest(Call& call, ppcaddr_t function, std::span<const u32> arguments, GuestReturn then);
 
 /// Release the stacks of callback threads that have finished, and forget the
 /// threads. Called before starting a new callback, so the cost lands on the

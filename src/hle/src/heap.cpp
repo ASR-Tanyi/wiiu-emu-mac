@@ -197,6 +197,12 @@ bool HeapManager::create_default_heaps(memory::Memory& memory, std::string& erro
         error = "MEM1 is not mapped";
         return false;
     }
+    if (!memory.range_is(memory::foreground_bucket_base,
+                         memory::foreground_application_size,
+                         memory::read_write)) {
+        error = "the foreground bucket is not mapped";
+        return false;
+    }
 
     default_handle_ = create("default", application_heap_base, application_heap_size);
     system_handle_ = create("system", system_heap_base, system_heap_size);
@@ -206,14 +212,33 @@ bool HeapManager::create_default_heaps(memory::Memory& memory, std::string& erro
         error = "MEM1's frame heap could not be made";
         return false;
     }
+    // The title's part of the foreground bucket, as decaf's CoreInitDefaultHeap
+    // makes it: a frame heap, like MEM1's.
+    foreground_base_ = frame_heap::create(
+        memory, memory::foreground_bucket_base, memory::foreground_application_size, 0);
+    if (foreground_base_ == 0) {
+        error = "the foreground bucket's frame heap could not be made";
+        return false;
+    }
 
     WIIU_LOG_INFO(Coreinit,
-                  "heaps: default {} MiB at {:#010x}, MEM1 {} MiB at {:#010x} (a frame heap)",
+                  "heaps: default {} MiB at {:#010x}, MEM1 {} MiB at {:#010x} and the foreground "
+                  "bucket's {} MiB at {:#010x} (frame heaps)",
                   application_heap_size / (1024 * 1024),
                   application_heap_base,
                   memory::mem1_size / (1024 * 1024),
-                  memory::mem1_base);
+                  memory::mem1_base,
+                  memory::foreground_application_size / (1024 * 1024),
+                  memory::foreground_bucket_base);
     return true;
+}
+
+bool HeapManager::destroy(u32 handle) {
+    if (handle == default_handle_ || handle == system_handle_) {
+        // Cafe OS's own; a title that destroys one is not given the chance.
+        return false;
+    }
+    return heaps_.erase(handle) != 0;
 }
 
 ExpandedHeap* HeapManager::find(u32 handle) {

@@ -2,6 +2,7 @@
 // first steps covered: the RPX's own `__preinit_user`, called before its
 // entry point; the system information block; the debugger and HOME button
 // queries; and the FSA client wut's newlib glue opens for its SD card device.
+// And on its way out: `exit`.
 //
 // Each is here because wut's start-up calls it -- every title built with
 // wut, which is every homebrew title, goes through all of them before
@@ -11,6 +12,7 @@
 #include <wiiu/common/log.hpp>
 #include <wiiu/cpu/state.hpp>
 #include <wiiu/hle/coreinit.hpp>
+#include <wiiu/hle/loader.hpp>
 
 #include <fmt/format.h>
 
@@ -193,6 +195,25 @@ s32 fsa_mount(Call& call, s32 handle, u32 source, u32 target) {
     return fs_error_not_found;
 }
 
+// --- exit ------------------------------------------------------------------------
+
+/// `void exit(int status)`: the process ends, every thread with it, and the
+/// run with it -- the core goes to the return sentinel, where the run loop
+/// finds nothing left to run. wut's newlib reaches it after its own exit
+/// handlers and `__fini_wut`.
+void os_exit(Call& call) {
+    const auto status = static_cast<s32>(call.next_word());
+    Context* const context = active();
+    if (context != nullptr) {
+        context->exit_status = status;
+        context->scheduler.exit_all(status);
+    }
+    WIIU_LOG_INFO(Coreinit, "the title exited with status {}", status);
+    call.state.gpr[3] = static_cast<u32>(status);
+    call.state.pc = return_sentinel;
+    call.state.next_pc = return_sentinel;
+}
+
 } // namespace
 
 bool start_with_preinit(Context& context,
@@ -256,6 +277,8 @@ void register_startup(Registry& registry, Context& context) {
     registry.add("coreinit", "OSIsDebuggerInitialized", os_no_debugger);
     registry.add("coreinit", "OSEnableHomeButtonMenu", os_enable_home_button_menu);
     registry.add("coreinit", "OSSavesDone_ReadyToRelease", os_saves_done_ready_to_release);
+
+    registry.add("coreinit", "exit", os_exit);
 
     registry.add("coreinit", "FSAInit", fsa_init);
     registry.add("coreinit", "FSAAddClient", fsa_add_client);

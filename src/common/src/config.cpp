@@ -180,6 +180,9 @@ const std::vector<Field>& field_table() {
 
         f.push_back({"paths.mlc", &Settings::mlc_path, "Emulated NAND storage directory"});
         f.push_back({"paths.cache", &Settings::cache_path, "Shader and pipeline cache directory"});
+        f.push_back({"paths.sdcard",
+                     &Settings::sdcard_path,
+                     "SD card directory, mounted at /vol/external01 (empty: no card)"});
 
         return f;
     }();

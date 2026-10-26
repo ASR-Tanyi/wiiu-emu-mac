@@ -148,7 +148,7 @@ TEST_CASE_METHOD(CoreinitFixture, "MEMAllocFromDefaultHeap returns usable memory
 }
 
 TEST_CASE_METHOD(CoreinitFixture,
-                 "MEM1 is a frame heap and MEM2 the expanded default heap",
+                 "MEM1 and the foreground bucket are frame heaps and MEM2 the default heap",
                  "[hle][heap]") {
     // As Cafe OS makes them before a title runs (decaf's CoreInitDefaultHeap).
     const u32 mem1 = call("MEMGetBaseHeapHandle", {0});
@@ -162,8 +162,13 @@ TEST_CASE_METHOD(CoreinitFixture,
     // An expanded-heap call on it is refused: it is not one.
     CHECK(call("MEMAllocFromExpHeapEx", {mem1, 128, 32}) == 0U);
 
-    // The foreground bucket is not modelled: no heap. Anything else, none.
-    CHECK(call("MEMGetBaseHeapHandle", {8}) == 0U);
+    // The foreground bucket's 40 MiB, at 0xE0000000 (decaf and Cemu): where
+    // WHBGfx puts its scan buffers. Anything else has no heap.
+    const u32 foreground = call("MEMGetBaseHeapHandle", {8});
+    CHECK(foreground == memory::foreground_bucket_base);
+    CHECK(memory.read<u32>(foreground) == frame_heap::tag);
+    CHECK(call("MEMGetAllocatableSizeForFrmHeapEx", {foreground, 4}) ==
+          memory::foreground_application_size - frame_heap::header_size);
     CHECK(call("MEMGetBaseHeapHandle", {2}) == 0U);
 
     // MEMSetBaseHeapHandle hands back the old one.
@@ -184,6 +189,18 @@ TEST_CASE_METHOD(CoreinitFixture,
 
     call("MEMFreeToDefaultHeap", {address});
     CHECK(call("MEMGetSizeForMBlockExpHeap", {address}) == 0U);
+}
+
+TEST_CASE_METHOD(CoreinitFixture,
+                 "destroying an expanded heap gives back its memory",
+                 "[hle][heap]") {
+    constexpr ppcaddr_t base = memory::data_heap_base + 0x00100000;
+    const u32 heap = call("MEMCreateExpHeapEx", {base, 0x10000, 0});
+    CHECK(call("MEMDestroyExpHeap", {heap}) == base);
+    CHECK(call("MEMAllocFromExpHeapEx", {heap, 16, 4}) == 0U); // gone
+    // The default heap is Cafe OS's, and stays.
+    CHECK(call("MEMDestroyExpHeap", {os.heaps.default_handle()}) == 0U);
+    CHECK(os.heaps.find(os.heaps.default_handle()) != nullptr);
 }
 
 TEST_CASE_METHOD(CoreinitFixture,
@@ -288,6 +305,55 @@ TEST_CASE_METHOD(CoreinitFixture, "a file opens, reads and closes", "[hle][fs]")
     CHECK(std::string(contents.begin(), contents.end()) == "content payload\n");
 
     CHECK(static_cast<s32>(call("FSCloseFile", {0, 0, handle, 0})) == 0);
+}
+
+TEST_CASE_METHOD(CoreinitFixture, "the SD card mounts where WHB looks for it", "[hle][fs]") {
+    // WHBMountSdCard: FSGetMountSource for the SD card, then FSMount, which
+    // gives back the path it mounted at. The card is a host directory --
+    // the test title's content directory stands in for one.
+    constexpr ppcaddr_t scratch = memory::data_heap_base;
+    constexpr ppcaddr_t block = scratch + 0x1000;
+    constexpr ppcaddr_t source = scratch + 0x2000;
+    constexpr ppcaddr_t target = scratch + 0x2400;
+    constexpr ppcaddr_t handle_out = scratch + 0x2500;
+    constexpr ppcaddr_t stat = scratch + 0x2600;
+    const ppcaddr_t path = put_string("/vol/external01/data.bin", scratch);
+    const ppcaddr_t mode = put_string("r", scratch + 0x100);
+
+    REQUIRE(memory.fill(block, 0xA80, 0xCD));
+    call("FSInitCmdBlock", {block});
+    CHECK(memory.read<u32>(block) == 0U);
+    CHECK(memory.read<u32>(block + 0xA7C) == 0U);
+
+    // No card in the slot: no mount source.
+    CHECK(static_cast<s32>(call("FSGetMountSource", {0, block, 0, source, 0})) ==
+          static_cast<s32>(FsStatus::End));
+
+    os.filesystem.set_sd_card(std::filesystem::path{WIIU_TEST_DATA_DIR} / "loader" / "data" /
+                              "title" / "content");
+    CHECK(call("FSGetMountSource", {0, block, 0, source, 0}) == 0U);
+    CHECK(memory.read<u32>(source) == 0U); // the SD card
+    Call reader{.state = state, .memory = memory};
+    CHECK(reader.read_string(source + 4) == "external01");
+
+    // Not there until it is mounted.
+    CHECK(static_cast<s32>(call("FSOpenFile", {0, block, path, mode, handle_out, 0})) ==
+          static_cast<s32>(FsStatus::NotFound));
+    CHECK(call("FSMount", {0, block, source, target, 0x80, 0}) == 0U);
+    CHECK(reader.read_string(target) == "/vol/external01");
+    CHECK(static_cast<s32>(call("FSMount", {0, block, source, target, 0x80, 0})) ==
+          static_cast<s32>(FsStatus::Exists));
+
+    REQUIRE(call("FSOpenFile", {0, block, path, mode, handle_out, 0}) == 0U);
+    const u32 handle = memory.read<u32>(handle_out);
+    CHECK(call("FSGetStatFile", {0, block, handle, stat, 0}) == 0U);
+    CHECK(memory.read<u32>(stat + 0x10) == 16U);  // "content payload\n"
+    CHECK(memory.read<u32>(stat) == 0x01000000U); // a file
+    CHECK(call("FSCloseFile", {0, block, handle, 0}) == 0U);
+
+    CHECK(call("FSUnmount", {0, block, target, 0}) == 0U);
+    CHECK(static_cast<s32>(call("FSOpenFile", {0, block, path, mode, handle_out, 0})) ==
+          static_cast<s32>(FsStatus::NotFound));
 }
 
 TEST_CASE_METHOD(CoreinitFixture, "reading past the end returns zero items", "[hle][fs]") {

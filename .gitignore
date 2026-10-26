@@ -12,3 +12,5 @@ keys.txt
 *.wux
 *.rpx
 *.rpl
+# What scripts/wut-samples.sh builds: the samples and their SD card.
+tests/loader/data/wut/

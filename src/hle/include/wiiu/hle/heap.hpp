@@ -1,8 +1,9 @@
 // Phase 6.6 — coreinit heaps.
 //
-// Cafe OS hands applications several heaps: MEM1 (the 32 MiB of fast on-die
-// memory), MEM2 (main RAM), and a foreground bucket, each managed as an
-// "expanded heap" that allocates from either end.
+// Cafe OS hands applications three base heaps: MEM1 (the 32 MiB of fast
+// on-die memory), MEM2 (main RAM) and the foreground bucket's 40 MiB, the
+// first two of them frame heaps and MEM2 an "expanded heap" that allocates
+// from either end, which is the default heap.
 //
 // An expanded heap's bookkeeping lives host-side rather than in guest memory.
 // Real MEMExpHeap keeps its block headers in the heap itself, and a few games
@@ -15,10 +16,10 @@
 // and a list of recorded states, all of it in guest memory as `MEMFrmHeap`
 // and `MEMFrmHeapState` (wut documents the layouts, and decaf keeps them
 // there), so that is where it is kept here too, and its handle is its
-// address. MEM1's base heap is one: Cafe OS makes MEM1 a frame heap and
-// MEM2 the expanded default heap (decaf's CoreInitDefaultHeap), and WHB's
+// address. MEM1's and the foreground bucket's base heaps are frame heaps,
+// MEM2's the expanded default heap (decaf's CoreInitDefaultHeap): WHB's
 // console records a state on MEM1's heap and allocates its framebuffers
-// from it.
+// from it, and WHBGfx puts its scan buffers in the foreground bucket's.
 //
 // **coreinit's own objects** -- the system message queue, the stacks OS
 // callbacks run on, ProcUI's inboxes, OSSystemInfo -- come from a system heap
@@ -156,12 +157,17 @@ public:
     void reset();
 
     /// Create the standard heaps for a title, as Cafe OS does before it runs
-    /// one: MEM1 a frame heap over the whole of MEM1, MEM2 an expanded heap
-    /// that is the default heap, and coreinit's own system heap. The
-    /// foreground bucket is not modelled, so its base heap is none.
+    /// one: MEM1 a frame heap over the whole of MEM1, the foreground base
+    /// heap a frame heap over the title's 40 MiB of the foreground bucket,
+    /// MEM2 an expanded heap that is the default heap, and coreinit's own
+    /// system heap.
     [[nodiscard]] bool create_default_heaps(memory::Memory& memory, std::string& error);
 
     [[nodiscard]] u32 create(std::string name, ppcaddr_t base, u32 size);
+
+    /// MEMDestroyExpHeap: forget an expanded heap. The default heap and the
+    /// system heap are refused.
+    bool destroy(u32 handle);
     [[nodiscard]] ExpandedHeap* find(u32 handle);
     [[nodiscard]] const ExpandedHeap* find(u32 handle) const;
 

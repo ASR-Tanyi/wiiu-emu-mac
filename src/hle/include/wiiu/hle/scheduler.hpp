@@ -219,6 +219,10 @@ public:
 
     void exit_current(cpu::CoreState& state, s32 value);
 
+    /// The process is ending (coreinit's `exit`): every thread has exited,
+    /// with `value`, wherever it was.
+    void exit_all(s32 value);
+
     /// Block the caller until `handle` exits. False if it has already exited,
     /// in which case `value` is filled in and nothing blocks.
     [[nodiscard]] bool join(cpu::CoreState& state, u32 handle, ppcaddr_t out_address, s32& value);

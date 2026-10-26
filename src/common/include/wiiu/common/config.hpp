@@ -61,6 +61,7 @@ struct Settings {
     // [paths]
     std::string mlc_path;   ///< emulated NAND storage
     std::string cache_path; ///< shader and pipeline caches
+    std::string sdcard_path; ///< the SD card, a title's /vol/external01
 };
 
 /// What a field's value is, and where it lives.

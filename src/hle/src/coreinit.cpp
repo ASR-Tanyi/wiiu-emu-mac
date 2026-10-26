@@ -1,10 +1,12 @@
 #include <wiiu/common/log.hpp>
 #include <wiiu/hle/coreinit.hpp>
+#include <wiiu/hle/ios.hpp>
 
 #include <fmt/format.h>
 
 #include <array>
 #include <cmath>
+#include <string_view>
 #include <vector>
 
 namespace wiiu::hle::coreinit {
@@ -225,17 +227,7 @@ u32 mem_get_base_heap_handle(Call&, u32 index) {
     if (active() == nullptr || !base_heap_type(index, type)) {
         return 0;
     }
-    const u32 handle = active()->heaps.base(type);
-    if (handle == 0 && type == BaseHeap::Foreground) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
-            WIIU_LOG_WARN(Coreinit,
-                          "MEMGetBaseHeapHandle(MEM_BASE_HEAP_FG): the foreground bucket is not "
-                          "modelled; no heap");
-        }
-    }
-    return handle;
+    return active()->heaps.base(type);
 }
 
 /// `MEMHeapHandle MEMSetBaseHeapHandle(MEMBaseHeapType, MEMHeapHandle)`: the
@@ -337,6 +329,22 @@ void mem_free_to_default_heap(Call&, u32 address) {
 u32 mem_create_exp_heap_ex(Call&, u32 base, u32 size, u32 flags) {
     static_cast<void>(flags);
     return active() == nullptr ? 0 : active()->heaps.create("user", base, size);
+}
+
+/// `void* MEMDestroyExpHeap(MEMHeapHandle)`: the memory the heap was made
+/// over, as on hardware -- where the heap's header is at its start and the
+/// handle is that address -- or null for a heap that is not one.
+u32 mem_destroy_exp_heap(Call&, u32 handle) {
+    if (active() == nullptr) {
+        return 0;
+    }
+    const ExpandedHeap* const heap = active()->heaps.find(handle);
+    if (heap == nullptr) {
+        WIIU_LOG_WARN(Coreinit, "MEMDestroyExpHeap({:#010x}): not an expanded heap", handle);
+        return 0;
+    }
+    const ppcaddr_t base = heap->base();
+    return active()->heaps.destroy(handle) ? base : 0;
 }
 
 u32 mem_alloc_from_exp_heap_ex(Call&, u32 handle, u32 size, s32 alignment) {
@@ -497,6 +505,95 @@ s32 fs_get_pos_file(
         return static_cast<s32>(status);
     }
     return call.memory.try_write<u32>(out_address, static_cast<u32>(position))
+               ? 0
+               : static_cast<s32>(FsStatus::FatalError);
+}
+
+/// FSCmdBlock is 0xA80 bytes the API keeps its state in (wut's size).
+inline constexpr u32 fs_cmd_block_size = 0xA80;
+
+/// FSMountSource: the type, then the source's name ("external01" for the SD
+/// card), as decaf lays it out; FSMount's target is at least 0x80 bytes.
+inline constexpr u32 fs_mount_source_path = 0x4;
+inline constexpr u32 fs_mount_source_type_sd_card = 0;
+inline constexpr u32 fs_max_mount_path_length = 0x80;
+inline constexpr std::string_view fs_sd_card_source = "external01";
+
+/// A NUL-terminated string into guest memory.
+[[nodiscard]] bool
+write_c_string(memory::Memory& memory, ppcaddr_t address, std::string_view text) {
+    std::vector<u8> bytes(text.begin(), text.end());
+    bytes.push_back(0);
+    return memory.write_bytes(address, bytes);
+}
+
+void fs_init_cmd_block(Call& call, u32 block) {
+    static_cast<void>(call.memory.fill(block, fs_cmd_block_size, 0));
+}
+
+/// `FSStatus FSGetMountSource(FSClient*, FSCmdBlock*, FSMountSourceType,
+/// FSMountSource*, FSErrorFlag)`: the SD card, if there is one. Host file
+/// I/O (devkits' `hfio`) there never is.
+s32 fs_get_mount_source(Call& call, u32 client, u32 block, u32 type, u32 source, u32 error_mask) {
+    static_cast<void>(client);
+    static_cast<void>(block);
+    static_cast<void>(error_mask);
+    if (active() == nullptr || source == 0) {
+        return static_cast<s32>(FsStatus::FatalError);
+    }
+    if (type != fs_mount_source_type_sd_card || !active()->filesystem.has_sd_card()) {
+        // decaf's answer once every source of the type has been listed.
+        return static_cast<s32>(FsStatus::End);
+    }
+    bool ok = call.memory.try_write<u32>(source, fs_mount_source_type_sd_card);
+    ok = write_c_string(call.memory, source + fs_mount_source_path, fs_sd_card_source) && ok;
+    return ok ? 0 : static_cast<s32>(FsStatus::FatalError);
+}
+
+/// `FSStatus FSMount(FSClient*, FSCmdBlock*, FSMountSource*, char* target,
+/// u32 bytes, FSErrorFlag)`: the target is `/vol/` and the source's name.
+s32 fs_mount(Call& call, u32 client, u32 block, u32 source, u32 target, u32 bytes) {
+    static_cast<void>(client);
+    static_cast<void>(block);
+    if (active() == nullptr || source == 0 || target == 0 || bytes < fs_max_mount_path_length) {
+        return static_cast<s32>(FsStatus::FatalError);
+    }
+    u32 type = 0;
+    static_cast<void>(call.memory.try_read<u32>(source, type));
+    const std::string name = call.read_string(source + fs_mount_source_path, 0x10);
+    if (type != fs_mount_source_type_sd_card || name != fs_sd_card_source) {
+        WIIU_LOG_WARN(Coreinit, "FSMount: no mount source {} '{}'", type, name);
+        return static_cast<s32>(FsStatus::NotFound);
+    }
+    if (!write_c_string(call.memory, target, FileSystem::sd_card_path)) {
+        return static_cast<s32>(FsStatus::FatalError);
+    }
+    return static_cast<s32>(active()->filesystem.mount_sd_card());
+}
+
+s32 fs_unmount(Call& call, u32 client, u32 block, u32 target) {
+    static_cast<void>(client);
+    static_cast<void>(block);
+    if (active() == nullptr) {
+        return static_cast<s32>(FsStatus::FatalError);
+    }
+    return static_cast<s32>(active()->filesystem.unmount(call.read_string(target)));
+}
+
+/// `FSStatus FSGetStatFile(FSClient*, FSCmdBlock*, FSFileHandle, FSStat*,
+/// FSErrorFlag)`: an open file's size, in the FSStat /dev/fsa writes.
+s32 fs_get_stat_file(Call& call, u32 client, u32 block, u32 handle, u32 stat) {
+    static_cast<void>(client);
+    static_cast<void>(block);
+    if (active() == nullptr) {
+        return static_cast<s32>(FsStatus::FatalError);
+    }
+    u64 size = 0;
+    const FsStatus status = active()->filesystem.size_of(handle, size);
+    if (status != FsStatus::Ok) {
+        return static_cast<s32>(status);
+    }
+    return FsaDevice::write_stat(call.memory, stat, false, size)
                ? 0
                : static_cast<s32>(FsStatus::FatalError);
 }
@@ -802,6 +899,7 @@ void register_all(Registry& registry, Context& context) {
     registry.add("coreinit", "MEMAllocFromDefaultHeapEx", mem_alloc_from_default_heap_ex);
     registry.add("coreinit", "MEMFreeToDefaultHeap", mem_free_to_default_heap);
     registry.add("coreinit", "MEMCreateExpHeapEx", mem_create_exp_heap_ex);
+    registry.add("coreinit", "MEMDestroyExpHeap", mem_destroy_exp_heap);
     registry.add("coreinit", "MEMAllocFromExpHeapEx", mem_alloc_from_exp_heap_ex);
     registry.add("coreinit", "MEMFreeToExpHeap", mem_free_to_exp_heap);
     registry.add("coreinit", "MEMGetSizeForMBlockExpHeap", mem_get_size_for_mblock_exp_heap);
@@ -817,6 +915,11 @@ void register_all(Registry& registry, Context& context) {
     registry.add("coreinit", "FSCloseFile", fs_close_file);
     registry.add("coreinit", "FSSetPosFile", fs_set_pos_file);
     registry.add("coreinit", "FSGetPosFile", fs_get_pos_file);
+    registry.add("coreinit", "FSGetStatFile", fs_get_stat_file);
+    registry.add("coreinit", "FSInitCmdBlock", fs_init_cmd_block);
+    registry.add("coreinit", "FSGetMountSource", fs_get_mount_source);
+    registry.add("coreinit", "FSMount", fs_mount);
+    registry.add("coreinit", "FSUnmount", fs_unmount);
 
     registry.add("coreinit", "FSOpenFileAsync", fs_open_file_async);
     registry.add("coreinit", "FSReadFileAsync", fs_read_file_async);
@@ -833,15 +936,21 @@ void register_all(Registry& registry, Context& context) {
     // the list doubles as the to-do for Phase 6.4 onwards.
     for (const char* name : {
              "OSGetSystemMessageQueue",
-             "FSInitCmdBlock",
              "OSDynLoad_Acquire",
              "OSDynLoad_FindExport",
              "OSDynLoad_Release",
-             "exit",
              "__os_snprintf",
          }) {
         registry.add_stub("coreinit", name);
     }
+
+    // coreinit's own pointers to the default heap's functions (see
+    // DefaultHeapCells), resolved now that the functions are registered.
+    context.default_heap_cells = DefaultHeapCells{
+        .alloc = registry.resolve_data("coreinit", "MEMAllocFromDefaultHeap"),
+        .alloc_ex = registry.resolve_data("coreinit", "MEMAllocFromDefaultHeapEx"),
+        .free = registry.resolve_data("coreinit", "MEMFreeToDefaultHeap"),
+    };
 }
 
 } // namespace wiiu::hle::coreinit

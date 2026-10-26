@@ -71,6 +71,7 @@ enum class Form : u8 {
     XMcrfs,       ///< crfD, crfS          mcrfs
     XMtfsb,       ///< crbD                mtfsb0, mtfsb1
     XMtfsfi,      ///< crfD, IMM           mtfsfi
+    XCrfd,        ///< crfD                mcrxr
     PsQuantized,  ///< frD, d(rA), W, I    psq_l
     PsQuantizedX, ///< frD, rA, rB, W, I   psq_lx
     Sc,           ///< (none)              sc
@@ -177,6 +178,7 @@ enum Flags : u8 {
     X(Crorc, "crorc", WIIU_PPC_XR(19, 417), Form::XlCr, FlagNone)                                  \
     X(Crxor, "crxor", WIIU_PPC_XR(19, 193), Form::XlCr, FlagNone)                                  \
     X(Mcrf, "mcrf", WIIU_PPC_XR(19, 0), Form::XlMcrf, FlagNone)                                    \
+    X(Mcrxr, "mcrxr", WIIU_PPC_XR(31, 512), Form::XCrfd, FlagNone)                                 \
     /* special registers */                                                                        \
     X(Mfspr, "mfspr", WIIU_PPC_XR(31, 339), Form::XfxSprFrom, FlagNone)                            \
     X(Mtspr, "mtspr", WIIU_PPC_XR(31, 467), Form::XfxSprTo, FlagNone)                              \
@@ -215,12 +217,15 @@ enum Flags : u8 {
     X(Lbzx, "lbzx", WIIU_PPC_XR(31, 87), Form::XLoad, FlagNone)                                    \
     X(Lbzux, "lbzux", WIIU_PPC_XR(31, 119), Form::XLoad, FlagNone)                                 \
     X(Lhax, "lhax", WIIU_PPC_XR(31, 343), Form::XLoad, FlagNone)                                   \
+    X(Lhaux, "lhaux", WIIU_PPC_XR(31, 375), Form::XLoad, FlagNone)                                 \
     X(Lhzx, "lhzx", WIIU_PPC_XR(31, 279), Form::XLoad, FlagNone)                                   \
     X(Lhzux, "lhzux", WIIU_PPC_XR(31, 311), Form::XLoad, FlagNone)                                 \
     X(Lwzx, "lwzx", WIIU_PPC_XR(31, 23), Form::XLoad, FlagNone)                                    \
     X(Lwzux, "lwzux", WIIU_PPC_XR(31, 55), Form::XLoad, FlagNone)                                  \
     X(Stbx, "stbx", WIIU_PPC_XR(31, 215), Form::XStore, FlagNone)                                  \
+    X(Stbux, "stbux", WIIU_PPC_XR(31, 247), Form::XStore, FlagNone)                                \
     X(Sthx, "sthx", WIIU_PPC_XR(31, 407), Form::XStore, FlagNone)                                  \
+    X(Sthux, "sthux", WIIU_PPC_XR(31, 439), Form::XStore, FlagNone)                                \
     X(Stwx, "stwx", WIIU_PPC_XR(31, 151), Form::XStore, FlagNone)                                  \
     X(Stwux, "stwux", WIIU_PPC_XR(31, 183), Form::XStore, FlagNone)                                \
     X(Lhbrx, "lhbrx", WIIU_PPC_XR(31, 790), Form::XLoad, FlagNone)                                 \
@@ -259,6 +264,11 @@ enum Flags : u8 {
     X(Lfdx, "lfdx", WIIU_PPC_XR(31, 599), Form::XLoadFp, FlagNone)                                 \
     X(Stfsx, "stfsx", WIIU_PPC_XR(31, 663), Form::XStoreFp, FlagNone)                              \
     X(Stfdx, "stfdx", WIIU_PPC_XR(31, 727), Form::XStoreFp, FlagNone)                              \
+    X(Lfsux, "lfsux", WIIU_PPC_XR(31, 567), Form::XLoadFp, FlagNone)                               \
+    X(Lfdux, "lfdux", WIIU_PPC_XR(31, 631), Form::XLoadFp, FlagNone)                               \
+    X(Stfsux, "stfsux", WIIU_PPC_XR(31, 695), Form::XStoreFp, FlagNone)                            \
+    X(Stfdux, "stfdux", WIIU_PPC_XR(31, 759), Form::XStoreFp, FlagNone)                            \
+    X(Stfiwx, "stfiwx", WIIU_PPC_XR(31, 983), Form::XStoreFp, FlagNone)                            \
     /* floating point arithmetic, double */                                                        \
     X(Fadd, "fadd", WIIU_PPC_A(63, 21), Form::Aab, FlagRc)                                         \
     X(Fsub, "fsub", WIIU_PPC_A(63, 20), Form::Aab, FlagRc)                                         \

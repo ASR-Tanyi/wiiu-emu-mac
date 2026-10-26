@@ -20,6 +20,7 @@ wiiu_add_library(hle
         src/gx2_state.cpp
         src/gx2_surface.cpp
         src/gx2_texture.cpp
+        src/gx2r_buffer.cpp
         src/heap.cpp
         src/ios.cpp
         src/loader.cpp

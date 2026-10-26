@@ -84,7 +84,14 @@ inline constexpr ppcaddr_t codegen_base = 0x01800000;
 inline constexpr ppcaddr_t application_base = 0x02000000;
 inline constexpr ppcaddr_t application_end = 0x10000000; ///< always, whatever the start
 inline constexpr ppcaddr_t data_heap_base = 0x10000000;
-inline constexpr ppcaddr_t hardware_base = 0xE0000000; ///< IPC communication area
+/// The foreground bucket: 64 MiB a title has while it is in the foreground,
+/// of which the first 40 MiB are its own (the rest is the OS's: the copy
+/// area, the transition audio buffer, saved frames). decaf and Cemu agree on
+/// the address, the size and the split; coreinit makes the title's part the
+/// foreground base heap.
+inline constexpr ppcaddr_t foreground_bucket_base = 0xE0000000;
+inline constexpr u32 foreground_bucket_size = 0x04000000;
+inline constexpr u32 foreground_application_size = 0x02800000;
 inline constexpr ppcaddr_t mem1_base = 0xF4000000;
 inline constexpr ppcaddr_t shared_data_base = 0xF8000000; ///< system fonts, read-only
 inline constexpr ppcaddr_t kernel_heap_base = 0xFF200000;

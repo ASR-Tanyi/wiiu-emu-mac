@@ -546,6 +546,8 @@ std::string disassemble(Instruction inst, ppcaddr_t address, const DisassemblyOp
             return fmt::format("{} {}", name, inst.crbd.value());
         case Form::XMtfsfi:
             return fmt::format("{} {},{}", name, inst.crfd.value(), inst.imm4.value());
+        case Form::XCrfd:
+            return fmt::format("{} {}", name, inst.crfd.value());
 
         case Form::PsQuantized:
             return fmt::format("{} {},{}({}),{},{}",

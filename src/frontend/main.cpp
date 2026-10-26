@@ -48,6 +48,8 @@ constexpr std::string_view kUsage = R"(usage: wiiu-emu [options]
 options:
   -h, --help              show this message
   -r, --run FILE          load and run an RPX
+      --sdcard DIR        the SD card a title mounts at /vol/external01
+                          (overrides paths.sdcard)
       --window            open a window: alone, a test pattern; with --run,
                           the title's screens, OSScreen's or GX2's
       --cpu-surfaces      with --run --window, do GX2's clears and scan-out
@@ -84,6 +86,7 @@ struct Arguments {
     bool quiet = false;
     bool list_settings = false;
     std::string run_path;
+    std::string sdcard_path;
     bool trace = false;
     bool stats = false;
     bool window = false;
@@ -244,6 +247,12 @@ bool parse_arguments(std::span<const std::string_view> argv, Arguments& args) {
                 fmt::print(stderr, "wiiu-emu: unrecognised --log value '{}'\n", value);
                 return false;
             }
+        } else if (arg == "--sdcard") {
+            std::string_view value;
+            if (!next(value)) {
+                return false;
+            }
+            args.sdcard_path = std::string{value};
         } else if (arg == "--log-file") {
             std::string_view value;
             if (!next(value)) {
@@ -661,10 +670,21 @@ int main(int argc, char** argv) {
     const std::filesystem::path executable{args.run_path};
     if (executable.has_parent_path() && executable.parent_path().filename() == "code") {
         std::string mount_error;
-        if (vfs.mount_title_directory(executable.parent_path().parent_path(), mount_error)) {
-            coreinit.filesystem.set_filesystem(&vfs);
-        } else {
+        if (!vfs.mount_title_directory(executable.parent_path().parent_path(), mount_error)) {
             WIIU_LOG_DEBUG(Loader, "no title directory: {}", mount_error);
+        }
+    }
+    coreinit.filesystem.set_filesystem(&vfs);
+
+    // The SD card is in its slot from the start; the title mounts it.
+    const std::string sdcard =
+        args.sdcard_path.empty() ? config.base().sdcard_path : args.sdcard_path;
+    if (!sdcard.empty()) {
+        if (std::error_code ec; std::filesystem::is_directory(sdcard, ec)) {
+            coreinit.filesystem.set_sd_card(sdcard);
+            WIIU_LOG_INFO(Core, "SD card: {}", sdcard);
+        } else {
+            WIIU_LOG_WARN(Core, "SD card {} is not a directory; the slot is empty", sdcard);
         }
     }
 

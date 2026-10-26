@@ -2,9 +2,9 @@
 //
 // Everything a Wii U title cannot do for itself goes through Starbuck: the
 // filesystem, the account system, saves, the network stack, decryption. The
-// PowerPC side asks for it over IPC — a request structure in the
-// `0xE0000000` communication area and a doorbell through the PI registers —
-// and an ARM926 inside Latte answers.
+// PowerPC side asks for it over IPC — a request structure handed over by
+// physical address, and a doorbell through the PI registers — and an ARM926
+// inside Latte answers.
 //
 // None of that is emulated. The plan is explicit that LLE of the security
 // processor is out of scope, so the interception happens one layer up, at the
@@ -440,6 +440,11 @@ public:
     /// sense of. Nonzero means `fsa::layout` is wrong and the log says how.
     [[nodiscard]] u64 layout_mismatches() const noexcept { return layout_mismatches_; }
 
+    /// Fill in an `FSStat` at `address`. coreinit's `FSGetStatFile` writes
+    /// the same structure.
+    [[nodiscard]] static bool
+    write_stat(memory::Memory& memory, ppcaddr_t address, bool directory, u64 size);
+
 private:
     using Status = fsa::Status;
 
@@ -466,10 +471,6 @@ private:
     /// buffer to read it from, which has already been logged.
     [[nodiscard]] bool
     read_handle(const memory::Memory& memory, const IosIoctl& request, u32& handle);
-
-    /// Fill in an `FSStat` at `address`.
-    [[nodiscard]] static bool
-    write_stat(memory::Memory& memory, ppcaddr_t address, bool directory, u64 size);
 
     void report_mismatch(const memory::Memory& memory,
                          u32 command,

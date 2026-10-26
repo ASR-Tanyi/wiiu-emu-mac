@@ -4,17 +4,20 @@
 // into the Phase 5 virtual filesystem, which is where the decision about
 // containers (folder, WUP, disc image) actually lives.
 //
-// Only the synchronous forms are implemented. The async ones take a callback
-// and a queue, and without a scheduler (Phase 6.4) there is nowhere to run the
-// callback from — so they are stubs that say so rather than silently never
-// completing, which is the failure mode that wastes a day.
+// The SD card is a host directory, given to the emulator (`--sdcard`), which
+// a title mounts at /vol/external01 the way it would on a console --
+// FSGetMountSource for the SD card, then FSMount -- and which is not there
+// until it does. Without one the slot is empty, and the mount source is not
+// found.
 #pragma once
 
 #include <wiiu/common/types.hpp>
 #include <wiiu/loader/vfs.hpp>
 
+#include <filesystem>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace wiiu::hle {
@@ -87,6 +90,21 @@ public:
 
     [[nodiscard]] FsStatus stat(std::string_view path, loader::FileInfo& out) const;
 
+    /// Where the SD card's mount source mounts.
+    static constexpr std::string_view sd_card_path = "/vol/external01";
+
+    /// The SD card: a host directory, or an empty path for an empty slot.
+    void set_sd_card(std::filesystem::path directory) { sd_card_ = std::move(directory); }
+
+    [[nodiscard]] bool has_sd_card() const noexcept { return !sd_card_.empty(); }
+
+    /// Mount the SD card at `sd_card_path`: `NotFound` with no card,
+    /// `Exists` if it is mounted already, `FatalError` with no filesystem.
+    [[nodiscard]] FsStatus mount_sd_card();
+
+    /// FSUnmount: only the SD card is mounted this way.
+    [[nodiscard]] FsStatus unmount(std::string_view target);
+
     [[nodiscard]] std::size_t open_file_count() const noexcept { return files_.size(); }
 
     [[nodiscard]] std::size_t client_count() const noexcept { return clients_.size(); }
@@ -97,6 +115,9 @@ private:
     std::map<u32, bool> clients_;
     std::map<u32, OpenFile> files_;
     std::map<u32, OpenDirectory> directories_;
+
+    std::filesystem::path sd_card_;
+    bool sd_card_mounted_ = false;
 
     u32 next_client_ = client_base;
     u32 next_file_ = file_base;

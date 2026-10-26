@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <bit>
 #include <span>
 #include <string>
 
@@ -303,6 +304,62 @@ TEST_CASE_METHOD(CpuFixture, "update forms write back the address", "[cpu][inter
     REQUIRE(exec(kEnc_stwu_neg32) == StepResult::Ok); // stwu r3,-32(r1)
     CHECK(state.gpr[1] == memory::data_heap_base + 0x100 - 32);
     CHECK(memory.read<u32>(state.gpr[1]) == 0xAABBCCDDU);
+}
+
+TEST_CASE_METHOD(CpuFixture,
+                 "the update-indexed forms add rB and write the address back",
+                 "[cpu][interp]") {
+    // Missing until a wut sample needed one of them: every compiled loop
+    // walking an array of floats wants lfsux or stfsux.
+    const u32 base = memory::data_heap_base + 0x200;
+    state.gpr[4] = 0x10;
+    state.gpr[5] = 0xFFFF8001;
+    state.fpr[2].ps0 = 1.5;
+
+    const auto at = [&](u32 word, u32 expected_address) {
+        state.gpr[3] = base;
+        REQUIRE(exec(word) == StepResult::Ok);
+        CHECK(state.gpr[3] == expected_address);
+    };
+    at(0x7CA321EEU, base + 0x10); // stbux r5,r3,r4
+    CHECK(memory.read<u8>(base + 0x10) == 0x01U);
+    at(0x7CA3236EU, base + 0x10); // sthux r5,r3,r4
+    CHECK(memory.read<u16>(base + 0x10) == 0x8001U);
+    state.gpr[5] = 0;
+    at(0x7CA322EEU, base + 0x10); // lhaux r5,r3,r4: sign-extended
+    CHECK(state.gpr[5] == 0xFFFF8001U);
+
+    at(0x7C43256EU, base + 0x10); // stfsux f2,r3,r4
+    CHECK(memory.read<u32>(base + 0x10) == std::bit_cast<u32>(1.5F));
+    state.fpr[2].ps0 = 0.0;
+    at(0x7C43246EU, base + 0x10); // lfsux f2,r3,r4
+    CHECK(state.fpr[2].ps0 == 1.5);
+    at(0x7C4325EEU, base + 0x10); // stfdux f2,r3,r4
+    CHECK(memory.read<u64>(base + 0x10) == std::bit_cast<u64>(1.5));
+    state.fpr[2].ps0 = 0.0;
+    at(0x7C4324EEU, base + 0x10); // lfdux f2,r3,r4
+    CHECK(state.fpr[2].ps0 == 1.5);
+}
+
+TEST_CASE_METHOD(CpuFixture, "stfiwx stores what fctiwz converted", "[cpu][interp]") {
+    // How GCC turns a float into an int in memory for the 750: the found
+    // case is wut's WHBGfx, which stopped on it.
+    state.fpr[1].ps0 = -2.75;
+    state.gpr[3] = memory::data_heap_base + 0x300;
+    state.gpr[4] = 8;
+    REQUIRE(exec(0xFC00081EU) == StepResult::Ok); // fctiwz f0,f1
+    REQUIRE(exec(0x7C0327AEU) == StepResult::Ok); // stfiwx f0,r3,r4
+    CHECK(memory.read<u32>(memory::data_heap_base + 0x308) == 0xFFFFFFFEU);
+    CHECK(state.gpr[3] == memory::data_heap_base + 0x300); // no update form
+}
+
+TEST_CASE_METHOD(CpuFixture,
+                 "mcrxr moves XER's top bits into a field and clears them",
+                 "[cpu][interp]") {
+    state.xer.value = 0xA0000000U | 0x7FU;        // SO and CA, and a byte count
+    REQUIRE(exec(0x7D800400U) == StepResult::Ok); // mcrxr cr3
+    CHECK(state.cr.field(3) == 0xAU);
+    CHECK(state.xer.value == 0x7FU);
 }
 
 TEST_CASE_METHOD(CpuFixture, "an unmapped access is a memory fault, not a crash", "[cpu][interp]") {

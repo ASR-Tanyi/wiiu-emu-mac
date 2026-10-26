@@ -443,9 +443,40 @@ TEST_CASE_METHOD(ProcUiFixture, "the start-up stubs report success", "[hle][proc
     CHECK(call("nn_save", "SAVEInit", {}) == 0U);
     CHECK(call("nn_acp", "ACPInitialize", {}) == 0U);
 
-    const Function* const function = registry.find("nsysnet", "socket_lib_init");
+    const Function* const function = registry.find("nn_save", "SAVEInit");
     REQUIRE(function != nullptr);
     CHECK(function->is_stub);
+}
+
+TEST_CASE_METHOD(ProcUiFixture, "sockets open and send into no network", "[hle][procui]") {
+    // What WHB's UDP log does, which most homebrew starts first: a socket, an
+    // option, the broadcast address in network order -- big-endian, as the
+    // guest already is -- and sends, every one of them all sent.
+    const u32 socket = call("nsysnet", "socket", {2, 2, 17});
+    CHECK(static_cast<s32>(socket) > 0);
+    CHECK(call("nsysnet", "setsockopt", {socket, 0xFFFF, 0x20, 0, 4}) == 0U);
+    CHECK(call("nsysnet", "htons", {4405}) == 4405U);
+    CHECK(call("nsysnet", "htonl", {0xFFFFFFFF}) == 0xFFFFFFFFU);
+
+    constexpr ppcaddr_t text = memory::data_heap_base + 0x7000;
+    constexpr ppcaddr_t address = memory::data_heap_base + 0x7100;
+    const std::string line = "Begin rendering...\n";
+    REQUIRE(memory.write_bytes(text, std::vector<u8>(line.begin(), line.end())));
+    REQUIRE(memory.try_write<u16>(address, 2));        // AF_INET
+    REQUIRE(memory.try_write<u16>(address + 2, 4405)); // WHB's log port
+    REQUIRE(memory.try_write<u32>(address + 4, 0xFFFFFFFF));
+    CHECK(call("nsysnet",
+               "sendto",
+               {socket, text, static_cast<u32>(line.size()), 0, address, 16}) == line.size());
+
+    CHECK(call("nsysnet", "shutdown", {socket, 1}) == 0U);
+    CHECK(call("nsysnet", "socketclose", {socket}) == 0U);
+    // Closed is closed.
+    CHECK(static_cast<s32>(call("nsysnet", "sendto", {socket, text, 4, 0, address, 16})) == -1);
+
+    // nn_ac takes the request to connect; nothing connects.
+    CHECK(call("nn_ac", "ACInitialize", {}) == 0U);
+    CHECK(call("nn_ac", "ACConnectAsync", {}) == 0U);
 }
 
 // ---------------------------------------------------------------------------

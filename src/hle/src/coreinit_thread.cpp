@@ -181,6 +181,36 @@ void os_set_thread_cleanup_callback(Call& call) {
     thread->cleanup_callback = callback;
 }
 
+// --- guest calls -----------------------------------------------------------
+
+/// The trampoline a guest function `call_guest` called returns to: back to
+/// the handler's caller, and whatever the handler wanted done then.
+void guest_call_returned(Call& call) {
+    Context& context = *detail::active_context();
+    const u32 handle = scheduler().current_handle();
+    const auto entry = context.guest_calls.find(handle);
+    if (entry == context.guest_calls.end() || entry->second.empty()) {
+        // Nothing called a guest function on this thread, so there is nowhere
+        // to send it -- and the dispatcher has pointed it back here.
+        WIIU_LOG_ERROR(
+            Coreinit, "a guest call returned on thread {:#010x}, which made none", handle);
+        call.state.halted = true;
+        return;
+    }
+    GuestCallFrame frame = std::move(entry->second.back());
+    entry->second.pop_back();
+    if (entry->second.empty()) {
+        context.guest_calls.erase(entry);
+    }
+
+    const u32 result = call.state.gpr[3];
+    // The thread is pointed home first, so a `then` that calls another guest
+    // function sends that one home too.
+    call.state.pc = frame.resume;
+    call.state.next_pc = frame.resume;
+    frame.then(call, result);
+}
+
 // --- mutexes ---------------------------------------------------------------
 
 void os_init_mutex(Call& call) {
@@ -936,8 +966,12 @@ void Context::reset() {
     system_message_queue = 0;
     system_info = 0;
     home_button_menu = true;
+    guest_calls.clear();
     fsa_clients.clear();
     next_fsa_client = 1;
+    sockets.clear();
+    next_socket = 1;
+    exit_status.reset();
 
     // The trampoline is coreinit's, registered once, and stays.
     const ppcaddr_t preinit_returned = startup.returned;
@@ -1032,6 +1066,46 @@ bool post_message(Context& context,
     return true;
 }
 
+void call_guest(Call& call, ppcaddr_t function, std::span<const u32> arguments, GuestReturn then) {
+    Context& context = *detail::active_context();
+    if (function == 0 || context.guest_call_returned == 0) {
+        if (function != 0) {
+            WIIU_LOG_ERROR(Coreinit,
+                           "no trampoline to return to; the guest function at {:#010x} is not "
+                           "called",
+                           function);
+        }
+        then(call, 0);
+        return;
+    }
+
+    // Frames left behind by threads that are gone -- one that exited inside
+    // the function it was called into -- are forgotten, as ProcUI's chains
+    // are, before a reused handle could pick them up.
+    for (auto entry = context.guest_calls.begin(); entry != context.guest_calls.end();) {
+        const Thread* const thread = scheduler().find(entry->first);
+        const bool alive = thread != nullptr && thread->state != ThreadState::Exited &&
+                           !entry->second.empty() &&
+                           entry->second.back().generation == thread->generation;
+        entry = alive || entry->first == 0 ? std::next(entry) : context.guest_calls.erase(entry);
+    }
+
+    const u32 handle = scheduler().current_handle();
+    const Thread* const thread = scheduler().current();
+    context.guest_calls[handle].push_back(GuestCallFrame{
+        .resume = call.state.pc, // where the dispatcher was sending the thread back to
+        .generation = thread == nullptr ? 0 : thread->generation,
+        .then = std::move(then),
+    });
+
+    for (std::size_t i = 0; i < arguments.size() && i < 8; ++i) {
+        call.state.gpr[3 + i] = arguments[i];
+    }
+    call.state.lr = context.guest_call_returned;
+    call.state.pc = function;
+    call.state.next_pc = function;
+}
+
 u32 invoke_guest_callback(Context& context,
                           memory::Memory& memory,
                           std::string name,
@@ -1120,6 +1194,12 @@ void register_threads(Registry& registry, Context& context) {
     detail::set_active_context(&context);
 
     context.scheduler.set_exit_callback(nullptr);
+
+    // The address a guest function a handler called returns to: registered
+    // like an import so it has an `sc` word, resolved now so it exists before
+    // the trampolines are written.
+    registry.add("coreinit", "__guest_call_returned", guest_call_returned);
+    context.guest_call_returned = registry.resolve("coreinit", "__guest_call_returned");
 
     registry.add("coreinit", "OSCreateThread", os_create_thread);
     registry.add("coreinit", "OSResumeThread", os_resume_thread);

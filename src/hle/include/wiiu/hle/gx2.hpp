@@ -419,6 +419,19 @@ public:
 
     [[nodiscard]] EventCallback event_callback(u32 type) const noexcept;
 
+    // --- GX2R ---------------------------------------------------------------
+
+    /// GX2RSetAllocator's functions, guest functions both; zero for GX2R's
+    /// own, which go to the default heap.
+    struct RAllocator {
+        ppcaddr_t alloc = 0;
+        ppcaddr_t free = 0;
+    };
+
+    void set_r_allocator(RAllocator allocator) noexcept { r_allocator_ = allocator; }
+
+    [[nodiscard]] RAllocator r_allocator() const noexcept { return r_allocator_; }
+
     // --- the GPU itself -----------------------------------------------------
 
     [[nodiscard]] latte::GpuTimeline& timeline() noexcept { return timeline_; }
@@ -578,6 +591,7 @@ private:
     std::vector<gpu::TextureHandle> retired_textures_;
 
     InitAttributes attributes_{};
+    RAllocator r_allocator_{};
     bool initialized_ = false;
     u32 main_core_ = 1;
 };
@@ -652,6 +666,10 @@ inline constexpr u32 export_buffer = 1U << 8;
 /// all ones) and a GPU read cache is involved. Empty when the mode asks
 /// nothing of the GPU: zero, or the CPU's cache alone.
 [[nodiscard]] std::vector<u32> invalidate_packets(u32 mode, physaddr_t address, u32 size);
+
+/// `GX2Invalidate`: the CPU's data cache flushed over the buffer if the mode
+/// asks (decaf's DCFlushRange), and the SURFACE_SYNC sent for the rest.
+void invalidate_range(Call& call, u32 mode, ppcaddr_t buffer, u32 size);
 
 /// A structure of the title's -- made of `u32be` and `f32be` fields, laid
 /// out as GX2 lays it out -- copied out of guest memory or into it. False if

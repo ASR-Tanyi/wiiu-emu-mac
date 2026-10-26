@@ -381,6 +381,7 @@ void Gpu::reset() {
         list.reset();
     }
     callbacks_ = {};
+    r_allocator_ = {};
     swap_ = {};
     scan_buffers_ = {};
     drc_connect_ = 0;
@@ -1061,6 +1062,27 @@ std::vector<u32> invalidate_packets(u32 mode, physaddr_t address, u32 size) {
     };
 }
 
+void invalidate_range(Call& call, u32 mode, ppcaddr_t buffer, u32 size) {
+    if ((mode & invalidate::cpu) != 0 && buffer != 0) {
+        // The CPU's part is a data-cache flush, as decaf's is: what the title
+        // wrote is published to everything that reads memory.
+        call.memory.dc_flush_range(buffer, size);
+    }
+    physaddr_t physical = 0;
+    if (buffer != 0) {
+        const std::optional<physaddr_t> found =
+            physical_address(call.memory, buffer, "GX2Invalidate's buffer");
+        if (!found.has_value()) {
+            return;
+        }
+        physical = *found;
+    }
+    const std::vector<u32> packet = invalidate_packets(mode, physical, size);
+    if (!packet.empty()) {
+        static_cast<void>(emit(call, packet));
+    }
+}
+
 bool emit_display_list_call(Call& call, ppcaddr_t list, u32 bytes, std::string_view what) {
     const std::optional<physaddr_t> physical = physical_address(call.memory, list, what);
     if (!physical.has_value()) {
@@ -1295,22 +1317,9 @@ void gx2_copy_display_list(Call& call, u32 list, u32 bytes) {
 }
 
 /// `void GX2Invalidate(GX2InvalidateMode mode, void *buffer, uint32_t
-/// size)`. The CPU's part -- a data-cache flush -- needs nothing here yet;
-/// it will tell the texture and buffer caches (8.13) what changed.
+/// size)`.
 void gx2_invalidate(Call& call, u32 mode, u32 buffer, u32 size) {
-    physaddr_t physical = 0;
-    if (buffer != 0) {
-        const std::optional<physaddr_t> found =
-            physical_address(call.memory, buffer, "GX2Invalidate's buffer");
-        if (!found.has_value()) {
-            return;
-        }
-        physical = *found;
-    }
-    const std::vector<u32> packet = invalidate_packets(mode, physical, size);
-    if (!packet.empty()) {
-        static_cast<void>(emit(call, packet));
-    }
+    invalidate_range(call, mode, buffer, size);
 }
 
 void gx2_set_event_callback(Call&, u32 type, u32 function, u32 user_data) {
@@ -1462,6 +1471,7 @@ void register_gx2(Registry& registry, coreinit::Context& context) {
     register_gx2_context(registry);
     register_gx2_shader(registry);
     register_gx2_buffers(registry);
+    register_gx2r_buffers(registry);
     register_gx2_texture(registry);
     register_gx2_sampler(registry);
     register_gx2_draw(registry);

@@ -206,6 +206,9 @@ using namespace wiiu::cpu;
         case Form::XMtfsb:
             inst.crbd = 5;
             break;
+        case Form::XCrfd:
+            inst.crfd = 3;
+            break;
         case Form::XMtfsfi:
             inst.crfd = 3;
             inst.imm4 = 5;
